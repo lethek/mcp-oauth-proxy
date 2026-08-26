@@ -1,0 +1,5 @@
+# Every text file is LF, in the repository and in the working tree, on every
+# platform. Without this a Windows checkout with core.autocrlf=true rewrites
+# .go files to CRLF; gofmt then reports every file as unformatted, and the CI
+# format gate rejects a commit made from that working tree.
+* text=auto eol=lf
