@@ -18,7 +18,7 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
+<meta name="referrer" content="same-origin">
 <title>Authorize {{.ClientName}}</title>
 <style>
   :root { color-scheme: light dark; }
@@ -84,7 +84,12 @@ type consentView struct {
 func renderConsent(w http.ResponseWriter, v consentView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// same-origin, not no-referrer. Under a no-referrer policy the Fetch spec has
+	// the browser serialise the Origin header of this page's own form submission
+	// as "null", so the page would guarantee that every submission it produces
+	// fails its own origin check. same-origin still withholds the referrer from
+	// anywhere else, which is the only place it could leak.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	// The page contains a one-time credential and must never be framed by the
 	// site that sent the user here.
 	w.Header().Set("X-Frame-Options", "DENY")

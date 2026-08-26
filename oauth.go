@@ -66,17 +66,25 @@ func readBrowserSecret(r *http.Request) string {
 
 // sameOrigin backs the cookie up for anything that does not honour SameSite.
 //
-// An absent Origin is allowed, because not every client sends one on a
-// same-origin form post and the cookie is the real check. Anything present and
-// not ours is refused, including the opaque "null" that a sandboxed frame or a
-// data: URL sends.
+// Two headers are consulted, because either can be absent. Sec-Fetch-Site is
+// the more dependable: unlike Origin it is not affected by the page's referrer
+// policy. Origin is checked whenever it names a real origin.
+//
+// Neither is required. A missing or opaque signal falls through to the browser
+// binding in ApproveFlow, which is the actual gate. Refusing here on a missing
+// header would lock out anyone whose browser or privacy extension suppresses
+// it, and would buy nothing: a cross-site POST cannot carry the SameSite=Lax
+// binding cookie in the first place, so it fails the check that matters.
 func (s *Server) sameOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	if origin == "null" {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" {
 		return false
+	}
+
+	origin := r.Header.Get("Origin")
+	// "null" is what a browser sends when a referrer policy withholds the
+	// origin, so it says nothing about who sent this.
+	if origin == "" || origin == "null" {
+		return true
 	}
 	got, err := url.Parse(origin)
 	if err != nil || got.Host == "" {

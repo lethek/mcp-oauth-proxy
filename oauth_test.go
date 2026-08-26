@@ -966,8 +966,10 @@ func TestConsentAcceptsOriginWithoutDefaultPort(t *testing.T) {
 	}
 
 	// A genuinely foreign origin is still refused, including one that merely
-	// starts with ours.
-	for _, origin := range []string{"https://evil.example", "http://example.com", "https://example.com.evil.test", "null"} {
+	// starts with ours. "null" is deliberately absent: it is what a referrer
+	// policy produces, not a sender, and TestSameOriginTreatsOpaqueOriginAsNoSignal
+	// covers it.
+	for _, origin := range []string{"https://evil.example", "http://example.com", "https://example.com.evil.test"} {
 		r := httptest.NewRequest(http.MethodPost, "/consent", nil)
 		r.Header.Set("Origin", origin)
 		if h.srv.sameOrigin(r) {
@@ -1009,5 +1011,78 @@ func TestBindingCookieIsSecureOverHTTPS(t *testing.T) {
 	// being stored at all.
 	if secureFor("http://127.0.0.1:8080") {
 		t.Error("PUBLIC_URL http://127.0.0.1:8080 produced a Secure cookie, which the browser will not send back over http")
+	}
+}
+
+// TestConsentPageDoesNotSuppressItsOwnOrigin is the regression test for a page
+// that refused its own submissions.
+//
+// Under a no-referrer policy the Fetch spec has the browser serialise the
+// Origin header of a form submission as "null". renderConsent set exactly that
+// policy, and sameOrigin refused "null" outright, so every consent submission
+// from a real browser was rejected with 403 and no authorization could
+// complete. Go's http.Client does not implement referrer policy, which is why
+// the existing tests all passed.
+func TestConsentPageDoesNotSuppressItsOwnOrigin(t *testing.T) {
+	h := newHarness(t)
+
+	redirect := "http://127.0.0.1:9999/cb"
+	clientID := h.register(redirect)
+
+	resp := h.get(h.authorizeURL(clientID, redirect, s256("v")))
+	defer resp.Body.Close()
+
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both the header and the in-page meta drive the same policy, and either one
+	// set to no-referrer reintroduces the bug.
+	if got := resp.Header.Get("Referrer-Policy"); got == "no-referrer" {
+		t.Errorf("Referrer-Policy is %q, which makes the browser send Origin: null on this page's own form", got)
+	}
+	if strings.Contains(buf.String(), `content="no-referrer"`) {
+		t.Error(`the page carries <meta name="referrer" content="no-referrer">, which makes the browser send Origin: null on its own form`)
+	}
+}
+
+func TestSameOriginTreatsOpaqueOriginAsNoSignal(t *testing.T) {
+	h := newHarness(t)
+
+	req := func(origin, fetchSite string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/consent", nil)
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		if fetchSite != "" {
+			r.Header.Set("Sec-Fetch-Site", fetchSite)
+		}
+		return r
+	}
+
+	// Opaque and absent origins carry no information, so they defer to the
+	// browser binding rather than failing shut.
+	for _, origin := range []string{"", "null"} {
+		if !h.srv.sameOrigin(req(origin, "")) {
+			t.Errorf("Origin %q was refused; it says nothing about the sender and the cookie is the real gate", origin)
+		}
+	}
+
+	// A real foreign origin is still refused.
+	if h.srv.sameOrigin(req("https://evil.example", "")) {
+		t.Error("a foreign Origin was accepted")
+	}
+
+	// Sec-Fetch-Site is not affected by referrer policy, so it still catches a
+	// cross-site post whose Origin has been suppressed.
+	if h.srv.sameOrigin(req("null", "cross-site")) {
+		t.Error("Sec-Fetch-Site: cross-site was accepted")
+	}
+	if h.srv.sameOrigin(req("", "same-site")) {
+		t.Error("Sec-Fetch-Site: same-site was accepted; the consent form is always same-origin")
+	}
+	if !h.srv.sameOrigin(req(h.srv.cfg.PublicOrigin, "same-origin")) {
+		t.Error("a genuine same-origin submission was refused")
 	}
 }
