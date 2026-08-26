@@ -2,3 +2,8 @@
 /mcp-oauth-proxy.exe
 /dist/
 .env
+
+# Local tooling caches. Fuse and Serena index the repo into these; they are
+# per-machine and rebuilt on demand.
+.fuse/
+.serena/
