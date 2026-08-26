@@ -125,10 +125,17 @@ cross-site navigation that reaches `/authorize`, minting a fresh secret every
 time and letting a second client started mid-flow invalidate the first one's
 consent page. The flow records a hash of it, and `/consent` approves only when
 the submitting browser presents the matching value. A cross-site POST does not
-carry the cookie, so it has nothing to prove itself with. The `Origin` header is
-checked as well, for anything that does not honour `SameSite`. Both checks are
-in the same SQL update that marks the flow approved, so neither can be skipped
-by a future caller.
+carry the cookie, so it has nothing to prove itself with. The binding check is
+part of the same SQL update that marks the flow approved, so it cannot be
+skipped by a future caller.
+
+`Origin` and `Sec-Fetch-Site` are checked as well, for anything that does not
+honour `SameSite`, but neither is required. A browser whose referrer policy
+withholds the origin sends the literal `null`, which describes a policy rather
+than a sender, so the check defers to the cookie instead of failing shut. For
+the same reason the consent page sets `Referrer-Policy: same-origin` rather than
+`no-referrer`: under `no-referrer` the browser sends `Origin: null` on the
+page's own form, so the page would refuse every submission it produced.
 
 A flow that was never approved cannot be redeemed at `/callback` at all.
 
