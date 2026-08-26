@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -108,6 +109,37 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	u.failErr = err
 	u.mu.Unlock()
 	return nil, err
+}
+
+// FormActionOrigins names every origin a consent submission may legitimately
+// end up at.
+//
+// The browser checks form-action against each hop of the redirect chain that
+// follows a submission, not just its immediate target, so the provider's
+// authorization endpoint has to be named or the redirect after approval is
+// blocked and the page simply sits there. Bouncing through a same-origin URL
+// first does not help, for the same reason.
+//
+// The endpoint's own origin is preferred, since a provider may host it on a
+// different host from its issuer. The issuer is included as well, to cover the
+// case where discovery has not answered yet.
+func (u *Upstream) FormActionOrigins(ctx context.Context) []string {
+	var origins []string
+	add := func(raw string) {
+		p, err := url.Parse(raw)
+		if err != nil || p.Host == "" {
+			return
+		}
+		if o := canonicalOrigin(p); !slices.Contains(origins, o) {
+			origins = append(origins, o)
+		}
+	}
+
+	add(u.cfg.UpstreamIssuer)
+	if m, err := u.Meta(ctx); err == nil {
+		add(m.AuthorizationEndpoint)
+	}
+	return origins
 }
 
 // AuthorizeURL builds the URL we send the browser to. The state we pass is our

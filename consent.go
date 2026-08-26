@@ -3,6 +3,7 @@ package main
 import (
 	"html/template"
 	"net/http"
+	"strings"
 )
 
 // consentTemplate renders the interstitial that closes the confused-deputy
@@ -79,6 +80,11 @@ type consentView struct {
 	RedirectURI string
 	FlowID      string
 	ConsentPath string
+
+	// ProviderOrigins are the origins the browser will be sent to after this
+	// form is submitted. They have to appear in form-action or the browser
+	// refuses the redirect.
+	ProviderOrigins []string
 }
 
 func renderConsent(w http.ResponseWriter, v consentView) {
@@ -93,8 +99,14 @@ func renderConsent(w http.ResponseWriter, v consentView) {
 	// The page contains a one-time credential and must never be framed by the
 	// site that sent the user here.
 	w.Header().Set("X-Frame-Options", "DENY")
+	// form-action has to name the provider as well as this origin. The browser
+	// applies it to every hop of the redirect chain a submission triggers, so
+	// listing only 'self' blocks the redirect to the provider that approval
+	// depends on, leaving the page apparently doing nothing.
+	formAction := append([]string{"'self'"}, v.ProviderOrigins...)
 	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		"default-src 'none'; style-src 'unsafe-inline'; form-action "+strings.Join(formAction, " ")+
+			"; frame-ancestors 'none'; base-uri 'none'")
 	w.WriteHeader(http.StatusOK)
 	_ = consentTemplate.Execute(w, v)
 }

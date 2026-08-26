@@ -263,11 +263,12 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	renderConsent(w, consentView{
-		ClientName:  client.Name,
-		ClientID:    client.ID,
-		RedirectURI: redirectURI,
-		FlowID:      flow.ID,
-		ConsentPath: "/consent",
+		ClientName:      client.Name,
+		ClientID:        client.ID,
+		RedirectURI:     redirectURI,
+		FlowID:          flow.ID,
+		ConsentPath:     "/consent",
+		ProviderOrigins: s.upstream.FormActionOrigins(r.Context()),
 	})
 }
 

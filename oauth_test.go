@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1084,5 +1085,63 @@ func TestSameOriginTreatsOpaqueOriginAsNoSignal(t *testing.T) {
 	}
 	if !h.srv.sameOrigin(req(h.srv.cfg.PublicOrigin, "same-origin")) {
 		t.Error("a genuine same-origin submission was refused")
+	}
+}
+
+// TestConsentCSPAllowsTheProviderRedirect is the regression test for a consent
+// page whose own Approve button did nothing.
+//
+// A browser applies form-action to every hop of the redirect chain a submission
+// triggers, not just its immediate target. With only 'self' listed, the POST
+// reached the server and approved the flow, but the redirect on to the provider
+// was blocked, so the page sat there. Tapping again then reported the flow as
+// already used. Verified in a real browser: Chrome logs "Sending form data to
+// .../consent violates the following Content Security Policy directive:
+// form-action 'self'. The request has been blocked."
+func TestConsentCSPAllowsTheProviderRedirect(t *testing.T) {
+	h := newHarness(t)
+
+	redirect := "http://127.0.0.1:9999/cb"
+	clientID := h.register(redirect)
+
+	resp := h.get(h.authorizeURL(clientID, redirect, s256("v")))
+	defer resp.Body.Close()
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("the consent page carries no Content-Security-Policy")
+	}
+
+	// The provider is on a different origin from the proxy in every real
+	// deployment, so naming only 'self' is what breaks the flow.
+	if !strings.Contains(csp, h.provider.URL) {
+		t.Errorf("form-action does not name the provider origin %q, so the browser will block the redirect after approval.\nCSP: %s",
+			h.provider.URL, csp)
+	}
+	if !strings.Contains(csp, "form-action 'self'") {
+		t.Errorf("form-action no longer allows this origin, so the submission itself would be blocked.\nCSP: %s", csp)
+	}
+}
+
+func TestFormActionOriginsPrefersTheDiscoveredEndpoint(t *testing.T) {
+	h := newHarness(t)
+
+	got := h.srv.upstream.FormActionOrigins(context.Background())
+	if len(got) == 0 {
+		t.Fatal("no origins returned, so form-action would name only 'self'")
+	}
+	if !slices.Contains(got, h.provider.URL) {
+		t.Errorf("FormActionOrigins = %v, want it to include the provider origin %q", got, h.provider.URL)
+	}
+
+	// A provider that hosts its authorization endpoint on another host must have
+	// that host named, not just its issuer.
+	elsewhere := &Upstream{
+		cfg:  &Config{UpstreamIssuer: "https://issuer.example"},
+		meta: &upstreamMeta{AuthorizationEndpoint: "https://login.example/authorize"},
+	}
+	origins := elsewhere.FormActionOrigins(context.Background())
+	if !slices.Contains(origins, "https://login.example") {
+		t.Errorf("FormActionOrigins = %v, want it to include the authorization endpoint's own origin", origins)
 	}
 }
