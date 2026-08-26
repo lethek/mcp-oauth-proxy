@@ -17,8 +17,25 @@ env:
 
 jobs:
   test:
-    name: Vet and build
+    name: Vet, test and build
     runs-on: ubuntu-latest
+
+    # The authorization tests exercise single use, rotation and reuse detection
+    # against real SQL, so they need a real database.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: proxytest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v7
 
@@ -37,6 +54,12 @@ jobs:
           fi
 
       - run: go vet ./...
+
+      - name: Test
+        env:
+          TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/proxytest?sslmode=disable
+        run: go test -race ./...
+
       - run: go build ./...
 
   image:

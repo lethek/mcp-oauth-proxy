@@ -17,6 +17,7 @@ type upstreamMeta struct {
 	Issuer                string `json:"issuer"`
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
+	UserinfoEndpoint      string `json:"userinfo_endpoint"`
 }
 
 // UpstreamToken is what the provider hands back, and what we store encrypted.
@@ -33,12 +34,21 @@ func (t UpstreamToken) expired() bool {
 	return !t.ExpiresAt.IsZero() && time.Now().Add(time.Minute).After(t.ExpiresAt)
 }
 
+// discoveryRetryAfter is how long a failed discovery is remembered. Without it,
+// every request that needs the provider retries both well-known paths itself,
+// so an outage turns each waiting caller into two more attempts against a
+// provider that is already struggling, and each of them waits out the client
+// timeout twice before failing.
+const discoveryRetryAfter = 5 * time.Second
+
 type Upstream struct {
 	cfg  *Config
 	http *http.Client
 
-	mu   sync.RWMutex
-	meta *upstreamMeta
+	mu       sync.RWMutex
+	meta     *upstreamMeta
+	failedAt time.Time
+	failErr  error
 }
 
 func NewUpstream(cfg *Config) *Upstream {
@@ -50,10 +60,13 @@ func NewUpstream(cfg *Config) *Upstream {
 // OIDC path first and fall back rather than assuming either.
 func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	u.mu.RLock()
-	m := u.meta
+	m, failedAt, failErr := u.meta, u.failedAt, u.failErr
 	u.mu.RUnlock()
 	if m != nil {
 		return m, nil
+	}
+	if failErr != nil && time.Since(failedAt) < discoveryRetryAfter {
+		return nil, failErr
 	}
 
 	var lastErr error
@@ -84,10 +97,17 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 		}
 		u.mu.Lock()
 		u.meta = &got
+		u.failErr = nil
 		u.mu.Unlock()
 		return &got, nil
 	}
-	return nil, fmt.Errorf("upstream discovery failed: %w", lastErr)
+
+	err := fmt.Errorf("upstream discovery failed: %w", lastErr)
+	u.mu.Lock()
+	u.failedAt = time.Now()
+	u.failErr = err
+	u.mu.Unlock()
+	return nil, err
 }
 
 // AuthorizeURL builds the URL we send the browser to. The state we pass is our
@@ -178,4 +198,61 @@ func (u *Upstream) postToken(ctx context.Context, form url.Values) (UpstreamToke
 		out.ExpiresAt = time.Now().Add(time.Duration(raw.ExpiresIn) * time.Second)
 	}
 	return out, nil
+}
+
+// Subject asks the provider who the token belongs to, so a session can be tied
+// to a person for auditing and revocation. Best effort by design: a provider
+// without a userinfo endpoint must not stop anyone logging in, so the caller
+// treats an empty result as "unknown" rather than as a failure.
+func (u *Upstream) Subject(ctx context.Context, accessToken string) (string, error) {
+	m, err := u.Meta(ctx)
+	if err != nil {
+		return "", err
+	}
+	if m.UserinfoEndpoint == "" {
+		return "", nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.UserinfoEndpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := u.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("userinfo returned %d", resp.StatusCode)
+	}
+
+	var claims struct {
+		Sub               string `json:"sub"`
+		PreferredUsername string `json:"preferred_username"`
+		Email             string `json:"email"`
+	}
+	if err := json.Unmarshal(body, &claims); err != nil {
+		return "", fmt.Errorf("userinfo response was not JSON: %w", err)
+	}
+
+	// sub is the stable identifier; the friendlier claims only decorate it so a
+	// log line is readable without a second lookup. Choosing the decoration
+	// first states the username-beats-email preference once, rather than leaving
+	// it implicit in the order of a longer switch.
+	name := claims.PreferredUsername
+	if name == "" {
+		name = claims.Email
+	}
+	switch {
+	case claims.Sub != "" && name != "":
+		return claims.Sub + " (" + name + ")", nil
+	case claims.Sub != "":
+		return claims.Sub, nil
+	default:
+		return name, nil
+	}
 }

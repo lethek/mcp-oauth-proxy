@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -43,6 +44,14 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 			r.Out.Header.Del("Cookie")
 		},
 		FlushInterval: -1,
+		ModifyResponse: func(resp *http.Response) error {
+			// Every client shares this proxy's origin, so an upstream cookie would
+			// be handed to whichever client happened to make the request and then
+			// sent back on everyone else's. MCP over streamable HTTP has no use for
+			// cookies, so they are dropped rather than scoped.
+			resp.Header.Del("Set-Cookie")
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			slog.Error("proxy to upstream failed", "err", err, "path", r.URL.Path)
 			oauthError(w, http.StatusBadGateway, "server_error", "the MCP server could not be reached")
@@ -51,10 +60,25 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	return p
 }
 
-// refreshMu serialises refreshes per session, so a burst of concurrent requests
-// on an expired token produces one upstream refresh rather than a stampede that
-// would invalidate its own rotated refresh token.
-var refreshMu sync.Map
+// refreshLocks serialises refreshes per session, so a burst of concurrent
+// requests on an expired token produces one upstream refresh rather than a
+// stampede that would invalidate its own rotated refresh token.
+//
+// The locks are striped over a fixed set rather than kept one per session in a
+// map. A map would grow for the life of the process, and pruning it is not
+// safe: removing a mutex that another goroutine is already blocked on lets the
+// next caller create a second mutex for the same session and run concurrently,
+// which is the exact stampede this exists to prevent. Two unrelated sessions
+// occasionally sharing a stripe just makes one wait, which costs nothing here.
+const refreshStripes = 256
+
+var refreshLocks [refreshStripes]sync.Mutex
+
+func refreshLock(sessionID string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(sessionID))
+	return &refreshLocks[h.Sum32()%refreshStripes]
+}
 
 // handleMCP authenticates the caller against a token we issued, swaps in the
 // upstream credential we are holding for that session, and forwards.
@@ -99,25 +123,34 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 		return tok, errors.New("upstream token expired and no refresh token was issued")
 	}
 
-	gate, _ := refreshMu.LoadOrStore(sessionID, &sync.Mutex{})
-	mu := gate.(*sync.Mutex)
+	mu := refreshLock(sessionID)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Re-read under the lock: another request may have refreshed it while we
-	// waited, in which case the token we loaded above is already stale.
-	if fresh, err := s.loadToken(r.Context(), sessionID); err == nil && !fresh.expired() {
+	// Re-read under the lock. Two things can have happened while we waited:
+	// another request may have refreshed the token, or the session may have been
+	// revoked out from under us. The error is not ignorable, because treating a
+	// revoked session as "no fresher token available" would send us on to
+	// refresh with a credential the session no longer has any claim to.
+	fresh, err := s.loadToken(r.Context(), sessionID)
+	if err != nil {
+		return tok, err
+	}
+	if !fresh.expired() {
 		return fresh, nil
 	}
+	if fresh.RefreshToken == "" {
+		return fresh, errors.New("upstream token expired and no refresh token was issued")
+	}
 
-	refreshed, err := s.upstream.Refresh(r.Context(), tok.RefreshToken)
+	refreshed, err := s.upstream.Refresh(r.Context(), fresh.RefreshToken)
 	if err != nil {
 		return tok, err
 	}
 	if refreshed.RefreshToken == "" {
-		refreshed.RefreshToken = tok.RefreshToken
+		refreshed.RefreshToken = fresh.RefreshToken
 	}
-	if err := s.persistToken(r.Context(), sessionID, refreshed, false); err != nil {
+	if err := s.persistToken(r.Context(), sessionID, "", refreshed, false); err != nil {
 		return refreshed, err
 	}
 	slog.Info("refreshed the upstream token", "session", sessionID)
