@@ -18,6 +18,17 @@ type Config struct {
 	// must match what clients actually dial. No trailing slash.
 	PublicURL string
 
+	// PublicScheme and PublicOrigin are parsed out of PublicURL once, at load.
+	//
+	// Nothing may re-derive these from the raw string later. Validation parses
+	// the URL, and Go lowercases a parsed scheme, so a raw-text check disagrees
+	// with what was validated: a PUBLIC_URL of "HTTPS://host" validates as https
+	// while a prefix test for "https://" says otherwise. PublicOrigin is also
+	// canonical, with any default port removed, so it can be compared against a
+	// browser's Origin header, which never carries one.
+	PublicScheme string
+	PublicOrigin string
+
 	// UpstreamMCP is the MCP server we forward to once a request is authorized.
 	UpstreamMCP string
 
@@ -94,6 +105,10 @@ func LoadConfig() (*Config, error) {
 		if err := checkURL(raw, true); err != nil {
 			return nil, fmt.Errorf("%s is not usable: %w", name, err)
 		}
+	}
+
+	if err := c.derivePublic(); err != nil {
+		return nil, fmt.Errorf("PUBLIC_URL is not usable: %w", err)
 	}
 
 	// The MCP server is held to a weaker rule on purpose. No browser goes there,
@@ -186,6 +201,37 @@ func checkURL(raw string, requireSecure bool) error {
 		return fmt.Errorf("%q %w", raw, err)
 	}
 	return nil
+}
+
+// derivePublic records the scheme and canonical origin of PublicURL, so that
+// the cookie's Secure attribute and the consent Origin check both read what was
+// validated rather than re-parsing the string their own way.
+func (c *Config) derivePublic() error {
+	u, err := url.Parse(c.PublicURL)
+	if err != nil {
+		return err
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%q has no host", c.PublicURL)
+	}
+	c.PublicScheme = u.Scheme
+	c.PublicOrigin = canonicalOrigin(u)
+	return nil
+}
+
+// canonicalOrigin renders a URL the way a browser writes the Origin header:
+// scheme, host, and a port only when it is not the default for that scheme.
+// Comparing raw url.Host instead would reject every request from a deployment
+// whose PUBLIC_URL spells out :443.
+func canonicalOrigin(u *url.URL) string {
+	host := strings.ToLower(u.Host)
+	switch {
+	case u.Scheme == "https" && strings.HasSuffix(host, ":443"):
+		host = strings.TrimSuffix(host, ":443")
+	case u.Scheme == "http" && strings.HasSuffix(host, ":80"):
+		host = strings.TrimSuffix(host, ":80")
+	}
+	return u.Scheme + "://" + host
 }
 
 // IsPlaintextUpstream reports whether the MCP hop runs unencrypted somewhere

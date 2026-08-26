@@ -438,3 +438,45 @@ func TestMigrateUpgradesAnOlderSchema(t *testing.T) {
 		t.Fatalf("migrate is not idempotent: %v", err)
 	}
 }
+
+// TestSweepKeepsClientsWithAnOutstandingCode covers the window between
+// /callback and /token, where a client is referenced only by its authorization
+// code. Sweeping it there let the token exchange succeed while the next
+// /authorize failed with "unknown client_id", forcing a surprise re-registration.
+func TestSweepKeepsClientsWithAnOutstandingCode(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	session := mustSession(t, s)
+
+	// A long-idle client that has just reached /callback: its flow is consumed,
+	// an authorization code exists, and no tokens have been issued yet.
+	pending := Client{ID: newSecret(), Name: "mid-exchange", RedirectURIs: []string{"https://a/cb"}}
+	if err := s.CreateClient(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	code := newSecret()
+	if err := s.CreateAuthCode(ctx, code, AuthCode{SessionID: session, ClientID: pending.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A client that really is abandoned: nothing refers to it at all.
+	abandoned := Client{ID: newSecret(), Name: "abandoned", RedirectURIs: []string{"https://b/cb"}}
+	if err := s.CreateClient(ctx, abandoned); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.pool.Exec(ctx, `UPDATE clients SET created_at = now() - INTERVAL '31 days'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if _, err := s.GetClient(ctx, pending.ID); err != nil {
+		t.Errorf("a client mid-exchange was swept: %v", err)
+	}
+	if _, err := s.GetClient(ctx, abandoned.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an abandoned client survived the sweep: err = %v", err)
+	}
+}

@@ -46,7 +46,7 @@ func (s *Server) browserSecret(w http.ResponseWriter, r *http.Request) string {
 		Value:    secret,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   strings.HasPrefix(s.cfg.PublicURL, "https://"),
+		Secure:   s.cfg.PublicScheme == "https",
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(flowTTL.Seconds()),
 	})
@@ -78,15 +78,13 @@ func (s *Server) sameOrigin(r *http.Request) bool {
 	if origin == "null" {
 		return false
 	}
-	want, err := url.Parse(s.cfg.PublicURL)
-	if err != nil {
-		return false
-	}
 	got, err := url.Parse(origin)
-	if err != nil {
+	if err != nil || got.Host == "" {
 		return false
 	}
-	return got.Scheme == want.Scheme && got.Host == want.Host
+	// Both sides are canonicalised, because a browser omits the default port and
+	// a PUBLIC_URL may spell it out.
+	return canonicalOrigin(got) == s.cfg.PublicOrigin
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

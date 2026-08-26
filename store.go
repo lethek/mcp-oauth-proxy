@@ -451,7 +451,8 @@ DELETE FROM clients c
  WHERE c.created_at < now() - $1::interval
    AND NOT EXISTS (SELECT 1 FROM access_tokens  t WHERE t.client_id = c.client_id)
    AND NOT EXISTS (SELECT 1 FROM refresh_tokens r WHERE r.client_id = c.client_id)
-   AND NOT EXISTS (SELECT 1 FROM flows          f WHERE f.client_id = c.client_id)`,
+   AND NOT EXISTS (SELECT 1 FROM flows          f WHERE f.client_id = c.client_id)
+   AND NOT EXISTS (SELECT 1 FROM auth_codes     a WHERE a.client_id = c.client_id)`,
 			args: []any{unusedClientTTL.String()},
 		},
 	}

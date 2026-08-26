@@ -135,8 +135,13 @@ func newHarness(t *testing.T) *harness {
 	h.proxy = httptest.NewServer(s.routes())
 	t.Cleanup(h.proxy.Close)
 
-	// Both origins are known only once the servers are listening.
+	// Both origins are known only once the servers are listening. Deriving the
+	// public scheme and origin through the same path LoadConfig uses keeps the
+	// harness honest: if that derivation breaks, these tests break too.
 	cfg.PublicURL = h.proxy.URL
+	if err := cfg.derivePublic(); err != nil {
+		t.Fatal(err)
+	}
 	cfg.UpstreamIssuer = h.provider.URL
 	cfg.UpstreamMCP = h.provider.URL
 	s.upstream = NewUpstream(cfg)
@@ -935,5 +940,74 @@ func TestUnauthenticatedEndpointsAreRateLimited(t *testing.T) {
 	// process is alive, and a flood is exactly when that matters.
 	if got := get("/healthz"); got != http.StatusOK {
 		t.Errorf("GET /healthz: status %d, want 200 regardless of load", got)
+	}
+}
+
+// TestConsentAcceptsOriginWithoutDefaultPort covers a PUBLIC_URL that spells out
+// the default port. A browser never includes one in the Origin header, so
+// comparing raw hosts refused every consent submission from every user, while
+// logging it as a cross-origin attack.
+func TestConsentAcceptsOriginWithoutDefaultPort(t *testing.T) {
+	h := newHarness(t)
+
+	// Pretend this deployment is https://example.com:443. The browser will say
+	// https://example.com.
+	h.srv.cfg.PublicURL = "https://example.com:443"
+	if err := h.srv.cfg.derivePublic(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, origin := range []string{"https://example.com", "https://example.com:443", "https://EXAMPLE.com"} {
+		r := httptest.NewRequest(http.MethodPost, "/consent", nil)
+		r.Header.Set("Origin", origin)
+		if !h.srv.sameOrigin(r) {
+			t.Errorf("Origin %q was refused against PUBLIC_URL %q", origin, h.srv.cfg.PublicURL)
+		}
+	}
+
+	// A genuinely foreign origin is still refused, including one that merely
+	// starts with ours.
+	for _, origin := range []string{"https://evil.example", "http://example.com", "https://example.com.evil.test", "null"} {
+		r := httptest.NewRequest(http.MethodPost, "/consent", nil)
+		r.Header.Set("Origin", origin)
+		if h.srv.sameOrigin(r) {
+			t.Errorf("Origin %q was accepted against PUBLIC_URL %q", origin, h.srv.cfg.PublicURL)
+		}
+	}
+}
+
+// TestBindingCookieIsSecureOverHTTPS pins the Secure attribute to the parsed
+// scheme. It used to come from a case-sensitive prefix test on the raw
+// PUBLIC_URL, so a mixed-case scheme validated as https but shipped the cookie
+// that gates consent without Secure.
+func TestBindingCookieIsSecureOverHTTPS(t *testing.T) {
+	h := newHarness(t)
+
+	secureFor := func(publicURL string) bool {
+		h.srv.cfg.PublicURL = publicURL
+		if err := h.srv.cfg.derivePublic(); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		h.srv.browserSecret(w, httptest.NewRequest(http.MethodGet, "/authorize", nil))
+		for _, c := range w.Result().Cookies() {
+			if c.Name == consentCookie {
+				return c.Secure
+			}
+		}
+		t.Fatalf("browserSecret set no %s cookie", consentCookie)
+		return false
+	}
+
+	for _, publicURL := range []string{"https://example.com", "HTTPS://example.com", "Https://example.com:8443"} {
+		if !secureFor(publicURL) {
+			t.Errorf("PUBLIC_URL %q produced a binding cookie without Secure", publicURL)
+		}
+	}
+
+	// Loopback http is the one supported case where Secure would stop the cookie
+	// being stored at all.
+	if secureFor("http://127.0.0.1:8080") {
+		t.Error("PUBLIC_URL http://127.0.0.1:8080 produced a Secure cookie, which the browser will not send back over http")
 	}
 }
