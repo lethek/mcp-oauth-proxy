@@ -1,0 +1,4 @@
+/mcp-oauth-proxy
+/mcp-oauth-proxy.exe
+/dist/
+.env
