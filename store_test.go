@@ -480,3 +480,44 @@ func TestSweepKeepsClientsWithAnOutstandingCode(t *testing.T) {
 		t.Errorf("an abandoned client survived the sweep: err = %v", err)
 	}
 }
+
+// TestSweepRunsAtStartup pins the first pass to process start. The loop used to
+// wait a full interval before its first sweep, so a deployment that rolls or
+// crash-loops more often than that never swept at all, and expired sessions
+// kept their encrypted provider token indefinitely.
+func TestSweepRunsAtStartup(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	stale := mustSession(t, s)
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sessions SET created_at = now() - INTERVAL '100 days' WHERE id = $1`, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{store: s}
+	swept, cancel := context.WithCancel(ctx)
+	go srv.sweep(swept)
+
+	// Poll the row itself, not SessionToken: that already filters on the session
+	// lifetime, so it reports "not found" for this session whether or not the
+	// sweep ever ran. The point here is that the row, and the encrypted provider
+	// token in it, is actually gone.
+	rows := func() int {
+		var n int
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id = $1`, stale).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for rows() != 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("the session past its lifetime survived; the sweep did not run at startup (interval is %s)", sweepInterval)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+}

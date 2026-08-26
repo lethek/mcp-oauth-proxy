@@ -8,12 +8,15 @@ import (
 	"time"
 )
 
-// limiter is a fixed-window counter keyed by client address, used to stop an
-// anonymous caller filling the clients table. It deliberately ignores
-// X-Forwarded-For: the proxy has no way to know which hop it can trust, and
-// honouring a client-supplied header would let the attacker pick a fresh key
-// per request. Behind a load balancer every caller therefore shares one bucket,
-// which makes this a cap on total registration rate rather than a per-user one.
+// limiter is a fixed-window counter keyed by client address. Several of these
+// exist, one per class of endpoint; routes() decides which endpoint draws on
+// which.
+//
+// It deliberately ignores X-Forwarded-For: the proxy has no way to know which
+// hop it can trust, and honouring a client-supplied header would let an
+// attacker pick a fresh key per request. Behind a load balancer every caller
+// therefore shares one bucket, which makes these caps on total rate rather than
+// per-user ones.
 type limiter struct {
 	limit  int
 	window time.Duration

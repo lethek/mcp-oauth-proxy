@@ -177,17 +177,25 @@ func (s *Server) routes() http.Handler {
 	return mux
 }
 
+// sweepInterval is how often expired rows are cleared. The first pass runs at
+// startup rather than after the first tick: a process that restarts more often
+// than this would otherwise never sweep at all, and under a rollout or a crash
+// loop that is exactly what happens. The sweep is what makes an expired
+// session's provider token stop existing rather than merely stop being
+// reachable, so skipping it is not only a question of table size.
+const sweepInterval = 30 * time.Minute
+
 func (s *Server) sweep(ctx context.Context) {
-	t := time.NewTicker(30 * time.Minute)
+	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
 	for {
+		if err := s.store.Sweep(ctx); err != nil {
+			slog.Warn("sweep failed", "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := s.store.Sweep(ctx); err != nil {
-				slog.Warn("sweep failed", "err", err)
-			}
 		}
 	}
 }

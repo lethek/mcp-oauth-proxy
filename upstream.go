@@ -34,12 +34,21 @@ func (t UpstreamToken) expired() bool {
 	return !t.ExpiresAt.IsZero() && time.Now().Add(time.Minute).After(t.ExpiresAt)
 }
 
+// discoveryRetryAfter is how long a failed discovery is remembered. Without it,
+// every request that needs the provider retries both well-known paths itself,
+// so an outage turns each waiting caller into two more attempts against a
+// provider that is already struggling, and each of them waits out the client
+// timeout twice before failing.
+const discoveryRetryAfter = 5 * time.Second
+
 type Upstream struct {
 	cfg  *Config
 	http *http.Client
 
-	mu   sync.RWMutex
-	meta *upstreamMeta
+	mu       sync.RWMutex
+	meta     *upstreamMeta
+	failedAt time.Time
+	failErr  error
 }
 
 func NewUpstream(cfg *Config) *Upstream {
@@ -51,10 +60,13 @@ func NewUpstream(cfg *Config) *Upstream {
 // OIDC path first and fall back rather than assuming either.
 func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	u.mu.RLock()
-	m := u.meta
+	m, failedAt, failErr := u.meta, u.failedAt, u.failErr
 	u.mu.RUnlock()
 	if m != nil {
 		return m, nil
+	}
+	if failErr != nil && time.Since(failedAt) < discoveryRetryAfter {
+		return nil, failErr
 	}
 
 	var lastErr error
@@ -85,10 +97,17 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 		}
 		u.mu.Lock()
 		u.meta = &got
+		u.failErr = nil
 		u.mu.Unlock()
 		return &got, nil
 	}
-	return nil, fmt.Errorf("upstream discovery failed: %w", lastErr)
+
+	err := fmt.Errorf("upstream discovery failed: %w", lastErr)
+	u.mu.Lock()
+	u.failedAt = time.Now()
+	u.failErr = err
+	u.mu.Unlock()
+	return nil, err
 }
 
 // AuthorizeURL builds the URL we send the browser to. The state we pass is our

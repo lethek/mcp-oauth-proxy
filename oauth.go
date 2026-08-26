@@ -263,10 +263,15 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleConsent receives the user's decision. The flow id in the form is the
-// CSRF defence: it is generated server side and appears only in the consent
-// page, so whoever crafted the /authorize link never sees it and cannot forge
-// this POST.
+// handleConsent receives the user's decision.
+//
+// The flow id in the form is NOT the CSRF defence, and reading it as one is how
+// this was got wrong the first time. Anyone may call /authorize and read a
+// valid flow id straight out of the page they get back, then have a victim's
+// browser submit it from a page they control; a plain HTML form POST is not
+// blocked by CORS. What binds the decision is the browser secret, checked
+// inside ApproveFlow, plus the Origin check above. Do not remove either on the
+// grounds that the flow id already proves something.
 func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	if !s.sameOrigin(r) {
 		slog.Warn("consent: cross-origin submission refused", "origin", r.Header.Get("Origin"))
