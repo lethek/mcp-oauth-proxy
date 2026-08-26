@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26-alpine AS build
+# Pinned to the build host's own architecture. The compile then runs natively
+# and cross-compiles to the target below, rather than running the whole Go
+# toolchain under QEMU emulation once per non-native platform.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Dependencies first, so edits to source do not invalidate the module cache.
@@ -9,7 +12,10 @@ RUN go mod download
 
 COPY *.go ./
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build \
+# BuildKit supplies these per requested platform.
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
         -trimpath \
         -ldflags="-s -w -X main.version=${VERSION}" \
         -o /out/mcp-oauth-proxy .
