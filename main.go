@@ -29,6 +29,19 @@ type Server struct {
 	upstream *Upstream
 	sealer   *sealer
 	proxy    http.Handler
+
+	// The caps differ by what each endpoint can be made to do, not by how
+	// sensitive it sounds.
+	//
+	// registerLimit and flowLimit guard the two endpoints that create rows for a
+	// caller holding nothing at all, so they are the only real resource cap.
+	// credentialLimit covers endpoints that need a high-entropy credential
+	// before they do anything, where a tight per-address cap would buy very
+	// little and would punish a hosted client whose users share one egress
+	// address. It is a brute-force backstop, not a resource cap.
+	registerLimit   *limiter
+	flowLimit       *limiter
+	credentialLimit *limiter
 }
 
 func main() {
@@ -56,21 +69,29 @@ func run() error {
 		return err
 	}
 
+	if cfg.IsPlaintextUpstream() {
+		slog.Warn("the MCP server is reached over plain http; the provider's token crosses that hop in the clear",
+			"upstream_mcp", cfg.UpstreamMCP)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	store, err := NewStore(ctx, cfg.DatabaseURL)
+	store, err := NewStore(ctx, cfg.DatabaseURL, cfg.RefreshTokenTTL, cfg.SessionTTL)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
 
 	s := &Server{
-		cfg:      cfg,
-		store:    store,
-		upstream: NewUpstream(cfg),
-		sealer:   seal,
-		proxy:    newReverseProxy(upstreamURL),
+		cfg:             cfg,
+		store:           store,
+		upstream:        NewUpstream(cfg),
+		sealer:          seal,
+		proxy:           newReverseProxy(upstreamURL),
+		registerLimit:   newLimiter(20, time.Minute),
+		flowLimit:       newLimiter(120, time.Minute),
+		credentialLimit: newLimiter(600, time.Minute),
 	}
 
 	// Confirm the provider is discoverable at boot. This is a warning rather
@@ -126,10 +147,22 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthorizationServerMetadata)
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server/mcp", s.handleAuthorizationServerMetadata)
 
-	mux.HandleFunc("POST /register", s.handleRegister)
-	mux.HandleFunc("GET /authorize", s.handleAuthorize)
-	mux.HandleFunc("GET /callback", s.handleCallback)
-	mux.HandleFunc("POST /token", s.handleToken)
+	// Every unauthenticated endpoint is capped here rather than inside its
+	// handler, so this list is the whole story and adding a route without a limit
+	// is a visible omission rather than a forgotten line.
+	mux.HandleFunc("POST /register", limited(s.registerLimit, s.handleRegister))
+	mux.HandleFunc("GET /authorize", limited(s.flowLimit, s.handleAuthorize))
+	// The consent screen stands between /authorize and the provider. Without it
+	// an anonymous registration could be used to collect someone else's
+	// credentials, so nothing may reach /callback that did not pass through here.
+	// The rest each demand a credential the caller must already hold, so they
+	// share the looser backstop. /token in particular is dialled by the MCP
+	// client rather than a browser, and a hosted client refreshes for every one
+	// of its users from a single address.
+	mux.HandleFunc("POST /consent", limited(s.credentialLimit, s.handleConsent))
+	mux.HandleFunc("GET /callback", limited(s.credentialLimit, s.handleCallback))
+	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.handleToken))
+	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.handleRevoke))
 
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/mcp/", s.handleMCP)

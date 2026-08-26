@@ -17,6 +17,7 @@ type upstreamMeta struct {
 	Issuer                string `json:"issuer"`
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
+	UserinfoEndpoint      string `json:"userinfo_endpoint"`
 }
 
 // UpstreamToken is what the provider hands back, and what we store encrypted.
@@ -178,4 +179,61 @@ func (u *Upstream) postToken(ctx context.Context, form url.Values) (UpstreamToke
 		out.ExpiresAt = time.Now().Add(time.Duration(raw.ExpiresIn) * time.Second)
 	}
 	return out, nil
+}
+
+// Subject asks the provider who the token belongs to, so a session can be tied
+// to a person for auditing and revocation. Best effort by design: a provider
+// without a userinfo endpoint must not stop anyone logging in, so the caller
+// treats an empty result as "unknown" rather than as a failure.
+func (u *Upstream) Subject(ctx context.Context, accessToken string) (string, error) {
+	m, err := u.Meta(ctx)
+	if err != nil {
+		return "", err
+	}
+	if m.UserinfoEndpoint == "" {
+		return "", nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.UserinfoEndpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := u.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("userinfo returned %d", resp.StatusCode)
+	}
+
+	var claims struct {
+		Sub               string `json:"sub"`
+		PreferredUsername string `json:"preferred_username"`
+		Email             string `json:"email"`
+	}
+	if err := json.Unmarshal(body, &claims); err != nil {
+		return "", fmt.Errorf("userinfo response was not JSON: %w", err)
+	}
+
+	// sub is the stable identifier; the friendlier claims only decorate it so a
+	// log line is readable without a second lookup. Choosing the decoration
+	// first states the username-beats-email preference once, rather than leaving
+	// it implicit in the order of a longer switch.
+	name := claims.PreferredUsername
+	if name == "" {
+		name = claims.Email
+	}
+	switch {
+	case claims.Sub != "" && name != "":
+		return claims.Sub + " (" + name + ")", nil
+	case claims.Sub != "":
+		return claims.Sub, nil
+	default:
+		return name, nil
+	}
 }
