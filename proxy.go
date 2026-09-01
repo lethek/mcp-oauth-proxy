@@ -15,15 +15,12 @@ import (
 	"sync"
 )
 
-// challenge sends the RFC 6750 response that starts the whole dance. Without
+// challengeFor sends the RFC 6750 response that starts the whole dance. Without
 // the resource_metadata pointer a client has no way to discover who issues
 // tokens for this endpoint, so every unauthenticated path must go through here.
-func (s *Server) challenge(w http.ResponseWriter, errCode, desc string) {
-	s.challengeFor(w, s.cfg.Targets[0], errCode, desc)
-}
-
-// challengeFor points the client at the metadata for a specific target, which is
-// what lets a caller holding a token for the wrong one recover on its own.
+//
+// It names a specific target's metadata, which is what lets a caller holding a
+// token for the wrong one discover the right resource and recover on its own.
 func (s *Server) challengeFor(w http.ResponseWriter, t Target, errCode, desc string) {
 	v := `Bearer resource_metadata=` + strconv.Quote(s.cfg.PublicURL+t.MetadataPath())
 	if errCode != "" {
@@ -106,6 +103,11 @@ func replaceWithEnrolAdvice(resp *http.Response, enrolURL string) error {
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	// The upstream's own challenge would point at a realm the client cannot use.
 	resp.Header.Del("WWW-Authenticate")
+	// The replacement body is plain JSON. Leaving the upstream's encoding behind
+	// hands a client that asked for gzip an uncompressed body labelled gzip, and
+	// it fails to decode exactly the advice this function exists to deliver.
+	resp.Header.Del("Content-Encoding")
+	resp.Uncompressed = true
 	return nil
 }
 
@@ -124,6 +126,26 @@ func (s *Server) notEnrolled(w http.ResponseWriter, t Target) {
 // a request to /plane/mcp against an upstream of /http/api-key would be sent to
 // /http/api-key/plane/mcp. The target name is how this proxy addresses its own
 // routes and means nothing to the server behind it.
+// hasDotSegments reports whether a path contains "." or ".." segments.
+//
+// ServeMux normalises a literal "/../" and redirects, but it does NOT decode
+// percent-encoding first, so "%2e%2e" reaches the handler intact and arrives at
+// the upstream as "..". Whether that escapes the target's base path depends on
+// the upstream's own normalisation, and the request carries an injected
+// credential the caller never held, so it is refused here rather than forwarded
+// and hoped about.
+//
+// r.URL.Path is already percent-decoded by net/http, so checking it catches both
+// spellings at once.
+func hasDotSegments(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func stripTargetPrefix(r *http.Request, t Target) {
 	if t.Name == "" {
 		return
@@ -183,6 +205,14 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 	proxy := s.proxies[t.Name]
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Before authentication, because a traversal is malformed whoever sent it
+		// and there is no reason to spend a database lookup deciding that.
+		if hasDotSegments(r.URL.Path) {
+			slog.Warn("mcp: refused a path containing dot segments", "path", r.URL.Path, "target", t.Name)
+			oauthError(w, http.StatusBadRequest, "invalid_request", "the request path may not contain dot segments")
+			return
+		}
+
 		token := bearerFrom(r)
 		if token == "" {
 			s.challengeFor(w, t, "", "")

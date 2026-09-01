@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -46,6 +47,15 @@ type harness struct {
 	// each one saw, which is how the prefix stripping is checked.
 	alphaHits, betaHits atomic.Int64
 	upstreamPaths       chan string
+
+	// refuseAlpha makes the alpha upstream answer 401 the way a server does when
+	// the credential it was given has been revoked: chunked, with its own
+	// challenge header.
+	refuseAlpha atomic.Bool
+
+	// gzipRefusal makes that 401 gzip-encoded, as a real server behind a
+	// compressing layer would.
+	gzipRefusal atomic.Bool
 }
 
 // targetBuilder lets a test choose the target layout. It runs once PUBLIC_URL is
@@ -160,6 +170,23 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 		return func(w http.ResponseWriter, r *http.Request) {
 			hits.Add(1)
 			h.upstreamPaths <- r.URL.Path
+			if target == "alpha" && h.refuseAlpha.Load() {
+				// No Content-Length set, so Go serves this chunked, which is what
+				// the rewrite has to survive.
+				w.Header().Set("WWW-Authenticate", `Bearer realm="upstream"`)
+				payload := []byte(`{"error":"unauthorized","detail":"token revoked upstream"}`)
+				if h.gzipRefusal.Load() {
+					w.Header().Set("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusUnauthorized)
+					gz := gzip.NewWriter(w)
+					_, _ = gz.Write(payload)
+					_ = gz.Close()
+					return
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write(payload)
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"target":            target,
 				"saw_authorization": r.Header.Get("Authorization"),

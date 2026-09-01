@@ -239,12 +239,19 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		// Nothing here is safe to redirect: an unknown client means we cannot
 		// trust the redirect_uri either, so the error is rendered directly.
 		//
-		// A metadata document that would not load is reported in full. The
-		// caller controls that URL and can fix it, and "unknown client_id" would
-		// send them looking in the wrong place entirely.
+		// A metadata document failure says only that it failed. The detail goes
+		// to the log instead.
+		//
+		// Returning it was tempting, because the caller controls that URL and
+		// could act on the reason. But this endpoint is unauthenticated, and the
+		// reason distinguishes "refused to connect to a non-public address"
+		// from a timeout from a 404 — which turns /authorize into an oracle for
+		// probing internal names and addresses from outside.
 		if looksLikeCIMD(clientID) {
-			slog.Warn("authorize: could not resolve a client id metadata document", "client_id", clientID, "err", err)
-			oauthError(w, http.StatusBadRequest, "invalid_client", err.Error())
+			slog.Warn("authorize: could not resolve a client id metadata document",
+				"client_id", clientID, "err", err)
+			oauthError(w, http.StatusBadRequest, "invalid_client",
+				"the client_id metadata document could not be retrieved or was not valid")
 			return
 		}
 		oauthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
