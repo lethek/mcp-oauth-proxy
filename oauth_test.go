@@ -39,10 +39,35 @@ type harness struct {
 	// providerTokenHits counts upstream token-endpoint calls, so a test can
 	// assert that a refresh did not happen.
 	providerTokenHits atomic.Int64
+
+	// Two further MCP endpoints, mounted under distinct prefixes, so a
+	// multi-target test can tell which upstream a request actually reached and
+	// assert that the other was never touched. upstreamPaths records the path
+	// each one saw, which is how the prefix stripping is checked.
+	alphaHits, betaHits atomic.Int64
+	upstreamPaths       chan string
 }
 
-func newHarness(t *testing.T) *harness {
+// targetBuilder lets a test choose the target layout. It runs once PUBLIC_URL is
+// known, because a target's resource is derived from it.
+type targetBuilder func(cfg *Config, upstreamURL string) []Target
+
+func newHarness(t *testing.T) *harness { return newHarnessWith(t, nil) }
+
+func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	t.Helper()
+
+	// The default is the original single unnamed target, so every test that does
+	// not care keeps exercising that path.
+	if build == nil {
+		build = func(cfg *Config, upstreamURL string) []Target {
+			return []Target{{
+				UpstreamMCP: upstreamURL,
+				Mode:        CredProviderToken,
+				Resource:    cfg.PublicURL + "/mcp",
+			}}
+		}
+	}
 
 	store := newTestStore(t) // skips the test when there is no database
 	h := &harness{t: t}
@@ -122,6 +147,21 @@ func newHarness(t *testing.T) *harness {
 		})
 	})
 
+	// Distinct upstreams for the multi-target tests. Each records the path it was
+	// given, which is what proves the "/<target>" segment was stripped before
+	// forwarding rather than passed through to a server that knows nothing of it.
+	h.upstreamPaths = make(chan string, 16)
+	providerMux.HandleFunc("/alpha-upstream/", func(w http.ResponseWriter, r *http.Request) {
+		h.alphaHits.Add(1)
+		h.upstreamPaths <- r.URL.Path
+		writeJSON(w, http.StatusOK, map[string]any{"target": "alpha"})
+	})
+	providerMux.HandleFunc("/beta-upstream/", func(w http.ResponseWriter, r *http.Request) {
+		h.betaHits.Add(1)
+		h.upstreamPaths <- r.URL.Path
+		writeJSON(w, http.StatusOK, map[string]any{"target": "beta"})
+	})
+
 	seal, sealErr := newSealer(bytes.Repeat([]byte{3}, 32))
 	if sealErr != nil {
 		t.Fatal(sealErr)
@@ -133,25 +173,37 @@ func newHarness(t *testing.T) *harness {
 		flowLimit:       newLimiter(1000, time.Minute),
 		credentialLimit: newLimiter(1000, time.Minute),
 	}
-	h.proxy = httptest.NewServer(s.routes())
+
+	// Unstarted, because the routes depend on configuration that depends on this
+	// server's own address. A target's resource is derived from PUBLIC_URL and
+	// captured by the handlers, so it has to be settled before routes() runs.
+	// The listener has an address before the server accepts anything, which is
+	// what breaks the circle.
+	h.proxy = httptest.NewUnstartedServer(nil)
 	t.Cleanup(h.proxy.Close)
 
-	// Both origins are known only once the servers are listening. Deriving the
-	// public scheme and origin through the same path LoadConfig uses keeps the
-	// harness honest: if that derivation breaks, these tests break too.
-	cfg.PublicURL = h.proxy.URL
+	// Deriving the public scheme and origin through the same path LoadConfig uses
+	// keeps the harness honest: if that derivation breaks, these tests break too.
+	cfg.PublicURL = "http://" + h.proxy.Listener.Addr().String()
 	if err := cfg.derivePublic(); err != nil {
 		t.Fatal(err)
 	}
 	cfg.UpstreamIssuer = h.provider.URL
 	cfg.UpstreamMCP = h.provider.URL
+	cfg.Targets = build(cfg, h.provider.URL)
 	s.upstream = NewUpstream(cfg)
 
-	upstreamURL, parseErr := url.Parse(cfg.UpstreamMCP)
-	if parseErr != nil {
-		t.Fatal(parseErr)
+	s.proxies = map[string]http.Handler{}
+	for _, tgt := range cfg.Targets {
+		u, parseErr := url.Parse(tgt.UpstreamMCP)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		s.proxies[tgt.Name] = newReverseProxy(u)
 	}
-	s.proxy = newReverseProxy(upstreamURL)
+
+	h.proxy.Config.Handler = s.routes()
+	h.proxy.Start()
 	h.srv = s
 
 	return h
@@ -184,6 +236,12 @@ func (h *harness) register(redirectURI string) string {
 }
 
 func (h *harness) authorizeURL(clientID, redirectURI, challenge string) string {
+	return h.authorizeURLFor(clientID, redirectURI, challenge, "")
+}
+
+// authorizeURLFor adds the RFC 8707 resource parameter, which is optional with
+// one target and required with several.
+func (h *harness) authorizeURLFor(clientID, redirectURI, challenge, resource string) string {
 	q := url.Values{
 		"client_id":             {clientID},
 		"redirect_uri":          {redirectURI},
@@ -191,6 +249,9 @@ func (h *harness) authorizeURL(clientID, redirectURI, challenge string) string {
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 		"state":                 {"client-state"},
+	}
+	if resource != "" {
+		q.Set("resource", resource)
 	}
 	return h.proxy.URL + "/authorize?" + q.Encode()
 }
@@ -379,9 +440,13 @@ func TestConsentRejectsAForgedFlowID(t *testing.T) {
 // authorizeThroughConsent walks the full flow and returns the proxy's
 // authorization code.
 func (h *harness) authorizeThroughConsent(clientID, redirect, verifier string) string {
+	return h.authorizeThroughConsentFor(clientID, redirect, verifier, "")
+}
+
+func (h *harness) authorizeThroughConsentFor(clientID, redirect, verifier, resource string) string {
 	h.t.Helper()
 
-	flowID := h.consentFlowID(h.get(h.authorizeURL(clientID, redirect, s256(verifier))))
+	flowID := h.consentFlowID(h.get(h.authorizeURLFor(clientID, redirect, s256(verifier), resource)))
 
 	consent := h.postForm("/consent", url.Values{"flow_id": {flowID}, "decision": {"approve"}})
 	consent.Body.Close()
@@ -417,10 +482,14 @@ func (h *harness) authorizeThroughConsent(clientID, redirect, verifier string) s
 // client would actually hold. Four tests need a live token before they can test
 // anything else; this keeps the shape of the token response in one place.
 func (h *harness) tokens(clientID, redirect string) (access, refresh string) {
+	return h.tokensFor(clientID, redirect, "")
+}
+
+func (h *harness) tokensFor(clientID, redirect, resource string) (access, refresh string) {
 	h.t.Helper()
 
 	verifier := newSecret()
-	code := h.authorizeThroughConsent(clientID, redirect, verifier)
+	code := h.authorizeThroughConsentFor(clientID, redirect, verifier, resource)
 
 	resp := h.postForm("/token", url.Values{
 		"grant_type":    {"authorization_code"},
@@ -808,7 +877,7 @@ func TestRefreshAbortsWhenTheSessionIsRevokedWhileWaiting(t *testing.T) {
 		RefreshToken: "stale-refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
-	if err := h.srv.persistToken(ctx, sessionID, "subject", expired, true); err != nil {
+	if err := h.srv.persistToken(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, expired, true); err != nil {
 		t.Fatal(err)
 	}
 

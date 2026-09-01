@@ -58,7 +58,8 @@ where a default is shown.
 | Variable | Meaning |
 | --- | --- |
 | `PUBLIC_URL` | The origin clients dial, e.g. `https://git-mcp.example.com`. Used as the OAuth issuer and as the base of every advertised URL, so it must match reality. Must be `https` unless it is loopback. No trailing slash. Spelling out a default port is fine; it is normalised before being compared against a browser's `Origin`. |
-| `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. |
+| `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set. |
+| `TARGETS` | Comma-separated names, to serve several MCP servers from one proxy. See below. |
 | `UPSTREAM_ISSUER` | The OAuth provider's origin. Discovery is read from `/.well-known/openid-configuration`, falling back to `/.well-known/oauth-authorization-server`. |
 | `UPSTREAM_CLIENT_ID` | Client id of the application you registered with the provider. |
 | `UPSTREAM_CLIENT_SECRET` | Its secret. |
@@ -78,6 +79,43 @@ openssl rand -base64 32
 
 The application you register with the provider must use
 `PUBLIC_URL` + `/callback` as its redirect URI.
+
+### Several MCP servers behind one proxy
+
+`TARGETS` names them. Each is then configured by its own variables, where the
+prefix is the name uppercased with hyphens turned into underscores, so `git-mcp`
+reads `TARGET_GIT_MCP_*`:
+
+```
+TARGETS=forgejo,plane
+
+TARGET_FORGEJO_UPSTREAM_MCP_URL=http://forgejo-mcp:8080
+TARGET_FORGEJO_CREDENTIAL_MODE=provider_token
+
+TARGET_PLANE_UPSTREAM_MCP_URL=http://plane-mcp-api:8211/http/api-key
+TARGET_PLANE_CREDENTIAL_MODE=static
+TARGET_PLANE_STATIC_HEADERS=Authorization: Bearer plane_api_xxx
+```
+
+`CREDENTIAL_MODE` is `provider_token`, the default, which forwards the
+provider's token; or `static`, which sends `..._STATIC_HEADERS` instead.
+
+Each target is served at `PUBLIC_URL/<name>/mcp` and is a distinct OAuth
+resource, with its own RFC 9728 document at
+`/.well-known/oauth-protected-resource/<name>/mcp`. There is still one issuer and
+one authorization server.
+
+**A token is bound to the target it was issued for.** Presenting it at another
+gets a 401 whose challenge names that target's metadata, so a client can discover
+the right resource and fetch a usable token by itself. Because of that, the
+`resource` parameter is **required** at `/authorize` when several targets are
+configured: there is no sensible default and guessing would mint a token for the
+wrong service.
+
+`TARGETS` cannot be combined with `UPSTREAM_MCP_URL` or `UPSTREAM_STATIC_HEADERS`;
+setting both is refused at boot rather than resolved by precedence. Leaving
+`TARGETS` unset keeps the single-target behaviour exactly as it was, serving
+`/mcp` with `resource` optional, so an existing deployment needs no change.
 
 ### Static upstream credentials
 

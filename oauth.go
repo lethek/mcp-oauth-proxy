@@ -111,13 +111,24 @@ func oauthError(w http.ResponseWriter, status int, code, desc string) {
 // handleProtectedResourceMetadata implements RFC 9728. This is the document a
 // client fetches first; it names us as our own authorization server, which is
 // what lets us present dynamic registration over a provider that has none.
-func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"resource":                 s.cfg.ResourceURI(),
-		"authorization_servers":    []string{s.cfg.PublicURL},
-		"bearer_methods_supported": []string{"header"},
-		"scopes_supported":         []string{"mcp"},
-	})
+func (s *Server) handleProtectedResourceMetadata(t Target) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"resource":                 t.Resource,
+			"authorization_servers":    []string{s.cfg.PublicURL},
+			"bearer_methods_supported": []string{"header"},
+			"scopes_supported":         []string{"mcp"},
+		})
+	}
+}
+
+// handleAmbiguousResourceMetadata answers the bare RFC 9728 path when several
+// targets are served. There is no single resource to name, and returning one of
+// them arbitrarily would send a client to the wrong upstream with a token that
+// will not work there. Better to say so.
+func (s *Server) handleAmbiguousResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	oauthError(w, http.StatusNotFound, "invalid_request",
+		"this proxy serves several resources; request the metadata for one of them: "+s.cfg.ResourceList())
 }
 
 // handleAuthorizationServerMetadata implements RFC 8414. We advertise only what
@@ -239,12 +250,22 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_request", "PKCE with S256 is required")
 		return
 	}
-	// RFC 8707. We serve exactly one resource, so a request naming a different
-	// one is either confused or trying to have us mint a token for somewhere
-	// else. Absent is still allowed, for clients predating the requirement.
-	if res := q.Get("resource"); res != "" && strings.TrimRight(res, "/") != s.cfg.ResourceURI() {
-		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target", "this proxy only issues tokens for "+s.cfg.ResourceURI())
+	// RFC 8707. The resource decides which upstream the resulting token may be
+	// used against, so with several targets it is required: there is no sensible
+	// default, and guessing would hand out a token for the wrong service. With
+	// one target it stays optional, for clients predating the requirement.
+	res := strings.TrimRight(q.Get("resource"), "/")
+	if res == "" && s.cfg.MultiTarget() {
+		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target",
+			"the resource parameter is required; this proxy serves "+s.cfg.ResourceList())
 		return
+	}
+	if res != "" {
+		if _, ok := s.cfg.TargetByResource(res); !ok {
+			s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target",
+				"this proxy only issues tokens for "+s.cfg.ResourceList())
+			return
+		}
 	}
 
 	flow := Flow{
@@ -254,6 +275,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		ClientState:      q.Get("state"),
 		CodeChallenge:    challenge,
 		UpstreamVerifier: newSecret(),
+		Resource:         res,
 		BrowserSecret:    s.browserSecret(w, r),
 	}
 	if err := s.store.CreateFlow(r.Context(), flow); err != nil {
@@ -379,7 +401,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := newSecret()
-	if err := s.persistToken(r.Context(), sessionID, subject, tok, true); err != nil {
+	if err := s.persistToken(r.Context(), sessionID, subject, flow.Resource, tok, true); err != nil {
 		slog.Error("callback: could not store session", "err", err)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error", "could not store the session")
 		return
@@ -560,7 +582,9 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 // ---------- shared helpers ----------
 
-func (s *Server) persistToken(ctx context.Context, sessionID, subject string, tok UpstreamToken, create bool) error {
+// persistToken seals the provider's token into the session. subject and resource
+// are set only on creation; a refresh updates the token and leaves both alone.
+func (s *Server) persistToken(ctx context.Context, sessionID, subject, resource string, tok UpstreamToken, create bool) error {
 	raw, err := json.Marshal(tok)
 	if err != nil {
 		return err
@@ -570,7 +594,7 @@ func (s *Server) persistToken(ctx context.Context, sessionID, subject string, to
 		return err
 	}
 	if create {
-		return s.store.CreateSession(ctx, sessionID, subject, sealed)
+		return s.store.CreateSession(ctx, sessionID, subject, resource, sealed)
 	}
 	return s.store.UpdateSessionToken(ctx, sessionID, sealed)
 }

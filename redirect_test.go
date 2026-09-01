@@ -96,7 +96,7 @@ func TestCheckURLAllowsPrivateHTTP(t *testing.T) {
 	}
 }
 
-func TestIsPlaintextUpstream(t *testing.T) {
+func TestIsPlaintextURL(t *testing.T) {
 	cases := map[string]bool{
 		"http://forgejo-mcp:8080": true,
 		"http://mcp.internal/mcp": true,
@@ -105,9 +105,8 @@ func TestIsPlaintextUpstream(t *testing.T) {
 		"https://mcp.example.com": false,
 	}
 	for raw, want := range cases {
-		c := &Config{UpstreamMCP: raw}
-		if got := c.IsPlaintextUpstream(); got != want {
-			t.Errorf("IsPlaintextUpstream(%q) = %v, want %v", raw, got, want)
+		if got := isPlaintextURL(raw); got != want {
+			t.Errorf("isPlaintextURL(%q) = %v, want %v", raw, got, want)
 		}
 	}
 }

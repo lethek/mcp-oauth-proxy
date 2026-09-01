@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -41,14 +42,9 @@ type Config struct {
 	UpstreamClientSecret string
 	UpstreamScopes       string
 
-	// UpstreamStaticHeaders, when set, are injected on every forwarded request
-	// INSTEAD of the session's upstream token. Some MCP servers authenticate
-	// with a fixed credential of their own rather than accepting the provider's
-	// token — Plane's api-key endpoint wants a personal access token plus a
-	// workspace header. The upstream OAuth settings are still required in this
-	// mode: the provider authenticates the person, and this credential is what
-	// the MCP server behind us accepts.
-	UpstreamStaticHeaders map[string]string
+	// Targets is every upstream MCP server this proxy serves, always at least
+	// one. A deployment configured the original way has a single unnamed target.
+	Targets []Target
 
 	DatabaseURL string
 
@@ -65,6 +61,42 @@ type Config struct {
 	SessionTTL time.Duration
 
 	ListenAddr string
+}
+
+// CredentialMode says how a target authenticates to its MCP server.
+type CredentialMode string
+
+const (
+	// CredProviderToken forwards the provider's own token, the original behaviour.
+	CredProviderToken CredentialMode = "provider_token"
+	// CredStatic sends fixed headers instead, for a server with its own credential.
+	CredStatic CredentialMode = "static"
+)
+
+// targetNamePattern constrains names because they appear in URLs and in
+// environment variable names.
+var targetNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// Target is one upstream MCP server. A deployment serves one or several.
+type Target struct {
+	// Name is empty for a single-target deployment configured the original way,
+	// which keeps serving /mcp. Named targets are served at /<name>/mcp.
+	Name string
+
+	UpstreamMCP   string
+	Mode          CredentialMode
+	StaticHeaders map[string]string
+
+	// Resource is this target's RFC 8707 identifier and the audience of every
+	// token issued for it. Computed once, because comparing it is on the path of
+	// every proxied request.
+	Resource string
+}
+
+// envPrefix maps a target name onto its variable prefix: "git-mcp" reads
+// TARGET_GIT_MCP_*.
+func envPrefix(name string) string {
+	return "TARGET_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_")) + "_"
 }
 
 // parseStaticHeaders reads newline-separated "Name: Value" pairs. Newlines
@@ -113,21 +145,21 @@ func LoadConfig() (*Config, error) {
 		c.ListenAddr = ":8080"
 	}
 
-	staticHeaders, err := parseStaticHeaders(os.Getenv("UPSTREAM_STATIC_HEADERS"))
-	if err != nil {
-		return nil, err
-	}
-	c.UpstreamStaticHeaders = staticHeaders
-
-	missing := []string{}
-	for name, v := range map[string]string{
+	required := map[string]string{
 		"PUBLIC_URL":             c.PublicURL,
-		"UPSTREAM_MCP_URL":       c.UpstreamMCP,
 		"UPSTREAM_ISSUER":        c.UpstreamIssuer,
 		"UPSTREAM_CLIENT_ID":     c.UpstreamClientID,
 		"UPSTREAM_CLIENT_SECRET": c.UpstreamClientSecret,
 		"DATABASE_URL":           c.DatabaseURL,
-	} {
+	}
+	// UPSTREAM_MCP_URL describes the single legacy target and is required only
+	// when TARGETS is absent.
+	if os.Getenv("TARGETS") == "" {
+		required["UPSTREAM_MCP_URL"] = c.UpstreamMCP
+	}
+
+	missing := []string{}
+	for name, v := range required {
 		if v == "" {
 			missing = append(missing, name)
 		}
@@ -153,14 +185,11 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("PUBLIC_URL is not usable: %w", err)
 	}
 
-	// The MCP server is held to a weaker rule on purpose. No browser goes there,
-	// and the common deployment puts it alongside this proxy on a private
-	// network, where plain http is normal and demanding TLS would refuse a
-	// perfectly ordinary setup. It still carries a bearer token, so anything
-	// beyond loopback is worth saying out loud.
-	if err := checkURL(c.UpstreamMCP, false); err != nil {
-		return nil, fmt.Errorf("UPSTREAM_MCP_URL is not usable: %w", err)
+	targets, err := parseTargets(c.PublicURL)
+	if err != nil {
+		return nil, err
 	}
+	c.Targets = targets
 
 	rawKey := os.Getenv("ENCRYPTION_KEY")
 	if rawKey == "" {
@@ -186,6 +215,112 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return c, nil
+}
+
+// parseTargets builds the target list from either the multi-target variables or
+// the original flat ones.
+//
+// The two are mutually exclusive and setting both is an error rather than a
+// precedence rule. A deployment that names TARGETS and also leaves an old
+// UPSTREAM_MCP_URL in place is ambiguous about which upstream it means, and
+// quietly picking one would route real traffic on a guess.
+func parseTargets(publicURL string) ([]Target, error) {
+	raw := strings.TrimSpace(os.Getenv("TARGETS"))
+	legacyURL := strings.TrimRight(os.Getenv("UPSTREAM_MCP_URL"), "/")
+	legacyHeaders := os.Getenv("UPSTREAM_STATIC_HEADERS")
+
+	if raw == "" {
+		headers, err := parseStaticHeaders(legacyHeaders)
+		if err != nil {
+			return nil, err
+		}
+		t := Target{
+			UpstreamMCP:   legacyURL,
+			Mode:          CredProviderToken,
+			StaticHeaders: headers,
+			Resource:      publicURL + "/mcp",
+		}
+		if len(headers) > 0 {
+			t.Mode = CredStatic
+		}
+		if err := checkTargetURL("UPSTREAM_MCP_URL", t.UpstreamMCP); err != nil {
+			return nil, err
+		}
+		return []Target{t}, nil
+	}
+
+	if legacyURL != "" || legacyHeaders != "" {
+		return nil, fmt.Errorf("TARGETS cannot be combined with UPSTREAM_MCP_URL or UPSTREAM_STATIC_HEADERS; move them into TARGET_<NAME>_* variables")
+	}
+
+	var targets []Target
+	seen := map[string]bool{}
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !targetNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("TARGETS: %q is not a valid target name (lowercase letters, digits and hyphens)", name)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("TARGETS: %q is listed twice", name)
+		}
+		seen[name] = true
+
+		p := envPrefix(name)
+		t := Target{
+			Name:        name,
+			UpstreamMCP: strings.TrimRight(os.Getenv(p+"UPSTREAM_MCP_URL"), "/"),
+			Mode:        CredentialMode(os.Getenv(p + "CREDENTIAL_MODE")),
+			Resource:    publicURL + "/" + name + "/mcp",
+		}
+		if t.UpstreamMCP == "" {
+			return nil, fmt.Errorf("missing required environment: %sUPSTREAM_MCP_URL", p)
+		}
+		if err := checkTargetURL(p+"UPSTREAM_MCP_URL", t.UpstreamMCP); err != nil {
+			return nil, err
+		}
+
+		switch t.Mode {
+		case "":
+			t.Mode = CredProviderToken
+		case CredProviderToken, CredStatic:
+		default:
+			return nil, fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static", p, t.Mode)
+		}
+
+		headers, err := parseStaticHeaders(os.Getenv(p + "STATIC_HEADERS"))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		if t.Mode == CredStatic && len(headers) == 0 {
+			return nil, fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
+		}
+		if t.Mode == CredProviderToken && len(headers) > 0 {
+			return nil, fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is provider_token", p, p)
+		}
+		t.StaticHeaders = headers
+
+		targets = append(targets, t)
+	}
+
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("TARGETS is set but names no targets")
+	}
+	return targets, nil
+}
+
+// checkTargetURL holds an MCP server to a weaker rule than a browser-facing URL
+// on purpose. No browser goes there, and the common deployment puts it beside
+// this proxy on a private network, where plain http is normal and demanding TLS
+// would refuse a perfectly ordinary setup. It still carries a credential, so
+// anything beyond loopback is worth saying out loud.
+func checkTargetURL(name, raw string) error {
+	if err := checkURL(raw, false); err != nil {
+		return fmt.Errorf("%s is not usable: %w", name, err)
+	}
+	return nil
 }
 
 func durationEnv(name string, def time.Duration) (time.Duration, error) {
@@ -276,10 +411,10 @@ func canonicalOrigin(u *url.URL) string {
 	return u.Scheme + "://" + host
 }
 
-// IsPlaintextUpstream reports whether the MCP hop runs unencrypted somewhere
-// other than loopback, which is worth a line in the log at boot.
-func (c *Config) IsPlaintextUpstream() bool {
-	u, err := url.Parse(c.UpstreamMCP)
+// isPlaintextURL reports whether an MCP hop runs unencrypted somewhere other
+// than loopback, which is worth a line in the log at boot.
+func isPlaintextURL(raw string) bool {
+	u, err := url.Parse(raw)
 	if err != nil {
 		return false
 	}
@@ -296,4 +431,47 @@ func isLoopbackHost(host string) bool {
 
 // ResourceURI is the canonical identifier of the MCP endpoint, used as the
 // `resource` value in metadata and as the audience of the tokens we issue.
-func (c *Config) ResourceURI() string { return c.PublicURL + "/mcp" }
+// Meaningful only for a single-target deployment.
+func (c *Config) ResourceURI() string { return c.Targets[0].Resource }
+
+// MultiTarget reports whether this deployment serves named targets. It governs
+// two behaviours: whether the `resource` parameter is required at /authorize,
+// and whether a session carrying no resource may be used at all.
+func (c *Config) MultiTarget() bool { return c.Targets[0].Name != "" }
+
+// TargetByResource finds the target a `resource` value names.
+func (c *Config) TargetByResource(resource string) (Target, bool) {
+	resource = strings.TrimRight(resource, "/")
+	for _, t := range c.Targets {
+		if t.Resource == resource {
+			return t, true
+		}
+	}
+	return Target{}, false
+}
+
+// ResourceList is every resource this proxy serves, for error messages.
+func (c *Config) ResourceList() string {
+	out := make([]string, 0, len(c.Targets))
+	for _, t := range c.Targets {
+		out = append(out, t.Resource)
+	}
+	return strings.Join(out, ", ")
+}
+
+// MetadataPath is where RFC 9728 says this target's protected-resource document
+// lives: the resource's path, appended to the well-known prefix.
+func (t Target) MetadataPath() string {
+	if t.Name == "" {
+		return "/.well-known/oauth-protected-resource/mcp"
+	}
+	return "/.well-known/oauth-protected-resource/" + t.Name + "/mcp"
+}
+
+// MCPPath is where clients reach this target.
+func (t Target) MCPPath() string {
+	if t.Name == "" {
+		return "/mcp"
+	}
+	return "/" + t.Name + "/mcp"
+}

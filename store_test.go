@@ -38,7 +38,7 @@ func newTestStore(t *testing.T) *Store {
 func mustSession(t *testing.T, s *Store) string {
 	t.Helper()
 	id := newSecret()
-	if err := s.CreateSession(context.Background(), id, "test-subject", []byte("sealed")); err != nil {
+	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", []byte("sealed")); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	return id
@@ -135,7 +135,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.LookupAccessToken(ctx, access); err != nil {
+	if _, _, err := s.LookupAccessToken(ctx, access); err != nil {
 		t.Fatalf("access token should work before revocation: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token after revocation: err = %v, want ErrNotFound", err)
 	}
 	if _, _, err := s.TakeRefreshToken(ctx, refresh); !errors.Is(err, ErrNotFound) {
@@ -217,7 +217,7 @@ func TestExpiredCredentialsAreRefused(t *testing.T) {
 	if err := s.CreateAccessToken(ctx, access, session, "c1", -time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expired access token: err = %v, want ErrNotFound", err)
 	}
 
@@ -253,7 +253,7 @@ func TestSessionLifetimeOutranksTokenLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token outlived its session: err = %v, want ErrNotFound", err)
 	}
 	if _, _, err := s.TakeRefreshToken(ctx, refresh); errors.Is(err, nil) {
@@ -401,14 +401,20 @@ func TestMigrateUpgradesAnOlderSchema(t *testing.T) {
 		return n > 0
 	}
 
-	for _, table := range []string{"flows", "auth_codes"} {
-		if hasColumn(table, "resource") {
-			t.Errorf("%s still carries the unused resource column after migrating", table)
-		}
+	// auth_codes.resource stays dropped. The audience belongs to the session, not
+	// to each credential minted against it, so threading it through the code adds
+	// a second place for the same fact to be wrong.
+	if hasColumn("auth_codes", "resource") {
+		t.Error("auth_codes still carries the unused resource column after migrating")
 	}
 	for _, c := range []struct{ table, column string }{
 		{"flows", "approved"},
 		{"flows", "browser_hash"},
+		// resource is back on flows, and new on sessions. It carries the chosen
+		// target from /authorize to /callback and then bounds what the resulting
+		// token may be used against, so an upgraded database must gain both.
+		{"flows", "resource"},
+		{"sessions", "resource"},
 		{"refresh_tokens", "used"},
 		{"refresh_tokens", "used_at"},
 	} {

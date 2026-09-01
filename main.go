@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -28,7 +29,10 @@ type Server struct {
 	store    *Store
 	upstream *Upstream
 	sealer   *sealer
-	proxy    http.Handler
+
+	// proxies holds one reverse proxy per target, keyed by target name. A
+	// single-target deployment keys it on the empty string.
+	proxies map[string]http.Handler
 
 	// The caps differ by what each endpoint can be made to do, not by how
 	// sensitive it sounds.
@@ -59,19 +63,23 @@ func run() error {
 		return err
 	}
 
-	upstreamURL, err := url.Parse(cfg.UpstreamMCP)
-	if err != nil {
-		return err
-	}
-
 	seal, err := newSealer(cfg.EncryptionKey)
 	if err != nil {
 		return err
 	}
 
-	if cfg.IsPlaintextUpstream() {
-		slog.Warn("the MCP server is reached over plain http; the provider's token crosses that hop in the clear",
-			"upstream_mcp", cfg.UpstreamMCP)
+	proxies := map[string]http.Handler{}
+	for _, t := range cfg.Targets {
+		u, err := url.Parse(t.UpstreamMCP)
+		if err != nil {
+			return fmt.Errorf("target %q: %w", t.Name, err)
+		}
+		proxies[t.Name] = newReverseProxy(u)
+
+		if isPlaintextURL(t.UpstreamMCP) {
+			slog.Warn("the MCP server is reached over plain http; the credential crosses that hop in the clear",
+				"target", t.Name, "upstream_mcp", t.UpstreamMCP)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -88,7 +96,7 @@ func run() error {
 		store:           store,
 		upstream:        NewUpstream(cfg),
 		sealer:          seal,
-		proxy:           newReverseProxy(upstreamURL),
+		proxies:         proxies,
 		registerLimit:   newLimiter(20, time.Minute),
 		flowLimit:       newLimiter(120, time.Minute),
 		credentialLimit: newLimiter(600, time.Minute),
@@ -140,10 +148,18 @@ func run() error {
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// RFC 9728 requires the bare path; MCP clients may also probe the
-	// resource-specific form, so both are served.
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleProtectedResourceMetadata)
+	// RFC 9728 derives a resource's metadata path from the resource's own path,
+	// so each target gets its own document. The bare path is only meaningful when
+	// there is a single resource to mean; with several it says so rather than
+	// naming one of them arbitrarily.
+	if s.cfg.MultiTarget() {
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleAmbiguousResourceMetadata)
+	} else {
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata(s.cfg.Targets[0]))
+	}
+	for _, t := range s.cfg.Targets {
+		mux.HandleFunc("GET "+t.MetadataPath(), s.handleProtectedResourceMetadata(t))
+	}
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthorizationServerMetadata)
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server/mcp", s.handleAuthorizationServerMetadata)
 
@@ -164,8 +180,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.handleToken))
 	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.handleRevoke))
 
-	mux.HandleFunc("/mcp", s.handleMCP)
-	mux.HandleFunc("/mcp/", s.handleMCP)
+	for _, t := range s.cfg.Targets {
+		h := s.handleMCP(t)
+		mux.HandleFunc(t.MCPPath(), h)
+		mux.HandleFunc(t.MCPPath()+"/", h)
+	}
 
 	// Liveness only. It says this process is up, not that the provider or the
 	// MCP server behind it are, so it can never take the pod down for their sake.

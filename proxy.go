@@ -8,6 +8,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -15,7 +16,13 @@ import (
 // the resource_metadata pointer a client has no way to discover who issues
 // tokens for this endpoint, so every unauthenticated path must go through here.
 func (s *Server) challenge(w http.ResponseWriter, errCode, desc string) {
-	v := `Bearer resource_metadata=` + strconv.Quote(s.cfg.PublicURL+"/.well-known/oauth-protected-resource")
+	s.challengeFor(w, s.cfg.Targets[0], errCode, desc)
+}
+
+// challengeFor points the client at the metadata for a specific target, which is
+// what lets a caller holding a token for the wrong one recover on its own.
+func (s *Server) challengeFor(w http.ResponseWriter, t Target, errCode, desc string) {
+	v := `Bearer resource_metadata=` + strconv.Quote(s.cfg.PublicURL+t.MetadataPath())
 	if errCode != "" {
 		v += `, error=` + strconv.Quote(errCode)
 		if desc != "" {
@@ -60,6 +67,27 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	return p
 }
 
+// stripTargetPrefix removes the "/<target>" segment before the request is
+// forwarded.
+//
+// ReverseProxy joins the upstream's path with the INCOMING path, so without this
+// a request to /plane/mcp against an upstream of /http/api-key would be sent to
+// /http/api-key/plane/mcp. The target name is how this proxy addresses its own
+// routes and means nothing to the server behind it.
+func stripTargetPrefix(r *http.Request, t Target) {
+	if t.Name == "" {
+		return
+	}
+	prefix := "/" + t.Name
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, prefix)
+	}
+	if r.URL.Path == "" {
+		r.URL.Path = "/"
+	}
+}
+
 // prepareUpstreamHeaders drops the credential the caller sent us and, when
 // static headers are configured, applies those in its place. It reports whether
 // the upstream credential is now settled.
@@ -98,42 +126,65 @@ func refreshLock(sessionID string) *sync.Mutex {
 	return &refreshLocks[h.Sum32()%refreshStripes]
 }
 
-// handleMCP authenticates the caller against a token we issued, swaps in the
-// upstream credential we are holding for that session, and forwards.
-func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
-	token := bearerFrom(r)
-	if token == "" {
-		s.challenge(w, "", "")
-		return
-	}
+// handleMCP authenticates the caller against a token we issued, checks that the
+// token was issued for THIS target, swaps in the upstream credential, and
+// forwards.
+func (s *Server) handleMCP(t Target) http.HandlerFunc {
+	proxy := s.proxies[t.Name]
 
-	sessionID, err := s.store.LookupAccessToken(r.Context(), token)
-	if err != nil {
-		if !errors.Is(err, ErrNotFound) {
-			slog.Error("mcp: token lookup failed", "err", err)
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := bearerFrom(r)
+		if token == "" {
+			s.challengeFor(w, t, "", "")
+			return
 		}
-		s.challenge(w, "invalid_token", "the access token is unknown or expired")
-		return
-	}
 
-	// In static mode the upstream authenticates with a fixed credential, so this
-	// session's provider token is irrelevant. It is deliberately not loaded: it
-	// may have expired with no refresh token available, and failing a request
-	// over a credential we were never going to send would be wrong.
-	if prepareUpstreamHeaders(r, s.cfg.UpstreamStaticHeaders) {
-		s.proxy.ServeHTTP(w, r)
-		return
-	}
+		sessionID, resource, err := s.store.LookupAccessToken(r.Context(), token)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				slog.Error("mcp: token lookup failed", "err", err)
+			}
+			s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
+			return
+		}
 
-	upstreamTok, err := s.currentUpstreamToken(r, sessionID)
-	if err != nil {
-		slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
-		s.challenge(w, "invalid_token", "the upstream credential for this session is no longer usable")
-		return
-	}
+		// The audience check. Without it a token minted for one target would work
+		// against every other, which would turn separate upstreams into one
+		// permission. A challenge naming THIS target's metadata is returned rather
+		// than a flat refusal, so a client holding the wrong token can discover the
+		// right resource and fetch a usable one by itself.
+		//
+		// An empty resource means a session from a single-target deployment that
+		// never asked for one. That is only acceptable while there is exactly one
+		// target to mean; with several it fails shut.
+		if resource != t.Resource && (resource != "" || s.cfg.MultiTarget()) {
+			slog.Warn("mcp: token presented at the wrong resource",
+				"session", sessionID, "token_resource", resource, "target", t.Resource)
+			s.challengeFor(w, t, "invalid_token", "this token was not issued for "+t.Resource)
+			return
+		}
 
-	r.Header.Set("Authorization", "Bearer "+upstreamTok.AccessToken)
-	s.proxy.ServeHTTP(w, r)
+		stripTargetPrefix(r, t)
+
+		// In static mode the upstream authenticates with a fixed credential, so this
+		// session's provider token is irrelevant. It is deliberately not loaded: it
+		// may have expired with no refresh token available, and failing a request
+		// over a credential we were never going to send would be wrong.
+		if prepareUpstreamHeaders(r, t.StaticHeaders) {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+
+		upstreamTok, err := s.currentUpstreamToken(r, sessionID)
+		if err != nil {
+			slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
+			s.challengeFor(w, t, "invalid_token", "the upstream credential for this session is no longer usable")
+			return
+		}
+
+		r.Header.Set("Authorization", "Bearer "+upstreamTok.AccessToken)
+		proxy.ServeHTTP(w, r)
+	}
 }
 
 // currentUpstreamToken returns a usable upstream token, refreshing it first if
@@ -177,7 +228,9 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 	if refreshed.RefreshToken == "" {
 		refreshed.RefreshToken = fresh.RefreshToken
 	}
-	if err := s.persistToken(r.Context(), sessionID, "", refreshed, false); err != nil {
+	// subject and resource are ignored on an update; both belong to the session
+	// as created and a refresh must not be able to change either.
+	if err := s.persistToken(r.Context(), sessionID, "", "", refreshed, false); err != nil {
 		return refreshed, err
 	}
 	slog.Info("refreshed the upstream token", "session", sessionID)

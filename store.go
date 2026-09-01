@@ -65,13 +65,19 @@ CREATE TABLE IF NOT EXISTS clients (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- resource lives here rather than on auth_codes and access_tokens because a
+-- session is created for exactly one authorization, which named exactly one
+-- resource. Every credential issued against the session inherits it, including
+-- refreshed ones, without threading the value through three more tables.
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,
     subject        TEXT NOT NULL DEFAULT '',
+    resource       TEXT NOT NULL DEFAULT '',
     upstream_token BYTEA NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS resource TEXT NOT NULL DEFAULT '';
 
 -- An in-flight authorization: created when the client hits /authorize, marked
 -- approved when the user accepts at /consent, and consumed when the upstream
@@ -93,11 +99,11 @@ ALTER TABLE flows ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT fal
 -- the equality test in ApproveFlow, so a row from an older version fails shut.
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS browser_hash BYTEA;
 
--- resource was collected and never used. It is validated at /authorize against
--- the one resource this proxy serves, so there is nothing left to carry per
--- row, and a column nobody writes reads as a control that exists when it does
--- not. Dropped rather than left behind.
-ALTER TABLE flows DROP COLUMN IF EXISTS resource;
+-- resource was dropped when this proxy served exactly one, because a column
+-- nobody reads is a control that only appears to exist. It is back, and this
+-- time it is enforced: with several targets it decides which upstream a token
+-- may be used against. Empty means a single-target deployment that never asked.
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS resource TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS auth_codes (
     code_hash      BYTEA PRIMARY KEY,
@@ -177,17 +183,21 @@ type Flow struct {
 	CodeChallenge    string
 	UpstreamVerifier string
 
+	// Resource is the target this authorization is for, carried from /authorize
+	// to /callback so the session it creates records the right audience.
+	Resource string
+
 	// BrowserSecret ties this flow to the browser that was shown the consent
 	// page. Only the hash is stored. It is write-only: CreateFlow reads it and
 	// nothing ever returns it, so a caller cannot accidentally leak it back out.
 	BrowserSecret string
 }
 
-const flowColumns = `id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier`
+const flowColumns = `id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, resource`
 
 func scanFlow(row pgx.Row) (Flow, error) {
 	var f Flow
-	err := row.Scan(&f.ID, &f.ClientID, &f.RedirectURI, &f.ClientState, &f.CodeChallenge, &f.UpstreamVerifier)
+	err := row.Scan(&f.ID, &f.ClientID, &f.RedirectURI, &f.ClientState, &f.CodeChallenge, &f.UpstreamVerifier, &f.Resource)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return f, ErrNotFound
 	}
@@ -196,10 +206,10 @@ func scanFlow(row pgx.Row) (Flow, error) {
 
 func (s *Store) CreateFlow(ctx context.Context, f Flow) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO flows (id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, browser_hash)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		`INSERT INTO flows (id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, resource, browser_hash)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		f.ID, f.ClientID, f.RedirectURI, f.ClientState, f.CodeChallenge, f.UpstreamVerifier,
-		hashToken(f.BrowserSecret))
+		f.Resource, hashToken(f.BrowserSecret))
 	return err
 }
 
@@ -249,10 +259,10 @@ func (s *Store) TakeApprovedFlow(ctx context.Context, id string) (Flow, error) {
 
 // ---------- sessions ----------
 
-func (s *Store) CreateSession(ctx context.Context, id, subject string, sealedToken []byte) error {
+func (s *Store) CreateSession(ctx context.Context, id, subject, resource string, sealedToken []byte) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO sessions (id, subject, upstream_token) VALUES ($1,$2,$3)`,
-		id, subject, sealedToken)
+		`INSERT INTO sessions (id, subject, resource, upstream_token) VALUES ($1,$2,$3,$4)`,
+		id, subject, resource, sealedToken)
 	return err
 }
 
@@ -331,16 +341,20 @@ func (s *Store) CreateAccessToken(ctx context.Context, token, sessionID, clientI
 
 // LookupAccessToken also enforces the session's absolute lifetime, so an access
 // token minted just before that deadline does not outlive it.
-func (s *Store) LookupAccessToken(ctx context.Context, token string) (sessionID string, err error) {
+//
+// It returns the session's resource in the same query, because every proxied
+// request needs it to check the token's audience and a second round trip on that
+// path would be paid on every call.
+func (s *Store) LookupAccessToken(ctx context.Context, token string) (sessionID, resource string, err error) {
 	err = s.pool.QueryRow(ctx,
-		`SELECT t.session_id FROM access_tokens t
+		`SELECT t.session_id, s.resource FROM access_tokens t
 		 JOIN sessions s ON s.id = t.session_id
 		 WHERE t.token_hash=$1 AND t.expires_at > now() AND s.created_at > now() - $2::interval`,
-		hashToken(token), s.sessionTTL.String()).Scan(&sessionID)
+		hashToken(token), s.sessionTTL.String()).Scan(&sessionID, &resource)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound
+		return "", "", ErrNotFound
 	}
-	return sessionID, err
+	return sessionID, resource, err
 }
 
 func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, clientID string) error {
