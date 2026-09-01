@@ -237,9 +237,16 @@ func TestIsPublicIPRejectsEmbeddedIPv4(t *testing.T) {
 		"2002:0a00:0063::": false, // 10.0.0.99
 		"2002:7f00:0001::": false, // 127.0.0.1
 		"2002:5db8:d822::": true,  // 93.184.216.34
-		// NAT64
-		"64:ff9b::10.0.0.99":     false,
-		"64:ff9b::93.184.216.34": true,
+		// NAT64, refused as a whole range rather than decoded. Which octets
+		// carry the embedded address depends on the translation prefix length,
+		// which RFC 8215 leaves to local choice for 64:ff9b:1::/48, so it
+		// cannot be read reliably. Taking the last four octets for both
+		// prefixes, as an earlier version did, accepted the third address here:
+		// those octets read as 8.8.8.8 while a /48 gateway translates it to
+		// 10.0.0.1.
+		"64:ff9b::10.0.0.99":        false,
+		"64:ff9b::93.184.216.34":    false,
+		"64:ff9b:1:a00:0:1:808:808": false,
 		// An ordinary v6 address is unaffected.
 		"2606:2800:220::": true,
 		"fd00::1":         false,

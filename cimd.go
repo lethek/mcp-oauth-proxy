@@ -66,10 +66,6 @@ func embeddedIPv4(ip net.IP) net.IP {
 		return nil
 	}
 	switch {
-	case nat64WellKnown.Contains(ip), nat64Local.Contains(ip):
-		// The v4 address sits in the last four octets of the /96, and for the
-		// /48 form in the same position this proxy cares about.
-		return net.IPv4(v6[12], v6[13], v6[14], v6[15])
 	case sixToFour.Contains(ip):
 		return net.IPv4(v6[2], v6[3], v6[4], v6[5])
 	case ipv4Compatible.Contains(ip):
@@ -200,6 +196,17 @@ func isPublicIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	// A NAT64 address is an IPv4 destination in disguise: on a network with a
+	// NAT64 gateway it reaches whatever address is embedded in it. Which octets
+	// hold that address depends on the translation prefix length, and RFC 8215
+	// leaves that to local choice for 64:ff9b:1::/48, so it cannot be read
+	// reliably — an earlier version read the last four octets for both prefixes
+	// and so accepted 64:ff9b:1:a00:0:1:808:808, which a /48 gateway translates
+	// to 10.0.0.1. Nothing legitimate serves a client metadata document at a
+	// synthesised address, so the range is refused rather than decoded.
+	if nat64WellKnown.Contains(ip) || nat64Local.Contains(ip) {
 		return false
 	}
 	if v4 := ip.To4(); v4 != nil {

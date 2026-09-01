@@ -67,6 +67,37 @@ var upstreamTransport = &http.Transport{
 	ExpectContinueTimeout: 1 * time.Second,
 }
 
+// maxInFlightPerTarget bounds how many requests may be forwarded to one
+// upstream at a time.
+//
+// There is no ResponseHeaderTimeout, so a request to an upstream that accepts
+// the connection and never answers is held until the client disconnects.
+// Nothing else bounds that: the rate limiter counts arrivals per minute, not
+// concurrent work, so a caller who opens requests and keeps them open
+// accumulates goroutines and upstream connections without limit. The cap sits
+// far above real use; past it callers get a 503 they can retry rather than a
+// proxy that has run out of sockets.
+const maxInFlightPerTarget = 64
+
+// boundConcurrency refuses a request rather than queueing it once n are already
+// in flight. Queueing would convert exhaustion into unbounded latency for
+// everyone, which is not an improvement on refusing the caller who caused it.
+func boundConcurrency(h http.Handler, n int) http.Handler {
+	slots := make(chan struct{}, n)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+			h.ServeHTTP(w, r)
+		default:
+			slog.Warn("mcp: refused a request; the upstream already has the maximum in flight", "limit", n)
+			w.Header().Set("Retry-After", "5")
+			oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
+				"too many requests are already in flight to this server; retry shortly")
+		}
+	})
+}
+
 // newReverseProxy targets the upstream MCP server. Streamable HTTP keeps a
 // long-lived response open, so buffering has to stay off.
 //
@@ -75,7 +106,10 @@ var upstreamTransport = &http.Transport{
 // accepted — revoked at the far end, most likely — and passing that through
 // unchanged would reach the client as an unexplained "unauthorized" about a
 // credential the client has never seen and cannot fix.
-func newReverseProxy(target *url.URL, enrolURL string) *httputil.ReverseProxy {
+//
+// The concurrency bound is applied here rather than by the caller so that no
+// construction site can forget it.
+func newReverseProxy(target *url.URL, enrolURL string) http.Handler {
 	p := &httputil.ReverseProxy{
 		Transport: upstreamTransport,
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -102,7 +136,7 @@ func newReverseProxy(target *url.URL, enrolURL string) *httputil.ReverseProxy {
 			oauthError(w, http.StatusBadGateway, "server_error", "the MCP server could not be reached")
 		},
 	}
-	return p
+	return boundConcurrency(p, maxInFlightPerTarget)
 }
 
 // replaceWithEnrolAdvice rewrites an upstream 401 in place.

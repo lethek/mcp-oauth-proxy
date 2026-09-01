@@ -94,3 +94,81 @@ func TestDiscoverySucceedsAfterTheProviderRecovers(t *testing.T) {
 		t.Errorf("unexpected token endpoint %q", meta.TokenEndpoint)
 	}
 }
+
+// TestStaleDiscoveryIsServedThroughAnOutage covers the fallback that exists so a
+// provider restart does not take every authorization down with it.
+//
+// The second call is the one that matters. Serving the stale document only from
+// the branch that attempts a fetch meant one call in each retry window survived
+// the outage and every other call failed, which is not what the fallback was
+// added to do.
+func TestStaleDiscoveryIsServedThroughAnOutage(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(true)
+
+	provider := httptest.NewUnstartedServer(nil)
+	provider.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issuer":                 "http://" + provider.Listener.Addr().String(),
+			"authorization_endpoint": "https://provider.example/authorize",
+			"token_endpoint":         "https://provider.example/token",
+		})
+	})
+	provider.Start()
+	defer provider.Close()
+
+	u := NewUpstream(&Config{UpstreamIssuer: provider.URL})
+	ctx := context.Background()
+
+	first, err := u.Meta(ctx)
+	if err != nil {
+		t.Fatalf("initial discovery: %v", err)
+	}
+
+	// Age the document past its TTL and take the provider away.
+	healthy.Store(false)
+	u.mu.Lock()
+	u.fetchedAt = time.Now().Add(-discoveryTTL - time.Second)
+	u.mu.Unlock()
+
+	for i := range 5 {
+		got, err := u.Meta(ctx)
+		if err != nil {
+			t.Fatalf("call %d during the outage failed with a usable document in memory: %v", i+1, err)
+		}
+		if got.TokenEndpoint != first.TokenEndpoint {
+			t.Fatalf("call %d returned %q, want the cached %q", i+1, got.TokenEndpoint, first.TokenEndpoint)
+		}
+	}
+}
+
+// TestStaleDiscoveryIsNotServedForever bounds the fallback above. Without a
+// bound, a provider we can no longer reach leaves the process running on a
+// document nobody has confirmed, and a rotated endpoint never takes effect.
+func TestStaleDiscoveryIsNotServedForever(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer down.Close()
+
+	u := NewUpstream(&Config{UpstreamIssuer: down.URL})
+	u.meta = &upstreamMeta{
+		Issuer:                down.URL,
+		AuthorizationEndpoint: "https://provider.example/authorize",
+		TokenEndpoint:         "https://provider.example/token",
+	}
+	u.fetchedAt = time.Now().Add(-discoveryMaxStale - time.Minute)
+
+	if _, err := u.Meta(context.Background()); err == nil {
+		t.Error("a document older than discoveryMaxStale was served")
+	}
+	// And again, now that the failure is cached, so the bound holds on the
+	// backoff path too.
+	if _, err := u.Meta(context.Background()); err == nil {
+		t.Error("a document older than discoveryMaxStale was served during retry backoff")
+	}
+}

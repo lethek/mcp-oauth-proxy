@@ -1052,6 +1052,62 @@ func TestUnauthenticatedEndpointsAreRateLimited(t *testing.T) {
 	}
 }
 
+// TestMCPDoesNotDrawOnTheCredentialBudget pins /mcp to its own bucket.
+//
+// Sharing credentialLimit meant one chatty session could spend the budget and
+// leave /token, /callback, /consent and /settings refusing everyone: a backstop
+// on the busiest route taking down the authorization surface. The route table
+// is the only thing that keeps them apart, and the test above never requests
+// /mcp, so nothing else fails if they are joined back together.
+func TestMCPDoesNotDrawOnTheCredentialBudget(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+
+	// Get a usable token and credential before shrinking anything, since
+	// obtaining them spends the very budget under test.
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer upstream-token"})
+
+	h.srv.credentialLimit = newLimiter(1, time.Minute)
+	limitedRoutes := httptest.NewServer(h.srv.routes())
+	defer limitedRoutes.Close()
+
+	// Spend the credential budget outright.
+	spend, err := h.otherBrowser.PostForm(limitedRoutes.URL+"/token", url.Values{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spend.Body.Close()
+	confirm, err := h.otherBrowser.PostForm(limitedRoutes.URL+"/token", url.Values{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirm.Body.Close()
+	if confirm.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("the credential budget was not spent: second POST /token gave %d, want 429", confirm.StatusCode)
+	}
+
+	// MCP must be unaffected.
+	req, err := http.NewRequest(http.MethodPost, limitedRoutes.URL+"/alpha/mcp", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+access)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.otherBrowser.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		t.Fatal("POST /alpha/mcp was refused by the spent credential budget; the two buckets are shared")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("POST /alpha/mcp: status %d, want 200", resp.StatusCode)
+	}
+}
+
 // TestConsentAcceptsOriginWithoutDefaultPort covers a PUBLIC_URL that spells out
 // the default port. A browser never includes one in the Origin header, so
 // comparing raw hosts refused every consent submission from every user, while

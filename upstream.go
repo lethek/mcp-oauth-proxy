@@ -49,6 +49,12 @@ const discoveryRetryAfter = 5 * time.Second
 // restart.
 const discoveryTTL = 15 * time.Minute
 
+// discoveryMaxStale bounds how far past the TTL a document may be served when
+// refresh keeps failing. Long enough to ride out any outage worth riding out,
+// short enough that a provider we can no longer reach eventually fails loudly
+// instead of running on a document nobody has confirmed for a day.
+const discoveryMaxStale = 24 * time.Hour
+
 type Upstream struct {
 	cfg  *Config
 	http *http.Client
@@ -76,8 +82,15 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	if m != nil && time.Since(fetchedAt) < discoveryTTL {
 		return m, nil
 	}
-	fresh := m == nil
 	if failErr != nil && time.Since(failedAt) < discoveryRetryAfter {
+		// Backoff stops us hammering a provider that is down; it must not also
+		// throw away a document we are holding. Returning the error here while
+		// the code below would have returned the same document as stale made the
+		// outage survivable for one request in every retry window and fatal for
+		// the rest.
+		if m != nil && time.Since(fetchedAt) < discoveryMaxStale {
+			return m, nil
+		}
 		return nil, failErr
 	}
 
@@ -143,7 +156,12 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	// The TTL exists so a rotated endpoint is eventually picked up, not so a
 	// thirty-second provider restart takes every authorization down while a
 	// perfectly usable document sits in memory.
-	if !fresh {
+	//
+	// Staleness is bounded all the same. Serving a document indefinitely because
+	// refresh keeps failing would restore the very failure the TTL was added to
+	// prevent: a rotated endpoint that never takes effect, with nothing but a log
+	// line to say so.
+	if m != nil && time.Since(fetchedAt) < discoveryMaxStale {
 		slog.Warn("serving stale provider discovery; refresh failed", "err", err)
 		return m, nil
 	}
