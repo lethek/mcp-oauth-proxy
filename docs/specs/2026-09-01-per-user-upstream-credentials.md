@@ -93,8 +93,21 @@ second round trip on every request. No existing signature changes.
 
 ### Enrolment
 
-`/settings` is a small authenticated page listing the fields from
-`UPSTREAM_USER_HEADERS`, with a form to set or replace them.
+`/settings` is an authenticated catalogue. It lists every configured target in
+`per_user` mode, shows whether the signed-in subject has enrolled in each, and
+offers a form per target to set or replace that credential.
+
+**Targets themselves stay operator-defined, in configuration under version
+control. Users supply credentials, never upstream URLs.** A user-supplied
+upstream URL would let anyone who can log in aim the proxy at any address it can
+reach and have it attach credentials to the request: Vault, Postgres, the
+Kubernetes API. The usual defence of refusing private address ranges is
+unavailable, because the legitimate upstreams are themselves internal cluster
+services and are indistinguishable from those by address. An operator allowlist
+would be the only real control, and maintaining one is the same work as defining
+the targets.
+
+The form fields for each target come from that target's `UPSTREAM_USER_HEADERS`.
 
 It needs its own browser session, which the proxy does not currently have. The
 existing consent page is bound to an in-flight authorization via `flows` and
@@ -152,8 +165,9 @@ change is larger than it first appears.
 - `handleMCP` in per-user mode: injects that subject's headers; an unenrolled
   subject gets 403 and no upstream request is made; and the existing guarantee
   that the caller's own `Authorization` never reaches the upstream still holds.
-- Enrolment: unauthenticated `GET /settings` redirects; `POST` stores against the
-  cookie's subject; a forged subject in the body is ignored.
+- Enrolment: unauthenticated `GET /settings` redirects; the catalogue lists only
+  targets in `per_user` mode; `POST` stores against the cookie's subject; and
+  both a forged subject and an unconfigured target name in the body are ignored.
 
 ## Out of scope
 
