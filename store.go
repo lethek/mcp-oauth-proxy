@@ -135,6 +135,30 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
 
+-- What a user supplied for themselves, for a target whose MCP server wants its
+-- own credential rather than the provider's token. Keyed on (subject, target)
+-- because one person may hold a different credential at each.
+--
+-- No foreign key to sessions: a credential outlives any single authorization and
+-- must survive the user re-authorising.
+CREATE TABLE IF NOT EXISTS user_credentials (
+    subject        TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    sealed_headers BYTEA NOT NULL,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (subject, target)
+);
+
+-- An in-flight login for the enrolment page. Separate from flows because there
+-- is no MCP client involved: nobody registered, there is no redirect_uri to
+-- return to and no PKCE challenge of a client's to verify.
+CREATE TABLE IF NOT EXISTS settings_flows (
+    id                TEXT PRIMARY KEY,
+    upstream_verifier TEXT NOT NULL,
+    browser_hash      BYTEA NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS access_tokens_session_idx  ON access_tokens (session_id);
 CREATE INDEX IF NOT EXISTS refresh_tokens_session_idx ON refresh_tokens (session_id);
 
@@ -418,6 +442,90 @@ func (s *Store) SessionForToken(ctx context.Context, token string) (string, erro
 	return sessionID, err
 }
 
+// ---------- per-user credentials ----------
+
+// PutUserCredential replaces whatever the subject had for this target. Replacing
+// rather than erroring on a duplicate is the point: rotating a leaked token is
+// the same action as setting one for the first time.
+func (s *Store) PutUserCredential(ctx context.Context, subject, target string, sealed []byte) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ($1,$2,$3)
+		 ON CONFLICT (subject, target)
+		 DO UPDATE SET sealed_headers = EXCLUDED.sealed_headers, updated_at = now()`,
+		subject, target, sealed)
+	return err
+}
+
+// UserCredentialForSession resolves a session straight to its owner's credential
+// for a target, in one query. Every proxied request in per_user mode needs it, so
+// fetching the subject and then the credential would cost a second round trip on
+// that path.
+func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target string) ([]byte, error) {
+	var sealed []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT c.sealed_headers FROM sessions s
+		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2
+		 WHERE s.id = $1 AND s.subject <> ''`,
+		sessionID, target).Scan(&sealed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return sealed, err
+}
+
+// EnrolledTargets is the set a subject has already configured, for the catalogue.
+func (s *Store) EnrolledTargets(ctx context.Context, subject string) (map[string]time.Time, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT target, updated_at FROM user_credentials WHERE subject=$1`, subject)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var target string
+		var at time.Time
+		if err := rows.Scan(&target, &at); err != nil {
+			return nil, err
+		}
+		out[target] = at
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteUserCredential(ctx context.Context, subject, target string) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM user_credentials WHERE subject=$1 AND target=$2`, subject, target)
+	return err
+}
+
+// ---------- settings login ----------
+
+func (s *Store) CreateSettingsFlow(ctx context.Context, id, verifier, browserSecret string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO settings_flows (id, upstream_verifier, browser_hash) VALUES ($1,$2,$3)`,
+		id, verifier, hashToken(browserSecret))
+	return err
+}
+
+// TakeSettingsFlow consumes the flow, demanding the same browser that started it.
+// Single use by deletion, so a replayed callback finds nothing.
+func (s *Store) TakeSettingsFlow(ctx context.Context, id, browserSecret string) (verifier string, err error) {
+	if browserSecret == "" {
+		return "", ErrNotFound
+	}
+	err = s.pool.QueryRow(ctx,
+		`DELETE FROM settings_flows
+		 WHERE id=$1 AND created_at > now() - $2::interval AND browser_hash=$3
+		 RETURNING upstream_verifier`,
+		id, flowTTL.String(), hashToken(browserSecret)).Scan(&verifier)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return verifier, err
+}
+
 // Sweep clears rows that are past their usefulness. Expired credentials are
 // already refused on lookup; this bounds the tables and, for sessions, makes
 // sure an upstream token stops existing rather than merely stops being
@@ -430,6 +538,7 @@ func (s *Store) Sweep(ctx context.Context) error {
 		args []any
 	}{
 		{sql: `DELETE FROM flows WHERE created_at < now() - INTERVAL '1 hour'`},
+		{sql: `DELETE FROM settings_flows WHERE created_at < now() - INTERVAL '1 hour'`},
 		{sql: `DELETE FROM auth_codes WHERE created_at < now() - INTERVAL '1 hour'`},
 		{sql: `DELETE FROM access_tokens WHERE expires_at < now() - INTERVAL '1 day'`},
 

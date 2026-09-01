@@ -97,8 +97,12 @@ TARGET_PLANE_CREDENTIAL_MODE=static
 TARGET_PLANE_STATIC_HEADERS=Authorization: Bearer plane_api_xxx
 ```
 
-`CREDENTIAL_MODE` is `provider_token`, the default, which forwards the
-provider's token; or `static`, which sends `..._STATIC_HEADERS` instead.
+`CREDENTIAL_MODE` is one of:
+
+- `provider_token`, the default, which forwards the provider's own token.
+- `static`, which sends the fixed `..._STATIC_HEADERS` instead.
+- `per_user`, which sends the credential each user stored for themselves. See
+  below.
 
 Each target is served at `PUBLIC_URL/<name>/mcp` and is a distinct OAuth
 resource, with its own RFC 9728 document at
@@ -116,6 +120,52 @@ wrong service.
 setting both is refused at boot rather than resolved by precedence. Leaving
 `TARGETS` unset keeps the single-target behaviour exactly as it was, serving
 `/mcp` with `resource` optional, so an existing deployment needs no change.
+
+### Per-user credentials
+
+`static` sends one credential for everybody, so the MCP server records every
+action against whoever owns that credential and cannot tell callers apart.
+`per_user` fixes that: each person stores their own, and the server sees who is
+actually asking.
+
+`..._USER_HEADERS` declares what they are asked for, as JSON:
+
+```
+TARGET_PLANE_CREDENTIAL_MODE=per_user
+TARGET_PLANE_USER_HEADERS=[
+  {"header":"Authorization","label":"Plane personal access token","prefix":"Bearer "},
+  {"header":"x-workspace-slug","label":"Workspace slug"}
+]
+```
+
+`prefix` is applied when the header is built, so a user pastes a bare token
+rather than typing `Bearer ` themselves.
+
+Users then visit **`PUBLIC_URL/settings`**, which lists every `per_user` target,
+shows which they have configured, and takes a value per field. The page runs its
+own sign-in against the provider, so **its redirect URI,
+`PUBLIC_URL/settings/callback`, must be registered with the provider alongside
+`PUBLIC_URL/callback`.**
+
+Credentials are stored encrypted with `ENCRYPTION_KEY`, keyed on the provider's
+subject and the target, and never logged.
+
+Someone who has not enrolled gets **403** naming the settings page, and their
+request never reaches the MCP server. It is deliberately not a 401 challenge:
+they authenticated correctly, so re-authenticating would succeed and change
+nothing, leaving a well-behaved client looping. An upstream 401, which is what a
+revoked credential looks like, is rewritten the same way rather than passed
+through as an unexplained "unauthorized" about a credential the client has never
+seen.
+
+**Targets are configured here, never by users.** A user-supplied upstream URL
+would let anyone who can sign in point the proxy at any address it can reach and
+have it attach credentials to the request. Refusing private address ranges is no
+defence when the legitimate upstreams are themselves internal.
+
+Note also that rotating `ENCRYPTION_KEY` already invalidates every session; with
+per-user credentials stored it also destroys those, and everyone must enrol
+again.
 
 ### Static upstream credentials
 

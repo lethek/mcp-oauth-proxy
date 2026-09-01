@@ -74,7 +74,12 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("target %q: %w", t.Name, err)
 		}
-		proxies[t.Name] = newReverseProxy(u)
+		// Only a per_user target can produce an upstream 401 the user can act on.
+		enrolURL := ""
+		if t.Mode == CredPerUser {
+			enrolURL = cfg.PublicURL + "/settings"
+		}
+		proxies[t.Name] = newReverseProxy(u, enrolURL)
 
 		if isPlaintextURL(t.UpstreamMCP) {
 			slog.Warn("the MCP server is reached over plain http; the credential crosses that hop in the clear",
@@ -184,6 +189,16 @@ func (s *Server) routes() http.Handler {
 		h := s.handleMCP(t)
 		mux.HandleFunc(t.MCPPath(), h)
 		mux.HandleFunc(t.MCPPath()+"/", h)
+	}
+
+	// The enrolment page, registered only when some target actually wants a
+	// credential of the user's own. It runs its own login rather than sharing the
+	// consent flow, which is bound to one MCP client's authorization and cannot
+	// answer "who is this browser" outside it.
+	if s.cfg.HasPerUserTargets() {
+		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.handleSettings))
+		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.handleSettingsCallback))
+		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.handleSettingsSave))
 	}
 
 	// Liveness only. It says this process is up, not that the provider or the

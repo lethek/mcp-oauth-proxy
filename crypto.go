@@ -65,3 +65,21 @@ func (s *sealer) open(sealed []byte) ([]byte, error) {
 	}
 	return s.aead.Open(nil, sealed[:n], sealed[n:], nil)
 }
+
+// sealString and openString are the cookie-safe forms, used for the settings
+// session. Base64url so the value survives a Set-Cookie round trip unchanged.
+func (s *sealer) sealString(plaintext []byte) (string, error) {
+	sealed, err := s.seal(plaintext)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+
+func (s *sealer) openString(v string) ([]byte, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(v)
+	if err != nil {
+		return nil, err
+	}
+	return s.open(raw)
+}

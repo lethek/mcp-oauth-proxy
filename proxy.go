@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -42,7 +45,13 @@ func orDefault(v, fallback string) string {
 
 // newReverseProxy targets the upstream MCP server. Streamable HTTP keeps a
 // long-lived response open, so buffering has to stay off.
-func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
+//
+// enrolURL, when set, turns an upstream 401 into advice. In per_user mode a 401
+// from the MCP server means the credential this user stored is no longer
+// accepted — revoked at the far end, most likely — and passing that through
+// unchanged would reach the client as an unexplained "unauthorized" about a
+// credential the client has never seen and cannot fix.
+func newReverseProxy(target *url.URL, enrolURL string) *httputil.ReverseProxy {
 	p := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
@@ -57,6 +66,10 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 			// sent back on everyone else's. MCP over streamable HTTP has no use for
 			// cookies, so they are dropped rather than scoped.
 			resp.Header.Del("Set-Cookie")
+
+			if enrolURL != "" && resp.StatusCode == http.StatusUnauthorized {
+				return replaceWithEnrolAdvice(resp, enrolURL)
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -65,6 +78,43 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 		},
 	}
 	return p
+}
+
+// replaceWithEnrolAdvice rewrites an upstream 401 in place.
+//
+// The status becomes 403, matching the not-enrolled case: the caller's own
+// authentication is fine, and the thing that is wrong is a credential only they
+// can replace. A 401 here would invite the client to re-run OAuth, which would
+// succeed and change nothing.
+func replaceWithEnrolAdvice(resp *http.Response, enrolURL string) error {
+	body, err := json.Marshal(map[string]string{
+		"error": "access_denied",
+		"error_description": "the MCP server rejected your stored credential; " +
+			"replace it at " + enrolURL,
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	resp.StatusCode = http.StatusForbidden
+	resp.Status = http.StatusText(http.StatusForbidden)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	// The upstream's own challenge would point at a realm the client cannot use.
+	resp.Header.Del("WWW-Authenticate")
+	return nil
+}
+
+// notEnrolled tells the caller what to do about it. An MCP client surfaces
+// errors poorly, so the message has to carry the address of the page that fixes
+// the problem rather than merely reporting that something is wrong.
+func (s *Server) notEnrolled(w http.ResponseWriter, t Target) {
+	oauthError(w, http.StatusForbidden, "access_denied",
+		"no credential is stored for you for "+t.Name+"; set one at "+s.cfg.PublicURL+"/settings")
 }
 
 // stripTargetPrefix removes the "/<target>" segment before the request is
@@ -161,6 +211,27 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 			slog.Warn("mcp: token presented at the wrong resource",
 				"session", sessionID, "token_resource", resource, "target", t.Resource)
 			s.challengeFor(w, t, "invalid_token", "this token was not issued for "+t.Resource)
+			return
+		}
+
+		// In per_user mode the credential is the caller's own, found through the
+		// subject behind this session. Not being enrolled answers 403 rather than a
+		// 401 challenge: the caller authenticated correctly and re-authenticating
+		// will not help, so a challenge would only put a well-behaved client into a
+		// retry loop. The upstream is never contacted.
+		if t.Mode == CredPerUser {
+			headers, err := s.userHeadersFor(r, sessionID, t.Name)
+			if err != nil {
+				if !errors.Is(err, ErrNotFound) {
+					slog.Error("mcp: could not read the stored credential",
+						"err", err, "session", sessionID, "target", t.Name)
+				}
+				s.notEnrolled(w, t)
+				return
+			}
+			stripTargetPrefix(r, t)
+			prepareUpstreamHeaders(r, headers)
+			proxy.ServeHTTP(w, r)
 			return
 		}
 

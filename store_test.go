@@ -26,8 +26,11 @@ func newTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(s.Close)
 
-	// Sessions cascade into codes and tokens, so two deletes clear everything.
-	for _, table := range []string{"sessions", "flows", "clients"} {
+	// Sessions cascade into codes and tokens, so these few deletes clear
+	// everything. user_credentials is NOT among the cascades: it deliberately has
+	// no foreign key to sessions, so it survives one and has to be cleared here
+	// or an enrolment leaks into the next test and makes "not enrolled" pass.
+	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "clients"} {
 		if _, err := s.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clearing %s: %v", table, err)
 		}

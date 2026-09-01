@@ -166,10 +166,17 @@ func (u *Upstream) AuthorizeURL(ctx context.Context, state, verifier string) (st
 }
 
 func (u *Upstream) Exchange(ctx context.Context, code, verifier string) (UpstreamToken, error) {
+	return u.ExchangeWithRedirect(ctx, code, verifier, u.cfg.PublicURL+"/callback")
+}
+
+// ExchangeWithRedirect exists because the settings page runs its own login and
+// returns to a different path. The redirect_uri must match the one the
+// authorization request used, so it cannot be assumed.
+func (u *Upstream) ExchangeWithRedirect(ctx context.Context, code, verifier, redirectURI string) (UpstreamToken, error) {
 	return u.postToken(ctx, url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
-		"redirect_uri":  {u.cfg.PublicURL + "/callback"},
+		"redirect_uri":  {redirectURI},
 		"code_verifier": {verifier},
 	})
 }

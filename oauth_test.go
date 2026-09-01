@@ -151,16 +151,24 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	// given, which is what proves the "/<target>" segment was stripped before
 	// forwarding rather than passed through to a server that knows nothing of it.
 	h.upstreamPaths = make(chan string, 16)
-	providerMux.HandleFunc("/alpha-upstream/", func(w http.ResponseWriter, r *http.Request) {
-		h.alphaHits.Add(1)
-		h.upstreamPaths <- r.URL.Path
-		writeJSON(w, http.StatusOK, map[string]any{"target": "alpha"})
-	})
-	providerMux.HandleFunc("/beta-upstream/", func(w http.ResponseWriter, r *http.Request) {
-		h.betaHits.Add(1)
-		h.upstreamPaths <- r.URL.Path
-		writeJSON(w, http.StatusOK, map[string]any{"target": "beta"})
-	})
+	//
+	// They echo the credential they were given, which is what lets a per-user
+	// test assert that the CALLER'S OWN credential arrived rather than the
+	// provider's token. Without that a per_user test passes just as happily when
+	// the mode is ignored and the provider token is forwarded instead.
+	echo := func(target string, hits *atomic.Int64) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			h.upstreamPaths <- r.URL.Path
+			writeJSON(w, http.StatusOK, map[string]any{
+				"target":            target,
+				"saw_authorization": r.Header.Get("Authorization"),
+				"saw_workspace":     r.Header.Get("x-workspace-slug"),
+			})
+		}
+	}
+	providerMux.HandleFunc("/alpha-upstream/", echo("alpha", &h.alphaHits))
+	providerMux.HandleFunc("/beta-upstream/", echo("beta", &h.betaHits))
 
 	seal, sealErr := newSealer(bytes.Repeat([]byte{3}, 32))
 	if sealErr != nil {
@@ -199,7 +207,11 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 		if parseErr != nil {
 			t.Fatal(parseErr)
 		}
-		s.proxies[tgt.Name] = newReverseProxy(u)
+		enrolURL := ""
+		if tgt.Mode == CredPerUser {
+			enrolURL = cfg.PublicURL + "/settings"
+		}
+		s.proxies[tgt.Name] = newReverseProxy(u, enrolURL)
 	}
 
 	h.proxy.Config.Handler = s.routes()

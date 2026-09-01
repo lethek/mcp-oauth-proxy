@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -71,7 +72,21 @@ const (
 	CredProviderToken CredentialMode = "provider_token"
 	// CredStatic sends fixed headers instead, for a server with its own credential.
 	CredStatic CredentialMode = "static"
+	// CredPerUser sends headers each user supplied for themselves, so the MCP
+	// server can tell one caller from another.
+	CredPerUser CredentialMode = "per_user"
 )
+
+// UserHeaderField describes one value a user provides at /settings.
+type UserHeaderField struct {
+	// Header is the HTTP header the value becomes.
+	Header string `json:"header"`
+	// Label is what the enrolment form calls it.
+	Label string `json:"label"`
+	// Prefix is prepended when the header is built, so a user pastes a bare
+	// token rather than having to type "Bearer " themselves.
+	Prefix string `json:"prefix,omitempty"`
+}
 
 // targetNamePattern constrains names because they appear in URLs and in
 // environment variable names.
@@ -86,6 +101,9 @@ type Target struct {
 	UpstreamMCP   string
 	Mode          CredentialMode
 	StaticHeaders map[string]string
+
+	// UserFields are the values a user supplies for themselves in per_user mode.
+	UserFields []UserHeaderField
 
 	// Resource is this target's RFC 8707 identifier and the audience of every
 	// token issued for it. Computed once, because comparing it is on the path of
@@ -285,9 +303,9 @@ func parseTargets(publicURL string) ([]Target, error) {
 		switch t.Mode {
 		case "":
 			t.Mode = CredProviderToken
-		case CredProviderToken, CredStatic:
+		case CredProviderToken, CredStatic, CredPerUser:
 		default:
-			return nil, fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static", p, t.Mode)
+			return nil, fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static, per_user", p, t.Mode)
 		}
 
 		headers, err := parseStaticHeaders(os.Getenv(p + "STATIC_HEADERS"))
@@ -297,10 +315,22 @@ func parseTargets(publicURL string) ([]Target, error) {
 		if t.Mode == CredStatic && len(headers) == 0 {
 			return nil, fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
 		}
-		if t.Mode == CredProviderToken && len(headers) > 0 {
-			return nil, fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is provider_token", p, p)
+		if t.Mode != CredStatic && len(headers) > 0 {
+			return nil, fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
 		}
 		t.StaticHeaders = headers
+
+		fields, err := parseUserHeaderFields(os.Getenv(p + "USER_HEADERS"))
+		if err != nil {
+			return nil, fmt.Errorf("%sUSER_HEADERS: %w", p, err)
+		}
+		if t.Mode == CredPerUser && len(fields) == 0 {
+			return nil, fmt.Errorf("%sUSER_HEADERS is required when %sCREDENTIAL_MODE is per_user", p, p)
+		}
+		if t.Mode != CredPerUser && len(fields) > 0 {
+			return nil, fmt.Errorf("%sUSER_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
+		}
+		t.UserFields = fields
 
 		targets = append(targets, t)
 	}
@@ -309,6 +339,47 @@ func parseTargets(publicURL string) ([]Target, error) {
 		return nil, fmt.Errorf("TARGETS is set but names no targets")
 	}
 	return targets, nil
+}
+
+// parseUserHeaderFields reads the per-user field definitions. JSON rather than a
+// delimited format, because each field carries three values and inventing
+// separators for that is how a config format becomes a parser.
+func parseUserHeaderFields(raw string) ([]UserHeaderField, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var fields []UserHeaderField
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return nil, fmt.Errorf("not valid JSON: %w", err)
+	}
+	seen := map[string]bool{}
+	for i, f := range fields {
+		if strings.TrimSpace(f.Header) == "" {
+			return nil, fmt.Errorf("field %d has no header name", i)
+		}
+		if strings.TrimSpace(f.Label) == "" {
+			return nil, fmt.Errorf("field %q has no label", f.Header)
+		}
+		if seen[f.Header] {
+			return nil, fmt.Errorf("field %q is listed twice", f.Header)
+		}
+		seen[f.Header] = true
+	}
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("names no fields")
+	}
+	return fields, nil
+}
+
+// HasPerUserTargets reports whether the enrolment page has anything to offer.
+func (c *Config) HasPerUserTargets() bool {
+	for _, t := range c.Targets {
+		if t.Mode == CredPerUser {
+			return true
+		}
+	}
+	return false
 }
 
 // checkTargetURL holds an MCP server to a weaker rule than a browser-facing URL
