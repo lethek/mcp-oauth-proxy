@@ -70,6 +70,7 @@ where a default is shown.
 | `REFRESH_TOKEN_TTL` | How long a refresh token stays usable. Rotation issues a new one, so this acts as an idle timeout. Go duration, default `720h` (30 days). |
 | `SESSION_TTL` | Absolute cap on one authorization, however actively it is refreshed. Reaching it sends the user back through the provider. Go duration, default `2160h` (90 days). Must not be shorter than `REFRESH_TOKEN_TTL`. |
 | `CIMD_ENABLED` | Accept an https `client_id` as a Client ID Metadata Document. Default `false`. See below. |
+| `TRUSTED_PROXY_HOPS` | How many reverse proxies sit in front. Default `0`, meaning `X-Forwarded-For` is ignored. See below. |
 | `LISTEN_ADDR` | Default `:8080`. |
 
 Generate a key with:
@@ -240,6 +241,23 @@ cannot break forwarding.
 Note what this means: everyone the provider lets in shares one upstream
 credential, and the MCP server cannot tell them apart. Scope that credential to
 the least it needs.
+
+### Rate limiting behind a proxy
+
+The limiter keys on the caller's address. With `TRUSTED_PROXY_HOPS=0` that is
+the peer, and `X-Forwarded-For` is ignored because it is then entirely
+caller-supplied.
+
+**Set it to the number of proxies actually in front of this process.** Behind an
+ingress every caller otherwise shares one bucket, so a single anonymous client
+exceeding the cap locks out registration and authorization for everyone — a
+remote kill switch rather than a defence. One hop means the peer is your proxy
+and its address is used; two means the rightmost `X-Forwarded-For` entry, and so
+on. Only that many entries are read, counted from the right, because each hop
+appends the address it saw and anything further left is attacker-controlled.
+
+IPv6 callers are keyed on their /64, since a single host is routinely allocated
+one and keying on the full address would hand out unlimited fresh buckets.
 
 ## Endpoints
 

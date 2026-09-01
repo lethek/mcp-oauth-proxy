@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -60,6 +61,11 @@ type Config struct {
 	// arrived with an upgrade. Clients negotiate on the advertised metadata, so
 	// leaving it off simply keeps them on dynamic registration.
 	CIMDEnabled bool
+
+	// TrustedProxyHops is how many reverse proxies sit in front of this process.
+	// It decides how far into X-Forwarded-For the rate limiter may read; see
+	// clientKey. Zero means the header is ignored entirely.
+	TrustedProxyHops int
 
 	DatabaseURL string
 
@@ -173,6 +179,14 @@ func LoadConfig() (*Config, error) {
 		UpstreamScopes:       os.Getenv("UPSTREAM_SCOPES"),
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
 		ListenAddr:           os.Getenv("LISTEN_ADDR"),
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXY_HOPS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("TRUSTED_PROXY_HOPS must be a non-negative integer, got %q", raw)
+		}
+		c.TrustedProxyHops = n
 	}
 
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CIMD_ENABLED"))) {
@@ -552,6 +566,9 @@ func isPlaintextURL(raw string) bool {
 }
 
 func isLoopbackHost(host string) bool {
+	// Case-folded and with a trailing root dot removed: url.Parse does neither,
+	// so "LOCALHOST" and "localhost." were refused as though they were remote.
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
 	if host == "localhost" {
 		return true
 	}

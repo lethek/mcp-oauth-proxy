@@ -17,12 +17,26 @@ func validateRedirectURI(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("redirect_uri is empty")
 	}
+	// Registration is anonymous and a client row outlives it by a month, so an
+	// unbounded URI is a way to fill the database from outside. No legitimate
+	// redirect target comes close to this.
+	if len(raw) > maxRedirectURILen {
+		return fmt.Errorf("redirect_uri is longer than %d bytes", maxRedirectURILen)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("unparseable redirect_uri %q: %w", raw, err)
 	}
 	if u.Scheme == "" {
 		return fmt.Errorf("redirect_uri %q must be absolute", raw)
+	}
+	// "https://accounts.google.com@evil.example/cb" parses with Host
+	// evil.example, and the consent screen prints the string as given. A reader
+	// sees a name they trust at the front and approves a redirect to somewhere
+	// else. That screen is the confused-deputy defence, so a URI which
+	// misrepresents its own destination must not reach it.
+	if u.User != nil {
+		return fmt.Errorf("redirect_uri %q must not contain a username or password", raw)
 	}
 	// RFC 6749 section 3.1.2: the endpoint URI must not include a fragment. A
 	// fragment would also be dropped on the wire, so a client relying on one is

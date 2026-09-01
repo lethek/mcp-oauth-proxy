@@ -126,8 +126,17 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 15 * time.Second,
+		// ReadTimeout bounds the body as well as the headers. Without it a slow
+		// body holds a goroutine indefinitely, and the rate limiter counts
+		// requests rather than open connections so it does not help. Generous,
+		// because an MCP request body can be large; it only has to be finite.
+		ReadTimeout: 2 * time.Minute,
 		// No WriteTimeout: streamable HTTP responses are long-lived by design.
 		IdleTimeout: 120 * time.Second,
+		// The default is 1 MB across all headers, which is more than any of these
+		// endpoints needs and is where an oversized state or client_id would
+		// otherwise arrive.
+		MaxHeaderBytes: 64 << 10,
 	}
 
 	errCh := make(chan error, 1)
@@ -187,8 +196,8 @@ func (s *Server) routes() http.Handler {
 	// Every unauthenticated endpoint is capped here rather than inside its
 	// handler, so this list is the whole story and adding a route without a limit
 	// is a visible omission rather than a forgotten line.
-	mux.HandleFunc("POST /register", limited(s.registerLimit, s.handleRegister))
-	mux.HandleFunc("GET /authorize", limited(s.flowLimit, s.handleAuthorize))
+	mux.HandleFunc("POST /register", limited(s.registerLimit, s.cfg.TrustedProxyHops, s.handleRegister))
+	mux.HandleFunc("GET /authorize", limited(s.flowLimit, s.cfg.TrustedProxyHops, s.handleAuthorize))
 	// The consent screen stands between /authorize and the provider. Without it
 	// an anonymous registration could be used to collect someone else's
 	// credentials, so nothing may reach /callback that did not pass through here.
@@ -196,10 +205,10 @@ func (s *Server) routes() http.Handler {
 	// share the looser backstop. /token in particular is dialled by the MCP
 	// client rather than a browser, and a hosted client refreshes for every one
 	// of its users from a single address.
-	mux.HandleFunc("POST /consent", limited(s.credentialLimit, s.handleConsent))
-	mux.HandleFunc("GET /callback", limited(s.credentialLimit, s.handleCallback))
-	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.handleToken))
-	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.handleRevoke))
+	mux.HandleFunc("POST /consent", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleConsent))
+	mux.HandleFunc("GET /callback", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleCallback))
+	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleToken))
+	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleRevoke))
 
 	// The MCP endpoints are capped too. They demand a credential, so they share
 	// the looser backstop rather than the tight per-flow cap, but an
@@ -207,7 +216,7 @@ func (s *Server) routes() http.Handler {
 	// busiest route as the only uncapped one is not a decision worth making by
 	// omission.
 	for _, t := range s.cfg.Targets {
-		h := limited(s.credentialLimit, s.handleMCP(t))
+		h := limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleMCP(t))
 		mux.HandleFunc(t.MCPPath(), h)
 		mux.HandleFunc(t.MCPPath()+"/", h)
 	}
@@ -217,10 +226,10 @@ func (s *Server) routes() http.Handler {
 	// consent flow, which is bound to one MCP client's authorization and cannot
 	// answer "who is this browser" outside it.
 	if s.cfg.HasPerUserTargets() {
-		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.handleSettings))
-		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.handleSettingsLogout))
-		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.handleSettingsCallback))
-		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.handleSettingsSave))
+		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg.TrustedProxyHops, s.handleSettings))
+		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleSettingsLogout))
+		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleSettingsCallback))
+		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleSettingsSave))
 	}
 
 	// Liveness only. It says this process is up, not that the provider or the

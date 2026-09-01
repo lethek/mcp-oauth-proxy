@@ -54,18 +54,24 @@ func TestDiscoveryFailureIsRememberedBriefly(t *testing.T) {
 func TestDiscoverySucceedsAfterTheProviderRecovers(t *testing.T) {
 	var healthy atomic.Bool
 
+	// The document has to declare its own URL as the issuer. RFC 8414 section
+	// 3.3 requires that to match what was asked for, so a fixture naming some
+	// other issuer is now rejected before the recovery under test is reached.
+	var issuer atomic.Value
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !healthy.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		base, _ := issuer.Load().(string)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"issuer":                 "https://provider.example",
-			"authorization_endpoint": "https://provider.example/authorize",
-			"token_endpoint":         "https://provider.example/token",
+			"issuer":                 base,
+			"authorization_endpoint": base + "/authorize",
+			"token_endpoint":         base + "/token",
 		})
 	}))
 	defer provider.Close()
+	issuer.Store(provider.URL)
 
 	u := NewUpstream(&Config{UpstreamIssuer: provider.URL})
 	ctx := context.Background()
@@ -84,7 +90,7 @@ func TestDiscoverySucceedsAfterTheProviderRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Meta after recovery: %v", err)
 	}
-	if meta.TokenEndpoint != "https://provider.example/token" {
+	if meta.TokenEndpoint != provider.URL+"/token" {
 		t.Errorf("unexpected token endpoint %q", meta.TokenEndpoint)
 	}
 }

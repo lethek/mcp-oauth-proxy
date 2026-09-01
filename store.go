@@ -381,6 +381,33 @@ func (s *Store) LookupAccessToken(ctx context.Context, token string) (sessionID,
 	return sessionID, resource, err
 }
 
+// CreateTokenPair writes both credentials of one grant in a single
+// transaction.
+//
+// Separately, a failure between them leaves the client holding nothing usable
+// while an access token it never received sits in the database, and the
+// authorization code it would need to retry with has already been consumed. The
+// pair is one grant, so it is one write.
+func (s *Store) CreateTokenPair(ctx context.Context, access, refresh, sessionID, clientID string, accessTTL time.Duration) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO access_tokens (token_hash, session_id, client_id, expires_at) VALUES ($1,$2,$3, now() + $4::interval)`,
+		hashToken(access), sessionID, clientID, accessTTL.String()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO refresh_tokens (token_hash, session_id, client_id) VALUES ($1,$2,$3)`,
+		hashToken(refresh), sessionID, clientID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, clientID string) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO refresh_tokens (token_hash, session_id, client_id) VALUES ($1,$2,$3)`,

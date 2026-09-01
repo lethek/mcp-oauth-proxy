@@ -1258,8 +1258,11 @@ func TestFormActionOriginsPrefersTheDiscoveredEndpoint(t *testing.T) {
 	// A provider that hosts its authorization endpoint on another host must have
 	// that host named, not just its issuer.
 	elsewhere := &Upstream{
-		cfg:  &Config{UpstreamIssuer: "https://issuer.example"},
-		meta: &upstreamMeta{AuthorizationEndpoint: "https://login.example/authorize"},
+		cfg: &Config{UpstreamIssuer: "https://issuer.example"},
+		// fetchedAt is set because a cached document is only trusted for
+		// discoveryTTL; a zero time reads as stale and would trigger a refetch.
+		meta:      &upstreamMeta{AuthorizationEndpoint: "https://login.example/authorize"},
+		fetchedAt: time.Now(),
 	}
 	origins := elsewhere.FormActionOrigins(context.Background())
 	if !slices.Contains(origins, "https://login.example") {

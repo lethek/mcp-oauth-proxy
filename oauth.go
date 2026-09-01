@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +18,16 @@ const accessTokenTTL = 12 * time.Hour
 // maxRedirectURIs caps a single registration. The body limit alone would allow
 // tens of thousands of them in one client row.
 const maxRedirectURIs = 16
+
+// maxRedirectURILen caps one of them. Without it a single anonymous
+// registration can store most of a megabyte, and the row survives for
+// unusedClientTTL.
+const maxRedirectURILen = 2048
+
+// maxFlowParam caps the client-chosen values carried through a flow. state and
+// code_challenge are stored verbatim, and the request line alone allows a
+// megabyte of either.
+const maxFlowParam = 512
 
 // consentCookie carries the secret that ties a consent decision to the browser
 // that was actually shown the question.
@@ -294,6 +305,14 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_request", "PKCE with S256 is required")
 		return
 	}
+	// Both are stored verbatim on the flow, and a request line may carry a
+	// megabyte of either. An S256 challenge is 43 characters and no sane client
+	// needs a long state.
+	if len(challenge) > maxFlowParam || len(q.Get("state")) > maxFlowParam {
+		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_request",
+			"state and code_challenge must each be shorter than "+strconv.Itoa(maxFlowParam)+" bytes")
+		return
+	}
 	// RFC 8707. The resource decides which upstream the resulting token may be
 	// used against, so with several targets it is required: there is no sensible
 	// default, and guessing would hand out a token for the wrong service. With
@@ -569,7 +588,10 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the refresh token is unknown or expired")
 		return
 	}
-	if given := r.PostForm.Get("client_id"); given != "" && given != clientID {
+	// Required, matching the authorization-code grant. Treating it as optional
+	// here meant a refresh could skip client binding entirely, which is an
+	// asymmetry with no reason behind it.
+	if r.PostForm.Get("client_id") != clientID {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "this refresh token was issued to a different client")
 		return
 	}
@@ -580,14 +602,13 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 // ours, not the provider's — the upstream token never leaves this process.
 func (s *Server) issue(w http.ResponseWriter, r *http.Request, sessionID, clientID string) {
 	access, refresh := newSecret(), newSecret()
-	if err := s.store.CreateAccessToken(r.Context(), access, sessionID, clientID, accessTokenTTL); err != nil {
-		slog.Error("token: could not store access token", "err", err)
-		oauthError(w, http.StatusInternalServerError, "server_error", "could not issue an access token")
-		return
-	}
-	if err := s.store.CreateRefreshToken(r.Context(), refresh, sessionID, clientID); err != nil {
-		slog.Error("token: could not store refresh token", "err", err)
-		oauthError(w, http.StatusInternalServerError, "server_error", "could not issue a refresh token")
+	// One transaction, because the two writes are one grant. Storing the access
+	// token and then failing on the refresh token leaves the client a 500 for a
+	// grant it cannot retry — the authorization code was consumed on read — and
+	// a usable access token in the database that nobody holds.
+	if err := s.store.CreateTokenPair(r.Context(), access, refresh, sessionID, clientID, accessTokenTTL); err != nil {
+		slog.Error("token: could not issue the token pair", "err", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "could not issue tokens")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

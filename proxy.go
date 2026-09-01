@@ -7,12 +7,14 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // challengeFor sends the RFC 6750 response that starts the whole dance. Without
@@ -40,6 +42,28 @@ func orDefault(v, fallback string) string {
 	return v
 }
 
+// upstreamTransport is used for every target.
+//
+// http.DefaultTransport was the previous behaviour and has no
+// ResponseHeaderTimeout, so an upstream that accepted a connection and then
+// never answered would hold a goroutine and a connection until the client gave
+// up, which for an MCP client can be a very long time.
+//
+// The timeout covers only the wait for response HEADERS. The body is left
+// unbounded on purpose: streamable HTTP keeps it open by design, and a deadline
+// there would cut off long-running tool calls.
+var upstreamTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   8,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
+}
+
 // newReverseProxy targets the upstream MCP server. Streamable HTTP keeps a
 // long-lived response open, so buffering has to stay off.
 //
@@ -50,6 +74,7 @@ func orDefault(v, fallback string) string {
 // credential the client has never seen and cannot fix.
 func newReverseProxy(target *url.URL, enrolURL string) *httputil.ReverseProxy {
 	p := &httputil.ReverseProxy{
+		Transport: upstreamTransport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
@@ -119,13 +144,6 @@ func (s *Server) notEnrolled(w http.ResponseWriter, t Target) {
 		"no credential is stored for you for "+t.DisplayName+"; set one at "+s.cfg.PublicURL+"/settings")
 }
 
-// stripTargetPrefix removes the "/<target>" segment before the request is
-// forwarded.
-//
-// ReverseProxy joins the upstream's path with the INCOMING path, so without this
-// a request to /plane/mcp against an upstream of /http/api-key would be sent to
-// /http/api-key/plane/mcp. The target name is how this proxy addresses its own
-// routes and means nothing to the server behind it.
 // hasDotSegments reports whether a path contains "." or ".." segments.
 //
 // ServeMux normalises a literal "/../" and redirects, but it does NOT decode
@@ -146,6 +164,13 @@ func hasDotSegments(p string) bool {
 	return false
 }
 
+// stripTargetPrefix removes the "/<target>" segment before the request is
+// forwarded.
+//
+// ReverseProxy joins the upstream's path with the INCOMING path, so without this
+// a request to /plane/mcp against an upstream of /http/api-key would be sent to
+// /http/api-key/plane/mcp. The target name is how this proxy addresses its own
+// routes and means nothing to the server behind it.
 func stripTargetPrefix(r *http.Request, t Target) {
 	if t.Name == "" {
 		return

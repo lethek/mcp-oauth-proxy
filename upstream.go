@@ -43,14 +43,20 @@ func (t UpstreamToken) expired() bool {
 // timeout twice before failing.
 const discoveryRetryAfter = 5 * time.Second
 
+// discoveryTTL bounds how long a successful document is trusted. Caching it for
+// the life of the process meant a rotated endpoint broke every request until a
+// restart.
+const discoveryTTL = 15 * time.Minute
+
 type Upstream struct {
 	cfg  *Config
 	http *http.Client
 
-	mu       sync.RWMutex
-	meta     *upstreamMeta
-	failedAt time.Time
-	failErr  error
+	mu        sync.RWMutex
+	meta      *upstreamMeta
+	fetchedAt time.Time
+	failedAt  time.Time
+	failErr   error
 }
 
 func NewUpstream(cfg *Config) *Upstream {
@@ -62,9 +68,11 @@ func NewUpstream(cfg *Config) *Upstream {
 // OIDC path first and fall back rather than assuming either.
 func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	u.mu.RLock()
-	m, failedAt, failErr := u.meta, u.failedAt, u.failErr
+	m, fetchedAt, failedAt, failErr := u.meta, u.fetchedAt, u.failedAt, u.failErr
 	u.mu.RUnlock()
-	if m != nil {
+	// Bounded rather than permanent: a provider that rotates an endpoint used to
+	// break this process until someone restarted it.
+	if m != nil && time.Since(fetchedAt) < discoveryTTL {
 		return m, nil
 	}
 	if failErr != nil && time.Since(failedAt) < discoveryRetryAfter {
@@ -97,8 +105,23 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 			lastErr = fmt.Errorf("%s lacked authorization or token endpoint", p)
 			continue
 		}
+		// RFC 8414 section 3.3: the issuer in the document must be the one we
+		// asked for. This is what stops a document served from one place
+		// claiming to be another provider's.
+		//
+		// The endpoints are deliberately NOT constrained to the issuer's origin.
+		// Hosting an authorization endpoint on a separate host is ordinary and
+		// several providers do it, so requiring it would refuse working setups.
+		// A provider that is itself compromised can name any endpoint regardless;
+		// the control that matters there is trusting the issuer in the first
+		// place.
+		if got.Issuer != "" && strings.TrimRight(got.Issuer, "/") != strings.TrimRight(u.cfg.UpstreamIssuer, "/") {
+			lastErr = fmt.Errorf("%s declared issuer %q, want %q", p, got.Issuer, u.cfg.UpstreamIssuer)
+			continue
+		}
 		u.mu.Lock()
 		u.meta = &got
+		u.fetchedAt = time.Now()
 		u.failErr = nil
 		u.mu.Unlock()
 		return &got, nil
