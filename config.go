@@ -48,6 +48,16 @@ type Config struct {
 	// one. A deployment configured the original way has a single unnamed target.
 	Targets []Target
 
+	// CIMDEnabled accepts an https client_id and fetches the client's metadata
+	// from it, per draft-ietf-oauth-client-id-metadata-document.
+	//
+	// Off by default, and deliberately so. It makes this process fetch a URL the
+	// caller chose, which is a network capability rather than a parsing change,
+	// and it should be a decision someone made rather than something that
+	// arrived with an upgrade. Clients negotiate on the advertised metadata, so
+	// leaving it off simply keeps them on dynamic registration.
+	CIMDEnabled bool
+
 	DatabaseURL string
 
 	// EncryptionKey protects upstream tokens at rest. 32 bytes, base64.
@@ -160,6 +170,14 @@ func LoadConfig() (*Config, error) {
 		UpstreamScopes:       os.Getenv("UPSTREAM_SCOPES"),
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
 		ListenAddr:           os.Getenv("LISTEN_ADDR"),
+	}
+
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CIMD_ENABLED"))) {
+	case "", "false", "0", "no":
+	case "true", "1", "yes":
+		c.CIMDEnabled = true
+	default:
+		return nil, fmt.Errorf("CIMD_ENABLED must be true or false, got %q", os.Getenv("CIMD_ENABLED"))
 	}
 
 	if c.UpstreamScopes == "" {

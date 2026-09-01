@@ -69,6 +69,7 @@ where a default is shown.
 | `ENCRYPTION_KEY` | Base64 of exactly 32 bytes. Encrypts provider tokens at rest with AES-256-GCM. Changing it invalidates every stored session. |
 | `REFRESH_TOKEN_TTL` | How long a refresh token stays usable. Rotation issues a new one, so this acts as an idle timeout. Go duration, default `720h` (30 days). |
 | `SESSION_TTL` | Absolute cap on one authorization, however actively it is refreshed. Reaching it sends the user back through the provider. Go duration, default `2160h` (90 days). Must not be shorter than `REFRESH_TOKEN_TTL`. |
+| `CIMD_ENABLED` | Accept an https `client_id` as a Client ID Metadata Document. Default `false`. See below. |
 | `LISTEN_ADDR` | Default `:8080`. |
 
 Generate a key with:
@@ -79,6 +80,37 @@ openssl rand -base64 32
 
 The application you register with the provider must use
 `PUBLIC_URL` + `/callback` as its redirect URI.
+
+### Client ID Metadata Documents
+
+`CIMD_ENABLED=true` accepts a `client_id` that is itself an https URL, and
+fetches the client's metadata from it, per
+`draft-ietf-oauth-client-id-metadata-document`. A client with a domain then needs
+no registration here at all. Dynamic registration keeps working alongside it; a
+`client_id` that is not a URL still goes to the clients table.
+
+It is advertised as `client_id_metadata_document_supported` in the
+authorization-server metadata, so clients negotiate rather than guess. With the
+flag off that reads `false` and clients fall back to registration.
+
+This is also a better answer than consent alone to the problem `/authorize`
+guards against. An anonymous registration proves nothing about who is asking; a
+metadata document is at least tied to a domain someone controls.
+
+**It is off by default because it makes this process fetch a URL the caller
+chose**, which is a network capability rather than a parsing change. The fetch is
+constrained accordingly:
+
+- https only, with a path, no fragment, no userinfo and no dot segments.
+- **Connections to private, loopback, link-local and carrier-grade-NAT addresses
+  are refused at dial time**, not by inspecting the hostname, so a name that
+  resolves to a public address and then to a private one is still caught.
+- No redirects, a 5 KiB body limit, a JSON content type and a short timeout.
+- The document's own `client_id` must equal the URL it came from, by simple
+  string comparison. Without that, any document could claim to be a client
+  hosted somewhere else.
+- Documents offering a `client_secret` or a confidential authentication method
+  are refused; this proxy issues tokens to public clients only.
 
 ### Several MCP servers behind one proxy
 

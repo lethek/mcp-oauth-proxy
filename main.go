@@ -34,6 +34,9 @@ type Server struct {
 	// single-target deployment keys it on the empty string.
 	proxies map[string]http.Handler
 
+	// cimd resolves https client ids to their metadata documents.
+	cimd *cimdClient
+
 	// The caps differ by what each endpoint can be made to do, not by how
 	// sensitive it sounds.
 	//
@@ -102,6 +105,7 @@ func run() error {
 		upstream:        NewUpstream(cfg),
 		sealer:          seal,
 		proxies:         proxies,
+		cimd:            newCIMDClient(),
 		registerLimit:   newLimiter(20, time.Minute),
 		flowLimit:       newLimiter(120, time.Minute),
 		credentialLimit: newLimiter(600, time.Minute),

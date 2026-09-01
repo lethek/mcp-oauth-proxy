@@ -135,6 +135,9 @@ func (s *Server) handleAmbiguousResourceMetadata(w http.ResponseWriter, r *http.
 // we actually accept: authorization code with S256, refresh, and public clients.
 func (s *Server) handleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
+		// Clients decide between a metadata document and dynamic registration on
+		// this flag, so it has to reflect what is actually accepted.
+		"client_id_metadata_document_supported":      s.cfg.CIMDEnabled,
 		"issuer":                                     s.cfg.PublicURL,
 		"authorization_endpoint":                     s.cfg.PublicURL + "/authorize",
 		"token_endpoint":                             s.cfg.PublicURL + "/token",
@@ -231,10 +234,19 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	redirectURI := q.Get("redirect_uri")
 	challenge := q.Get("code_challenge")
 
-	client, err := s.store.GetClient(r.Context(), clientID)
+	client, err := s.resolveClient(r.Context(), clientID)
 	if err != nil {
 		// Nothing here is safe to redirect: an unknown client means we cannot
 		// trust the redirect_uri either, so the error is rendered directly.
+		//
+		// A metadata document that would not load is reported in full. The
+		// caller controls that URL and can fix it, and "unknown client_id" would
+		// send them looking in the wrong place entirely.
+		if looksLikeCIMD(clientID) {
+			slog.Warn("authorize: could not resolve a client id metadata document", "client_id", clientID, "err", err)
+			oauthError(w, http.StatusBadRequest, "invalid_client", err.Error())
+			return
+		}
 		oauthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
 		return
 	}
