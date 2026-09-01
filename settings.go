@@ -340,7 +340,13 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
  .who{color:#555;font-size:.9rem}
 </style></head><body>
 <h1>MCP credentials</h1>
-<p class="who">Signed in as {{.Subject}}</p>
+<p class="who">Signed in as {{.Subject}}
+  <form method="post" action="/settings/logout" style="display:inline">
+    <button type="submit">Sign out</button>
+  </form>
+</p>
+<p class="who">Signing out clears this page's session only. An active session at
+the identity provider will sign you straight back in.</p>
 {{if .Notice}}<p class="notice">{{if eq .Notice "saved"}}Credential saved.{{else}}Credential cleared.{{end}}</p>{{end}}
 {{if not .Targets}}<p>No target on this proxy asks for a credential of your own.</p>{{end}}
 {{range .Targets}}

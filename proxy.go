@@ -44,14 +44,18 @@ func orDefault(v, fallback string) string {
 
 // upstreamTransport is used for every target.
 //
-// http.DefaultTransport was the previous behaviour and has no
-// ResponseHeaderTimeout, so an upstream that accepted a connection and then
-// never answered would hold a goroutine and a connection until the client gave
-// up, which for an MCP client can be a very long time.
+// It bounds connection establishment — dial, TLS handshake, idle pooling —
+// which http.DefaultTransport leaves partly open, without bounding the exchange
+// itself.
 //
-// The timeout covers only the wait for response HEADERS. The body is left
-// unbounded on purpose: streamable HTTP keeps it open by design, and a deadline
-// there would cut off long-running tool calls.
+// There is deliberately NO ResponseHeaderTimeout. A non-streaming MCP server
+// writes response headers only when the tool call returns, so any such timeout
+// is a ceiling on how long a tool may run: a 75-second call against a 60-second
+// timeout becomes a 502 with the work discarded. An earlier version of this file
+// set one and would have done exactly that.
+//
+// A hung upstream is instead released by the client going away, which
+// ReverseProxy propagates through the request context.
 var upstreamTransport = &http.Transport{
 	Proxy:                 http.ProxyFromEnvironment,
 	DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -61,7 +65,6 @@ var upstreamTransport = &http.Transport{
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
-	ResponseHeaderTimeout: 60 * time.Second,
 }
 
 // newReverseProxy targets the upstream MCP server. Streamable HTTP keeps a

@@ -49,6 +49,13 @@ type Server struct {
 	registerLimit   *limiter
 	flowLimit       *limiter
 	credentialLimit *limiter
+
+	// mcpLimit is separate from credentialLimit on purpose. MCP is by far the
+	// busiest route, and sharing a bucket let one chatty session exhaust it and
+	// then refuse /token, /callback, /consent and /settings for everyone. A
+	// backstop on the proxied path must not be able to take the authorization
+	// surface down with it.
+	mcpLimit *limiter
 }
 
 func main() {
@@ -109,6 +116,7 @@ func run() error {
 		registerLimit:   newLimiter(20, time.Minute),
 		flowLimit:       newLimiter(120, time.Minute),
 		credentialLimit: newLimiter(600, time.Minute),
+		mcpLimit:        newLimiter(6000, time.Minute),
 	}
 
 	// Confirm the provider is discoverable at boot. This is a warning rather
@@ -210,13 +218,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleToken))
 	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleRevoke))
 
-	// The MCP endpoints are capped too. They demand a credential, so they share
-	// the looser backstop rather than the tight per-flow cap, but an
-	// unauthenticated request still costs a database round trip and leaving the
-	// busiest route as the only uncapped one is not a decision worth making by
-	// omission.
+	// The MCP endpoints are capped on their own bucket. They demand a credential
+	// and are the busiest route, so a shared cap would let ordinary traffic here
+	// refuse the authorization endpoints; an unauthenticated request still costs
+	// a database round trip, so leaving them uncapped is not right either.
 	for _, t := range s.cfg.Targets {
-		h := limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleMCP(t))
+		h := limited(s.mcpLimit, s.cfg.TrustedProxyHops, s.handleMCP(t))
 		mux.HandleFunc(t.MCPPath(), h)
 		mux.HandleFunc(t.MCPPath()+"/", h)
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -75,6 +76,7 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	if m != nil && time.Since(fetchedAt) < discoveryTTL {
 		return m, nil
 	}
+	fresh := m == nil
 	if failErr != nil && time.Since(failedAt) < discoveryRetryAfter {
 		return nil, failErr
 	}
@@ -136,6 +138,15 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	u.failedAt = time.Now()
 	u.failErr = err
 	u.mu.Unlock()
+
+	// A document we already hold is served past its TTL rather than discarded.
+	// The TTL exists so a rotated endpoint is eventually picked up, not so a
+	// thirty-second provider restart takes every authorization down while a
+	// perfectly usable document sits in memory.
+	if !fresh {
+		slog.Warn("serving stale provider discovery; refresh failed", "err", err)
+		return m, nil
+	}
 	return nil, err
 }
 

@@ -356,6 +356,12 @@ func (s *Store) TakeAuthCode(ctx context.Context, code string) (AuthCode, error)
 
 // ---------- bearer tokens ----------
 
+// CreateAccessToken writes one token on its own.
+//
+// Nothing in the serving path uses it: issue() goes through CreateTokenPair,
+// because writing the two credentials of one grant separately can leave a client
+// unable to retry. Kept for tests that need a single row. New callers wanting a
+// grant want CreateTokenPair.
 func (s *Store) CreateAccessToken(ctx context.Context, token, sessionID, clientID string, ttl time.Duration) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO access_tokens (token_hash, session_id, client_id, expires_at) VALUES ($1,$2,$3, now() + $4::interval)`,
@@ -408,6 +414,8 @@ func (s *Store) CreateTokenPair(ctx context.Context, access, refresh, sessionID,
 	return tx.Commit(ctx)
 }
 
+// CreateRefreshToken writes one token on its own. See CreateAccessToken: the
+// serving path uses CreateTokenPair instead.
 func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, clientID string) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO refresh_tokens (token_hash, session_id, client_id) VALUES ($1,$2,$3)`,

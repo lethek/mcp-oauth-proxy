@@ -48,9 +48,40 @@ var errCIMDDisabled = errors.New("client id metadata documents are not enabled")
 // destination in disguise, so on a network with a NAT64 gateway it would reach
 // exactly the private range the v4 checks exclude.
 var (
+	// NAT64 translation prefixes.
 	_, nat64WellKnown, _ = net.ParseCIDR("64:ff9b::/96")
 	_, nat64Local, _     = net.ParseCIDR("64:ff9b:1::/48")
+	// 6to4, which carries the v4 address in the second and third groups.
+	_, sixToFour, _ = net.ParseCIDR("2002::/16")
+	// IPv4-compatible addresses, ::a.b.c.d. Deprecated but still routed by some
+	// stacks, and net.IP.To4 does not report them.
+	_, ipv4Compatible, _ = net.ParseCIDR("::/96")
 )
+
+// embeddedIPv4 extracts the IPv4 destination an IPv6 address stands for, or nil
+// when it is an ordinary v6 address.
+func embeddedIPv4(ip net.IP) net.IP {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return nil
+	}
+	switch {
+	case nat64WellKnown.Contains(ip), nat64Local.Contains(ip):
+		// The v4 address sits in the last four octets of the /96, and for the
+		// /48 form in the same position this proxy cares about.
+		return net.IPv4(v6[12], v6[13], v6[14], v6[15])
+	case sixToFour.Contains(ip):
+		return net.IPv4(v6[2], v6[3], v6[4], v6[5])
+	case ipv4Compatible.Contains(ip):
+		v4 := net.IPv4(v6[12], v6[13], v6[14], v6[15])
+		// ::/96 also covers :: and ::1, which the earlier checks already handle.
+		if v4.IsUnspecified() {
+			return nil
+		}
+		return v4
+	}
+	return nil
+}
 
 // validateCIMDURL applies the draft's rules for a usable client_id URL.
 func validateCIMDURL(raw string) (*url.URL, error) {
@@ -97,6 +128,8 @@ type cimdClient struct {
 
 	mu    sync.Mutex
 	cache map[string]cimdEntry
+	// failures is separate so a flood of bad client_ids cannot evict documents.
+	failures map[string]cimdEntry
 }
 
 type cimdEntry struct {
@@ -157,7 +190,8 @@ func newCIMD(guardAddresses bool) *cimdClient {
 				return errors.New("cimd: the document must not redirect")
 			},
 		},
-		cache: map[string]cimdEntry{},
+		cache:    map[string]cimdEntry{},
+		failures: map[string]cimdEntry{},
 	}
 }
 
@@ -180,10 +214,12 @@ func isPublicIP(ip net.IP) bool {
 		}
 		return true
 	}
-	// NAT64 well-known prefixes embed an IPv4 address, so a gateway on such a
-	// network would translate these straight back to a private v4 destination.
-	if nat64WellKnown.Contains(ip) || nat64Local.Contains(ip) {
-		return false
+	// Several IPv6 forms carry an IPv4 destination inside them, and net.IP only
+	// recognises the ::ffff: mapping. Each is resolved to the address it
+	// actually reaches and judged on that, rather than being waved through
+	// because it does not look like the private ranges.
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		return isPublicIP(v4)
 	}
 	return true
 }
@@ -300,11 +336,13 @@ func parseCIMD(clientID string, body []byte) (Client, error) {
 func (c *cimdClient) cached(clientID string) (cimdEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.cache[clientID]
-	if !ok || time.Now().After(e.expires) {
-		return cimdEntry{}, false
+	if e, ok := c.cache[clientID]; ok && time.Now().Before(e.expires) {
+		return e, true
 	}
-	return e, true
+	if e, ok := c.failures[clientID]; ok && time.Now().Before(e.expires) {
+		return e, true
+	}
+	return cimdEntry{}, false
 }
 
 // store bounds the cache by clearing it wholesale when it grows too large. A
@@ -312,16 +350,24 @@ func (c *cimdClient) cached(clientID string) (cimdEntry, bool) {
 // and expire on their own, and the cap exists only so a stream of distinct URLs
 // cannot grow it without limit.
 func (c *cimdClient) store(clientID string, client Client, err error) {
-	ttl := cimdCacheTTL
-	if err != nil {
-		ttl = cimdFailureTTL
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Failures are held apart from documents. Sharing one map meant a caller
+	// sending distinct bogus client_ids filled it and triggered the wholesale
+	// clear, discarding every legitimate client's cached document; the negative
+	// cache added to stop repeated outbound fetches became a way to force them.
+	if err != nil {
+		if len(c.failures) >= cimdCacheSize {
+			c.failures = map[string]cimdEntry{}
+		}
+		c.failures[clientID] = cimdEntry{err: err, expires: time.Now().Add(cimdFailureTTL)}
+		return
+	}
 	if len(c.cache) >= cimdCacheSize {
 		c.cache = map[string]cimdEntry{}
 	}
-	c.cache[clientID] = cimdEntry{client: client, err: err, expires: time.Now().Add(ttl)}
+	c.cache[clientID] = cimdEntry{client: client, expires: time.Now().Add(cimdCacheTTL)}
 }
 
 // fail records a failure and returns it, so every error path memoises without

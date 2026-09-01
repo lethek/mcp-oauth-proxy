@@ -206,6 +206,7 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 		registerLimit:   newLimiter(1000, time.Minute),
 		flowLimit:       newLimiter(1000, time.Minute),
 		credentialLimit: newLimiter(1000, time.Minute),
+		mcpLimit:        newLimiter(1000, time.Minute),
 	}
 
 	// Unstarted, because the routes depend on configuration that depends on this

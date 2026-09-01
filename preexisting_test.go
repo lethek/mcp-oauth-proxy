@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -217,5 +220,52 @@ func TestDiscoveryRequiresAnIssuer(t *testing.T) {
 
 	if _, err := NewUpstream(&Config{UpstreamIssuer: provider.URL}).Meta(context.Background()); err == nil {
 		t.Fatal("accepted a discovery document that declared no issuer")
+	}
+}
+
+// TestIsPublicIPRejectsEmbeddedIPv4 covers the IPv6 forms that carry a v4
+// destination inside them. net.IP only recognises the ::ffff: mapping, so
+// checking the v6 ranges alone let an address reach the very networks the guard
+// exists to exclude.
+func TestIsPublicIPRejectsEmbeddedIPv4(t *testing.T) {
+	for raw, want := range map[string]bool{
+		// IPv4-compatible, ::a.b.c.d
+		"::10.0.0.99":     false,
+		"::127.0.0.1":     false,
+		"::93.184.216.34": true,
+		// 6to4, 2002:aabb:ccdd::/48 where aabb:ccdd is the v4 address
+		"2002:0a00:0063::": false, // 10.0.0.99
+		"2002:7f00:0001::": false, // 127.0.0.1
+		"2002:5db8:d822::": true,  // 93.184.216.34
+		// NAT64
+		"64:ff9b::10.0.0.99":     false,
+		"64:ff9b::93.184.216.34": true,
+		// An ordinary v6 address is unaffected.
+		"2606:2800:220::": true,
+		"fd00::1":         false,
+	} {
+		if got := isPublicIP(net.ParseIP(raw)); got != want {
+			t.Errorf("isPublicIP(%s) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
+// TestCIMDFailuresDoNotEvictDocuments: the negative cache exists to stop
+// repeated outbound fetches, so it must not become a way to force them. Sharing
+// one map meant 256 bogus client_ids discarded every real client's document.
+func TestCIMDFailuresDoNotEvictDocuments(t *testing.T) {
+	c := newCIMD(false)
+	c.store("https://good.example/mcp", Client{ID: "https://good.example/mcp", Name: "Good"}, nil)
+
+	for i := 0; i < cimdCacheSize*2; i++ {
+		c.store("https://bad.example/"+strconv.Itoa(i), Client{}, errors.New("nope"))
+	}
+
+	entry, ok := c.cached("https://good.example/mcp")
+	if !ok || entry.err != nil {
+		t.Fatal("a flood of failures evicted a cached document")
+	}
+	if entry.client.Name != "Good" {
+		t.Errorf("cached document = %+v", entry.client)
 	}
 }

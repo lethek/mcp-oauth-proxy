@@ -309,7 +309,11 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// megabyte of either. An S256 challenge is 43 characters and no sane client
 	// needs a long state.
 	if len(challenge) > maxFlowParam || len(q.Get("state")) > maxFlowParam {
-		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_request",
+		// The state is deliberately not echoed. Putting a 60 KB value the check
+		// just refused into the Location header produces the very thing the
+		// check exists to avoid, and many intermediaries reject a redirect that
+		// size, so the client would see a transport failure instead of the error.
+		s.redirectErr(w, r, redirectURI, "", "invalid_request",
 			"state and code_challenge must each be shorter than "+strconv.Itoa(maxFlowParam)+" bytes")
 		return
 	}
@@ -469,10 +473,18 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// refused later for a reason nobody can act on.
 	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
-		slog.Error("callback: could not resolve the user", "err", err)
-		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error",
-			"the identity provider would not say who you are")
-		return
+		// Fatal only where the subject is load-bearing. With a per_user target
+		// it is the key the caller's stored credential is found by, so a session
+		// without one can do nothing and failing here is clearer than a 403
+		// later. Everywhere else the subject is audit metadata, and a provider
+		// that will not supply it must not block the login.
+		if s.cfg.HasPerUserTargets() {
+			slog.Error("callback: could not resolve the user", "err", err)
+			s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error",
+				"the identity provider would not say who you are")
+			return
+		}
+		slog.Warn("callback: could not resolve the user; continuing without a subject", "err", err)
 	}
 
 	sessionID := newSecret()

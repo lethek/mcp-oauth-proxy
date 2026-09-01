@@ -196,7 +196,7 @@ Only an allowlist of headers reaches the MCP server. The credential injected her
 is frequently not the caller's own, so any second authentication header the
 upstream happened to honour would let a caller override or sidestep it.
 
-Users can end a settings session at `POST /settings/logout`.
+Users can end a settings session with the Sign out control on the page. It clears this proxy's session only; an active session at the identity provider signs them straight back in.
 
 Someone who has not enrolled gets **403** naming the settings page, and their
 request never reaches the MCP server. It is deliberately not a 401 challenge:
