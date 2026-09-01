@@ -251,10 +251,11 @@ caller-supplied.
 **Set it to the number of proxies actually in front of this process.** Behind an
 ingress every caller otherwise shares one bucket, so a single anonymous client
 exceeding the cap locks out registration and authorization for everyone — a
-remote kill switch rather than a defence. One hop means the peer is your proxy
-and its address is used; two means the rightmost `X-Forwarded-For` entry, and so
-on. Only that many entries are read, counted from the right, because each hop
-appends the address it saw and anything further left is attacker-controlled.
+remote kill switch rather than a defence. Each proxy appends the address it received from, so with one proxy the header
+holds the client and the peer is the proxy: the caller is the rightmost entry.
+With two, it is the entry before that. Only `len(chain) - hops` is read, so
+anything a caller prepends lands to the left of what your own proxy wrote and can
+never displace it.
 
 IPv6 callers are keyed on their /64, since a single host is routinely allocated
 one and keying on the full address would hand out unlimited fresh buckets.

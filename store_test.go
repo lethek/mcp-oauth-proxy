@@ -101,23 +101,23 @@ func TestRefreshTokenRotatesAndDetectsReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gotSession, gotClient, err := s.TakeRefreshToken(ctx, first)
+	gotSession, err := s.TakeRefreshToken(ctx, first, "c1")
 	if err != nil {
 		t.Fatalf("first use: %v", err)
 	}
-	if gotSession != session || gotClient != "c1" {
-		t.Fatalf("first use returned (%q, %q), want (%q, %q)", gotSession, gotClient, session, "c1")
+	if gotSession != session {
+		t.Fatalf("first use returned %q, want %q", gotSession, session)
 	}
 
 	// Replaying it is the signature of a stolen token.
-	_, _, err = s.TakeRefreshToken(ctx, first)
+	_, err = s.TakeRefreshToken(ctx, first, "c1")
 	if !errors.Is(err, ErrTokenReused) {
 		t.Fatalf("replay: err = %v, want ErrTokenReused", err)
 	}
 
 	// An unknown token is a different answer, so the caller does not revoke a
 	// session over a typo.
-	if _, _, err := s.TakeRefreshToken(ctx, newSecret()); !errors.Is(err, ErrNotFound) {
+	if _, err := s.TakeRefreshToken(ctx, newSecret(), "c1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown token: err = %v, want ErrNotFound", err)
 	}
 }
@@ -149,7 +149,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token after revocation: err = %v, want ErrNotFound", err)
 	}
-	if _, _, err := s.TakeRefreshToken(ctx, refresh); !errors.Is(err, ErrNotFound) {
+	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("refresh token after revocation: err = %v, want ErrNotFound", err)
 	}
 	if _, err := s.TakeAuthCode(ctx, code); !errors.Is(err, ErrNotFound) {
@@ -259,7 +259,7 @@ func TestSessionLifetimeOutranksTokenLifetime(t *testing.T) {
 	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token outlived its session: err = %v, want ErrNotFound", err)
 	}
-	if _, _, err := s.TakeRefreshToken(ctx, refresh); errors.Is(err, nil) {
+	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); errors.Is(err, nil) {
 		t.Error("refresh succeeded against a session past its absolute lifetime")
 	}
 	if _, err := s.SessionToken(ctx, session); !errors.Is(err, ErrNotFound) {
@@ -281,7 +281,7 @@ func TestRefreshTokenExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.TakeRefreshToken(ctx, refresh); !errors.Is(err, ErrNotFound) {
+	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expired refresh token: err = %v, want ErrNotFound", err)
 	}
 }

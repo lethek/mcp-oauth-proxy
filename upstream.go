@@ -115,7 +115,11 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 		// A provider that is itself compromised can name any endpoint regardless;
 		// the control that matters there is trusting the issuer in the first
 		// place.
-		if got.Issuer != "" && strings.TrimRight(got.Issuer, "/") != strings.TrimRight(u.cfg.UpstreamIssuer, "/") {
+		if got.Issuer == "" {
+			lastErr = fmt.Errorf("%s declared no issuer", p)
+			continue
+		}
+		if strings.TrimRight(got.Issuer, "/") != strings.TrimRight(u.cfg.UpstreamIssuer, "/") {
 			lastErr = fmt.Errorf("%s declared issuer %q, want %q", p, got.Issuer, u.cfg.UpstreamIssuer)
 			continue
 		}

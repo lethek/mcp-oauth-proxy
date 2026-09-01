@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -57,10 +60,15 @@ func TestIsLoopbackHostIsCaseInsensitive(t *testing.T) {
 // property.
 //
 // Ignoring X-Forwarded-For entirely means every caller behind an ingress shares
-// one bucket, so a single client exceeding the cap locks everyone else out —
-// a remote kill switch rather than a defence. Honouring it blindly is the
-// opposite mistake, letting a caller mint a fresh bucket per request. Only the
-// declared number of hops, counted from the right, is trustworthy.
+// one bucket, so a single client exceeding the cap locks everyone else out — a
+// remote kill switch rather than a defence. Honouring it blindly is the opposite
+// mistake, letting a caller mint a fresh bucket per request.
+//
+// The arithmetic is the part worth pinning. Each proxy APPENDS the address it
+// received from, so with one proxy the header holds the client and the peer is
+// the proxy. An earlier version of this test asserted the peer was correct for
+// one hop, which was simply wrong and hid an off-by-one that left the shared
+// bucket in place.
 func TestClientKeyTrustsOnlyDeclaredHops(t *testing.T) {
 	req := func(xff string) *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/authorize", nil)
@@ -71,30 +79,48 @@ func TestClientKeyTrustsOnlyDeclaredHops(t *testing.T) {
 		return r
 	}
 
-	// No declared hops: the header is caller-supplied and must be ignored.
+	// No declared hops: the header is entirely caller-supplied and is ignored.
 	if got := clientKey(req("1.2.3.4"), 0); got != "10.0.0.1" {
 		t.Errorf("with no trusted hops, key = %q, want the peer address", got)
 	}
 
-	// One hop: the peer IS the only trusted hop, so still the peer.
-	if got := clientKey(req("1.2.3.4"), 1); got != "10.0.0.1" {
-		t.Errorf("with one trusted hop, key = %q, want the peer address", got)
+	// One proxy: it appended the client and connected to us, so the client is
+	// the only entry and the peer is the proxy.
+	if got := clientKey(req("198.51.100.7"), 1); got != "198.51.100.7" {
+		t.Errorf("with one trusted hop, key = %q, want the client from the header", got)
 	}
 
-	// Two hops: the rightmost header entry was written by our own edge.
-	if got := clientKey(req("9.9.9.9, 1.2.3.4"), 2); got != "1.2.3.4" {
-		t.Errorf("with two trusted hops, key = %q, want the rightmost entry", got)
+	// Two proxies: the header is "client, proxy1" and the peer is proxy2.
+	if got := clientKey(req("198.51.100.7, 10.0.0.2"), 2); got != "198.51.100.7" {
+		t.Errorf("with two trusted hops, key = %q, want the client", got)
 	}
 
-	// A caller prepending entries cannot reach further left than declared.
-	if got := clientKey(req("spoofed, 9.9.9.9, 1.2.3.4"), 2); got != "1.2.3.4" {
+	// A caller prepending entries cannot displace the one its proxy wrote,
+	// because a spoofed value lands to the LEFT of it.
+	if got := clientKey(req("spoofed, 198.51.100.7"), 1); got != "198.51.100.7" {
+		t.Errorf("a spoofed prefix changed the key to %q", got)
+	}
+	if got := clientKey(req("spoofed, 198.51.100.7, 10.0.0.2"), 2); got != "198.51.100.7" {
 		t.Errorf("a spoofed prefix changed the key to %q", got)
 	}
 
-	// More hops declared than present falls back to the peer rather than
-	// reading an attacker-controlled entry.
+	// Separate header lines are one chain, so splitting the spoof across them
+	// does not help either.
+	multi := req("")
+	multi.Header.Add("X-Forwarded-For", "spoofed")
+	multi.Header.Add("X-Forwarded-For", "198.51.100.7")
+	if got := clientKey(multi, 1); got != "198.51.100.7" {
+		t.Errorf("a spoof split across header lines changed the key to %q", got)
+	}
+
+	// Fewer entries than declared hops means the header was stripped or the
+	// configuration is wrong. Reading further left would trust a caller-supplied
+	// value, so the peer is used instead.
 	if got := clientKey(req("1.2.3.4"), 9); got != "10.0.0.1" {
 		t.Errorf("with more hops than entries, key = %q, want the peer address", got)
+	}
+	if got := clientKey(req(""), 1); got != "10.0.0.1" {
+		t.Errorf("with no header at all, key = %q, want the peer address", got)
 	}
 }
 
@@ -119,5 +145,77 @@ func TestClientKeyAggregatesIPv6(t *testing.T) {
 	// IPv4 is keyed exactly, since a single address is the unit there.
 	if got := key("203.0.113.5:443"); got != "203.0.113.5" {
 		t.Errorf("IPv4 key = %q, want the exact address", got)
+	}
+}
+
+// TestWrongClientIDDoesNotConsumeTheRefreshToken guards a sequence that used to
+// destroy a working session.
+//
+// The token was marked used before the client binding was checked, so a refresh
+// naming the wrong client burned the caller's only valid token. The legitimate
+// retry that followed then looked like a replay, and replay detection revokes
+// the entire session. An ordinary mistake, or one hostile request from anyone
+// holding a leaked token, was enough to sign a user out permanently.
+func TestWrongClientIDDoesNotConsumeTheRefreshToken(t *testing.T) {
+	h := newHarness(t)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	_, refresh := h.tokens(clientID, redirect)
+
+	for name, given := range map[string]string{
+		"a different client": "some-other-client",
+		"no client at all":   "",
+	} {
+		t.Run("refused for "+name, func(t *testing.T) {
+			form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}}
+			if given != "" {
+				form.Set("client_id", given)
+			}
+			resp := h.postForm("/token", form)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status %d, want 400", resp.StatusCode)
+			}
+		})
+	}
+
+	// The token must still be usable by the client it belongs to.
+	resp := h.postForm("/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refresh},
+		"client_id":     {clientID},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the legitimate refresh failed with %d; the earlier attempts consumed the token", resp.StatusCode)
+	}
+
+	// And the session survived, so nothing was revoked along the way.
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccessToken == "" {
+		t.Error("no access token issued")
+	}
+}
+
+// TestDiscoveryRequiresAnIssuer: RFC 8414 makes the issuer mandatory, and it is
+// the field the match is performed against. Accepting a document without one
+// meant the check could be skipped by omitting it.
+func TestDiscoveryRequiresAnIssuer(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authorization_endpoint": "https://provider.example/authorize",
+			"token_endpoint":         "https://provider.example/token",
+		})
+	}))
+	defer provider.Close()
+
+	if _, err := NewUpstream(&Config{UpstreamIssuer: provider.URL}).Meta(context.Background()); err == nil {
+		t.Fatal("accepted a discovery document that declared no issuer")
 	}
 }

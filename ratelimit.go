@@ -106,10 +106,20 @@ func clientKey(r *http.Request, trustedHops int) string {
 			}
 		}
 	}
-	// The peer is the last hop and is not in the header, so one trusted hop
-	// means the peer itself, two means the final header entry, and so on.
-	idx := len(chain) - (trustedHops - 1)
-	if trustedHops == 1 || idx < 0 || idx >= len(chain) {
+	// Each proxy appends the address it received from, so with N trusted hops
+	// the last N-1 entries were written about each other and the caller sits at
+	// len(chain)-N.
+	//
+	// Worked through for one proxy, the ordinary case: the client reaches the
+	// proxy, the proxy appends the client and connects to us, so the header is
+	// "client" and the peer is the proxy. The caller is chain[0], which is
+	// len(chain)-1. Anything an attacker prepends lands to the LEFT of the entry
+	// the proxy wrote, so it can never displace it.
+	idx := len(chain) - trustedHops
+	if idx < 0 || idx >= len(chain) {
+		// Fewer entries than declared hops. Something is misconfigured or the
+		// header was stripped, and reading further left would mean trusting a
+		// value the caller may have supplied, so fall back to the peer.
 		return aggregate(peer)
 	}
 	return aggregate(hostOnly(chain[idx]))

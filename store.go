@@ -421,35 +421,44 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, client
 // It returns ErrTokenReused when the token exists but was already rotated.
 // Rotation alone only detects theft; acting on that signal is what contains it,
 // so the caller revokes the session.
-func (s *Store) TakeRefreshToken(ctx context.Context, token string) (sessionID, clientID string, err error) {
+func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (sessionID string, err error) {
 	hash := hashToken(token)
 
+	// The client binding is part of the same statement, so a request naming the
+	// wrong client matches nothing and the token stays unused.
+	//
+	// Checking it after consumption was a real fault: an invalid refresh would
+	// burn the caller's only valid token, and the legitimate retry that followed
+	// then looked like a replay and revoked the whole session. A wrong client id
+	// is an ordinary mistake and must not be able to destroy a session.
 	err = s.pool.QueryRow(ctx,
 		`UPDATE refresh_tokens r SET used=true, used_at=now()
 		 FROM sessions s
 		 WHERE r.token_hash=$1
 		   AND NOT r.used
-		   AND r.created_at > now() - $2::interval
+		   AND r.client_id=$2
+		   AND r.created_at > now() - $3::interval
 		   AND s.id = r.session_id
-		   AND s.created_at > now() - $3::interval
-		 RETURNING r.session_id, r.client_id`,
-		hash, s.refreshTTL.String(), s.sessionTTL.String()).Scan(&sessionID, &clientID)
+		   AND s.created_at > now() - $4::interval
+		 RETURNING r.session_id`,
+		hash, clientID, s.refreshTTL.String(), s.sessionTTL.String()).Scan(&sessionID)
 	if err == nil {
-		return sessionID, clientID, nil
+		return sessionID, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", "", err
+		return "", err
 	}
 
-	// The token did not qualify. If it is on file as already used, this is a
-	// replay rather than an expiry or a typo.
+	// The token did not qualify. Only a token already marked used is a replay;
+	// a client-id mismatch on an unused token is not, and must not be reported
+	// as one or the caller below would tear the session down.
 	var reusedSession string
 	if e := s.pool.QueryRow(ctx,
 		`SELECT session_id FROM refresh_tokens WHERE token_hash=$1 AND used`, hash).
 		Scan(&reusedSession); e == nil {
-		return reusedSession, "", ErrTokenReused
+		return reusedSession, ErrTokenReused
 	}
-	return "", "", ErrNotFound
+	return "", ErrNotFound
 }
 
 // SessionForToken resolves either kind of bearer token to its session without

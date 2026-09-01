@@ -572,7 +572,10 @@ func (s *Server) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
-	sessionID, clientID, err := s.store.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"))
+	// The client id is passed in and matched inside the same statement that
+	// consumes the token, so a wrong or missing one leaves the token unused.
+	clientID := r.PostForm.Get("client_id")
+	sessionID, err := s.store.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
 	if errors.Is(err, ErrTokenReused) {
 		// Either the client replayed a token it should have discarded, or someone
 		// else is holding a copy. We cannot tell which, and only one of those is
@@ -585,14 +588,10 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "the refresh token is unknown or expired")
-		return
-	}
-	// Required, matching the authorization-code grant. Treating it as optional
-	// here meant a refresh could skip client binding entirely, which is an
-	// asymmetry with no reason behind it.
-	if r.PostForm.Get("client_id") != clientID {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "this refresh token was issued to a different client")
+		// Covers an unknown, expired or wrong-client token alike. They are not
+		// distinguished on purpose: saying which would tell an unauthenticated
+		// caller whether a token exists and which client holds it.
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "the refresh token is unknown, expired, or was issued to a different client")
 		return
 	}
 	s.issue(w, r, sessionID, clientID)
