@@ -63,6 +63,7 @@ where a default is shown.
 | `UPSTREAM_CLIENT_ID` | Client id of the application you registered with the provider. |
 | `UPSTREAM_CLIENT_SECRET` | Its secret. |
 | `UPSTREAM_SCOPES` | Space-separated. Default `openid profile email`. |
+| `UPSTREAM_STATIC_HEADERS` | Optional. Newline-separated `Name: Value` pairs, sent to the MCP server in place of the provider's token. See below. |
 | `DATABASE_URL` | PostgreSQL connection string. The schema is created on boot. |
 | `ENCRYPTION_KEY` | Base64 of exactly 32 bytes. Encrypts provider tokens at rest with AES-256-GCM. Changing it invalidates every stored session. |
 | `REFRESH_TOKEN_TTL` | How long a refresh token stays usable. Rotation issues a new one, so this acts as an idle timeout. Go duration, default `720h` (30 days). |
@@ -77,6 +78,33 @@ openssl rand -base64 32
 
 The application you register with the provider must use
 `PUBLIC_URL` + `/callback` as its redirect URI.
+
+### Static upstream credentials
+
+By default the proxy forwards the provider's own token to the MCP server. Some
+MCP servers do not accept it, and authenticate with a fixed credential instead.
+Plane's api-key endpoint is one: it wants a personal access token and a
+workspace header.
+
+`UPSTREAM_STATIC_HEADERS` covers that case:
+
+```yaml
+UPSTREAM_STATIC_HEADERS: |
+  Authorization: Bearer plane_api_xxxxxxxx
+  x-workspace-slug: acme
+```
+
+Newlines separate the pairs, because header values routinely contain commas.
+
+The provider still authenticates every user, and the proxy still issues and
+validates its own tokens, so an unauthenticated caller gets nowhere. What
+changes is only the credential the MCP server sees. The session's provider token
+is not loaded at all in this mode, so a provider that issues no refresh token
+cannot break forwarding.
+
+Note what this means: everyone the provider lets in shares one upstream
+credential, and the MCP server cannot tell them apart. Scope that credential to
+the least it needs.
 
 ## Endpoints
 

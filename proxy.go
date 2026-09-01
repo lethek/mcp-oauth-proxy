@@ -60,6 +60,24 @@ func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
 	return p
 }
 
+// prepareUpstreamHeaders drops the credential the caller sent us and, when
+// static headers are configured, applies those in its place. It reports whether
+// the upstream credential is now settled.
+//
+// The caller's token is dropped unconditionally, before any decision about what
+// replaces it. Relying on the injection to overwrite it would leak that token
+// upstream whenever the configured headers happen not to include Authorization.
+func prepareUpstreamHeaders(r *http.Request, static map[string]string) bool {
+	r.Header.Del("Authorization")
+	if len(static) == 0 {
+		return false
+	}
+	for name, value := range static {
+		r.Header.Set(name, value)
+	}
+	return true
+}
+
 // refreshLocks serialises refreshes per session, so a burst of concurrent
 // requests on an expired token produces one upstream refresh rather than a
 // stampede that would invalidate its own rotated refresh token.
@@ -95,6 +113,15 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			slog.Error("mcp: token lookup failed", "err", err)
 		}
 		s.challenge(w, "invalid_token", "the access token is unknown or expired")
+		return
+	}
+
+	// In static mode the upstream authenticates with a fixed credential, so this
+	// session's provider token is irrelevant. It is deliberately not loaded: it
+	// may have expired with no refresh token available, and failing a request
+	// over a credential we were never going to send would be wrong.
+	if prepareUpstreamHeaders(r, s.cfg.UpstreamStaticHeaders) {
+		s.proxy.ServeHTTP(w, r)
 		return
 	}
 

@@ -41,6 +41,15 @@ type Config struct {
 	UpstreamClientSecret string
 	UpstreamScopes       string
 
+	// UpstreamStaticHeaders, when set, are injected on every forwarded request
+	// INSTEAD of the session's upstream token. Some MCP servers authenticate
+	// with a fixed credential of their own rather than accepting the provider's
+	// token — Plane's api-key endpoint wants a personal access token plus a
+	// workspace header. The upstream OAuth settings are still required in this
+	// mode: the provider authenticates the person, and this credential is what
+	// the MCP server behind us accepts.
+	UpstreamStaticHeaders map[string]string
+
 	DatabaseURL string
 
 	// EncryptionKey protects upstream tokens at rest. 32 bytes, base64.
@@ -56,6 +65,33 @@ type Config struct {
 	SessionTTL time.Duration
 
 	ListenAddr string
+}
+
+// parseStaticHeaders reads newline-separated "Name: Value" pairs. Newlines
+// rather than commas because header values routinely contain commas, and a
+// YAML block scalar expresses this shape cleanly in a manifest.
+func parseStaticHeaders(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, value, found := strings.Cut(line, ":")
+		if !found {
+			return nil, fmt.Errorf("UPSTREAM_STATIC_HEADERS: %q is not \"Name: Value\"", line)
+		}
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if name == "" {
+			return nil, fmt.Errorf("UPSTREAM_STATIC_HEADERS: empty header name in %q", line)
+		}
+		if value == "" {
+			return nil, fmt.Errorf("UPSTREAM_STATIC_HEADERS: %s has an empty value", name)
+		}
+		out[name] = value
+	}
+	return out, nil
 }
 
 func LoadConfig() (*Config, error) {
@@ -76,6 +112,12 @@ func LoadConfig() (*Config, error) {
 	if c.ListenAddr == "" {
 		c.ListenAddr = ":8080"
 	}
+
+	staticHeaders, err := parseStaticHeaders(os.Getenv("UPSTREAM_STATIC_HEADERS"))
+	if err != nil {
+		return nil, err
+	}
+	c.UpstreamStaticHeaders = staticHeaders
 
 	missing := []string{}
 	for name, v := range map[string]string{
