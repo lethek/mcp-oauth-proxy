@@ -23,7 +23,7 @@ func TestUpstreamUnauthorizedBecomesEnrolAdvice(t *testing.T) {
 	const redirect = "https://client.example/callback"
 	clientID := h.register(redirect)
 	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
-	h.enrol("user-42 (alice)", "alpha", map[string]string{
+	h.enrol("user-42", "alpha", map[string]string{
 		"Authorization": "Bearer revoked-token",
 	})
 

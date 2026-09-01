@@ -37,27 +37,52 @@ const consentCookie = "mcp_proxy_consent"
 // silently invalidate the first client's consent page. Lax keeps the defence
 // and lets the reuse above actually happen.
 func (s *Server) browserSecret(w http.ResponseWriter, r *http.Request) string {
-	secret := readBrowserSecret(r)
+	secret := s.readBrowserSecret(r)
 	if secret == "" {
 		secret = newSecret()
 	}
+	s.setCookie(w, consentCookie, secret, int(flowTTL.Seconds()))
+	return secret
+}
+
+// cookieName applies the __Host- prefix when the deployment can satisfy it.
+//
+// The prefix is what stops a sibling host under the same registrable domain
+// setting these cookies for the parent domain: a browser refuses a __Host-
+// cookie that carries a Domain attribute, is not Secure, or is not Path=/. That
+// matters most for the settings session, where a seated attacker identity means
+// a user pastes their upstream API token into a form that stores it under
+// someone else's subject.
+//
+// It is conditional because the prefix requires Secure, which a browser only
+// accepts over https. A loopback http deployment would otherwise have every
+// cookie silently dropped.
+func (s *Server) cookieName(base string) string {
+	if s.cfg.PublicScheme == "https" {
+		return "__Host-" + base
+	}
+	return base
+}
+
+// setCookie writes a cookie with the attributes __Host- requires, so the name
+// and the attributes cannot drift apart.
+func (s *Server) setCookie(w http.ResponseWriter, base, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     consentCookie,
-		Value:    secret,
+		Name:     s.cookieName(base),
+		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   s.cfg.PublicScheme == "https",
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(flowTTL.Seconds()),
+		MaxAge:   maxAge,
 	})
-	return secret
 }
 
 // readBrowserSecret returns this browser's binding secret, or "" when it has
 // none. It never mints one: the consent handler must not manufacture a
 // valid-looking binding for a browser that was never shown the page.
-func readBrowserSecret(r *http.Request) string {
-	c, err := r.Cookie(consentCookie)
+func (s *Server) readBrowserSecret(r *http.Request) string {
+	c, err := r.Cookie(s.cookieName(consentCookie))
 	if err != nil {
 		return ""
 	}
@@ -279,12 +304,18 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			"the resource parameter is required; this proxy serves "+s.cfg.ResourceList())
 		return
 	}
+	// Resolved here so the consent screen can name the target. Which upstream a
+	// token will be spent against is chosen entirely by the client, so the user
+	// has to be told which one they are approving.
+	target := s.cfg.Targets[0]
 	if res != "" {
-		if _, ok := s.cfg.TargetByResource(res); !ok {
+		found, ok := s.cfg.TargetByResource(res)
+		if !ok {
 			s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target",
 				"this proxy only issues tokens for "+s.cfg.ResourceList())
 			return
 		}
+		target = found
 	}
 
 	flow := Flow{
@@ -306,6 +337,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	renderConsent(w, consentView{
 		ClientName:      client.Name,
 		ClientID:        client.ID,
+		TargetName:      target.DisplayName,
 		RedirectURI:     redirectURI,
 		FlowID:          flow.ID,
 		ConsentPath:     "/consent",
@@ -334,7 +366,7 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	}
 	flowID := r.PostForm.Get("flow_id")
 
-	binding := readBrowserSecret(r)
+	binding := s.readBrowserSecret(r)
 
 	if r.PostForm.Get("decision") != "approve" {
 		// Cancelling is bound the same way as approving. Nothing is granted here,
@@ -412,15 +444,20 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Who this session belongs to, for the audit trail. A provider that will not
-	// say must not block the login.
-	subject, err := s.upstream.Subject(r.Context(), tok.AccessToken)
+	// Who this session belongs to. In a per_user deployment this is the key the
+	// caller's stored credential is found by, so a session without it can do
+	// nothing; the request fails here rather than producing one that will be
+	// refused later for a reason nobody can act on.
+	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
-		slog.Warn("callback: could not resolve the user", "err", err)
+		slog.Error("callback: could not resolve the user", "err", err)
+		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error",
+			"the identity provider would not say who you are")
+		return
 	}
 
 	sessionID := newSecret()
-	if err := s.persistToken(r.Context(), sessionID, subject, flow.Resource, tok, true); err != nil {
+	if err := s.persistToken(r.Context(), sessionID, identity.Subject, flow.Resource, tok, true); err != nil {
 		slog.Error("callback: could not store session", "err", err)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error", "could not store the session")
 		return
@@ -453,7 +490,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	rq.Set("iss", s.cfg.PublicURL)
 	dest.RawQuery = rq.Encode()
 
-	slog.Info("authorized a client", "client_id", flow.ClientID, "subject", subject)
+	slog.Info("authorized a client", "client_id", flow.ClientID, "subject", identity.Label())
 	http.Redirect(w, r, dest.String(), http.StatusFound)
 }
 
@@ -608,7 +645,7 @@ func (s *Server) persistToken(ctx context.Context, sessionID, subject, resource 
 	if err != nil {
 		return err
 	}
-	sealed, err := s.sealer.seal(raw)
+	sealed, err := s.sealer.seal(purposeUpstreamToken, raw)
 	if err != nil {
 		return err
 	}
@@ -624,7 +661,7 @@ func (s *Server) loadToken(ctx context.Context, sessionID string) (UpstreamToken
 	if err != nil {
 		return tok, err
 	}
-	raw, err := s.sealer.open(sealed)
+	raw, err := s.sealer.open(purposeUpstreamToken, sealed)
 	if err != nil {
 		return tok, errors.New("stored token could not be decrypted; the encryption key may have changed")
 	}

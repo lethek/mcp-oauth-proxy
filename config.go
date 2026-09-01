@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 	"unicode"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // Config is assembled entirely from the environment. Every field is required
@@ -136,7 +139,7 @@ func envPrefix(name string) string {
 // parseStaticHeaders reads newline-separated "Name: Value" pairs. Newlines
 // rather than commas because header values routinely contain commas, and a
 // YAML block scalar expresses this shape cleanly in a manifest.
-func parseStaticHeaders(raw string) (map[string]string, error) {
+func parseStaticHeaders(varName, raw string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
@@ -145,15 +148,15 @@ func parseStaticHeaders(raw string) (map[string]string, error) {
 		}
 		name, value, found := strings.Cut(line, ":")
 		if !found {
-			return nil, fmt.Errorf("UPSTREAM_STATIC_HEADERS: %q is not \"Name: Value\"", line)
+			return nil, fmt.Errorf(varName+": %q is not \"Name: Value\"", line)
 		}
 		name = strings.TrimSpace(name)
 		value = strings.TrimSpace(value)
 		if name == "" {
-			return nil, fmt.Errorf("UPSTREAM_STATIC_HEADERS: empty header name in %q", line)
+			return nil, fmt.Errorf(varName+": empty header name in %q", line)
 		}
 		if value == "" {
-			return nil, fmt.Errorf("UPSTREAM_STATIC_HEADERS: %s has an empty value", name)
+			return nil, fmt.Errorf(varName+": %s has an empty value", name)
 		}
 		out[name] = value
 	}
@@ -196,7 +199,7 @@ func LoadConfig() (*Config, error) {
 	}
 	// UPSTREAM_MCP_URL describes the single legacy target and is required only
 	// when TARGETS is absent.
-	if os.Getenv("TARGETS") == "" {
+	if strings.TrimSpace(os.Getenv("TARGETS")) == "" {
 		required["UPSTREAM_MCP_URL"] = c.UpstreamMCP
 	}
 
@@ -225,6 +228,13 @@ func LoadConfig() (*Config, error) {
 
 	if err := c.derivePublic(); err != nil {
 		return nil, fmt.Errorf("PUBLIC_URL is not usable: %w", err)
+	}
+
+	// Every route is registered at the root and every advertised URL is built by
+	// appending to this, so a path component would produce metadata and redirect
+	// URIs that match nothing this process actually serves.
+	if u, err := url.Parse(c.PublicURL); err == nil && u.Path != "" {
+		return nil, fmt.Errorf("PUBLIC_URL must not have a path component, got %q", u.Path)
 	}
 
 	targets, err := parseTargets(c.PublicURL)
@@ -272,11 +282,14 @@ func parseTargets(publicURL string) ([]Target, error) {
 	legacyHeaders := os.Getenv("UPSTREAM_STATIC_HEADERS")
 
 	if raw == "" {
-		headers, err := parseStaticHeaders(legacyHeaders)
+		headers, err := parseStaticHeaders("UPSTREAM_STATIC_HEADERS", legacyHeaders)
 		if err != nil {
 			return nil, err
 		}
 		t := Target{
+			// Unnamed, so there is nothing to capitalise. The consent page still
+			// has to call it something.
+			DisplayName:   "the MCP server",
 			UpstreamMCP:   legacyURL,
 			Mode:          CredProviderToken,
 			StaticHeaders: headers,
@@ -336,9 +349,9 @@ func parseTargets(publicURL string) ([]Target, error) {
 			return nil, fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static, per_user", p, t.Mode)
 		}
 
-		headers, err := parseStaticHeaders(os.Getenv(p + "STATIC_HEADERS"))
+		headers, err := parseStaticHeaders(p+"STATIC_HEADERS", os.Getenv(p+"STATIC_HEADERS"))
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
+			return nil, err
 		}
 		if t.Mode == CredStatic && len(headers) == 0 {
 			return nil, fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
@@ -394,16 +407,23 @@ func parseUserHeaderFields(raw string) ([]UserHeaderField, error) {
 	}
 	seen := map[string]bool{}
 	for i, f := range fields {
-		if strings.TrimSpace(f.Header) == "" {
-			return nil, fmt.Errorf("field %d has no header name", i)
+		// Validated here rather than left to fail at request time, when the value
+		// would be rejected by the transport and surface to a user as a 502 on
+		// every call with nothing to point at.
+		if !httpguts.ValidHeaderFieldName(f.Header) {
+			return nil, fmt.Errorf("field %d has an invalid header name %q", i, f.Header)
 		}
 		if strings.TrimSpace(f.Label) == "" {
 			return nil, fmt.Errorf("field %q has no label", f.Header)
 		}
-		if seen[f.Header] {
+		if !httpguts.ValidHeaderFieldValue(f.Prefix) {
+			return nil, fmt.Errorf("field %q has an invalid prefix", f.Header)
+		}
+		key := http.CanonicalHeaderKey(f.Header)
+		if seen[key] {
 			return nil, fmt.Errorf("field %q is listed twice", f.Header)
 		}
-		seen[f.Header] = true
+		seen[key] = true
 	}
 	if len(fields) == 0 {
 		return nil, fmt.Errorf("names no fields")

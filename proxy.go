@@ -160,15 +160,43 @@ func stripTargetPrefix(r *http.Request, t Target) {
 	}
 }
 
-// prepareUpstreamHeaders drops the credential the caller sent us and, when
-// static headers are configured, applies those in its place. It reports whether
+// upstreamAllowedHeaders is what a caller may send through to the MCP server.
+//
+// An allowlist rather than a denylist, because the interesting failure is a
+// header nobody thought to remove. The credential injected here is often not the
+// caller's own — an operator's static token, or another user's stored one — so
+// any second authentication header the upstream happens to honour would let a
+// caller override or sidestep it. Enumerating the two we knew about would only
+// have covered the ones we knew about.
+//
+// The set is what MCP over streamable HTTP actually needs. Accept-Encoding is
+// excluded on purpose: Go's transport negotiates its own and decompresses
+// transparently, which keeps response rewriting honest.
+var upstreamAllowedHeaders = map[string]bool{
+	"Accept":               true,
+	"Accept-Language":      true,
+	"Content-Type":         true,
+	"Content-Length":       true,
+	"Last-Event-Id":        true,
+	"Mcp-Protocol-Version": true,
+	"Mcp-Session-Id":       true,
+	"User-Agent":           true,
+}
+
+// prepareUpstreamHeaders reduces the request to what the upstream should see and
+// then, when static headers are configured, applies those. It reports whether
 // the upstream credential is now settled.
 //
-// The caller's token is dropped unconditionally, before any decision about what
-// replaces it. Relying on the injection to overwrite it would leak that token
-// upstream whenever the configured headers happen not to include Authorization.
+// Everything the caller sent that is not on the allowlist is dropped before any
+// decision about what replaces it. Relying on the injection to overwrite the
+// caller's Authorization would leak that token upstream whenever the configured
+// headers happen not to include one.
 func prepareUpstreamHeaders(r *http.Request, static map[string]string) bool {
-	r.Header.Del("Authorization")
+	for name := range r.Header {
+		if !upstreamAllowedHeaders[http.CanonicalHeaderKey(name)] {
+			r.Header.Del(name)
+		}
+	}
 	if len(static) == 0 {
 		return false
 	}
@@ -251,12 +279,20 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 		// retry loop. The upstream is never contacted.
 		if t.Mode == CredPerUser {
 			headers, err := s.userHeadersFor(r, sessionID, t.Name)
-			if err != nil {
-				if !errors.Is(err, ErrNotFound) {
-					slog.Error("mcp: could not read the stored credential",
-						"err", err, "session", sessionID, "target", t.Name)
-				}
+			switch {
+			case err == nil:
+			case errors.Is(err, ErrNotFound):
 				s.notEnrolled(w, t)
+				return
+			default:
+				// A database outage, a rotated encryption key or a corrupt row is
+				// not the user's problem to fix. Telling them to go and set a
+				// credential sends them to do something that will not help and
+				// hides a server fault behind a 403.
+				slog.Error("mcp: could not read the stored credential",
+					"err", err, "session", sessionID, "target", t.Name)
+				oauthError(w, http.StatusInternalServerError, "server_error",
+					"your stored credential could not be read")
 				return
 			}
 			stripTargetPrefix(r, t)

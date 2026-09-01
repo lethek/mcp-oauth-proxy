@@ -48,7 +48,7 @@ func TestSealRoundTrip(t *testing.T) {
 	}
 	plain := []byte(`{"access_token":"secret"}`)
 
-	sealed, err := s.seal(plain)
+	sealed, err := s.seal(purposeUpstreamToken, plain)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestSealRoundTrip(t *testing.T) {
 		t.Error("sealed output contains the plaintext")
 	}
 
-	opened, err := s.open(sealed)
+	opened, err := s.open(purposeUpstreamToken, sealed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,11 +70,11 @@ func TestSealUsesAFreshNonce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := s.seal([]byte("same plaintext"))
+	a, err := s.seal(purposeUpstreamToken, []byte("same plaintext"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.seal([]byte("same plaintext"))
+	b, err := s.seal(purposeUpstreamToken, []byte("same plaintext"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,18 +88,18 @@ func TestOpenRejectsTampering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := s.seal([]byte("upstream token"))
+	sealed, err := s.seal(purposeUpstreamToken, []byte("upstream token"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	tampered := bytes.Clone(sealed)
 	tampered[len(tampered)-1] ^= 0xff
-	if _, err := s.open(tampered); err == nil {
+	if _, err := s.open(purposeUpstreamToken, tampered); err == nil {
 		t.Error("open accepted a modified ciphertext")
 	}
 
-	if _, err := s.open(sealed[:4]); err == nil {
+	if _, err := s.open(purposeUpstreamToken, sealed[:4]); err == nil {
 		t.Error("open accepted a truncated ciphertext")
 	}
 
@@ -107,7 +107,7 @@ func TestOpenRejectsTampering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := other.open(sealed); err == nil {
+	if _, err := other.open(purposeUpstreamToken, sealed); err == nil {
 		t.Error("open accepted a ciphertext sealed under a different key")
 	}
 }
@@ -128,5 +128,31 @@ func TestBearerFrom(t *testing.T) {
 		if got := bearerFrom(r); got != want {
 			t.Errorf("bearerFrom(%q) = %q, want %q", header, got, want)
 		}
+	}
+}
+
+// TestSealIsBoundToItsPurpose: one key protects several unrelated values, so a
+// ciphertext produced for one must not open as another. Without the binding,
+// safety would rest on the plaintexts failing to unmarshal into each other's
+// types, which is a property of today's structs rather than a guarantee.
+func TestSealIsBoundToItsPurpose(t *testing.T) {
+	s, err := newSealer(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte(`{"sub":"someone"}`)
+
+	sealed, err := s.seal(purposeSettingsSession, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.open(purposeUserCredential, sealed); err == nil {
+		t.Error("a settings cookie opened as a stored credential")
+	}
+	if _, err := s.open(purposeUpstreamToken, sealed); err == nil {
+		t.Error("a settings cookie opened as an upstream token")
+	}
+	if _, err := s.open(purposeSettingsSession, sealed); err != nil {
+		t.Errorf("its own purpose failed to open: %v", err)
 	}
 }

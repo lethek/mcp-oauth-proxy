@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -53,9 +52,12 @@ type harness struct {
 	// challenge header.
 	refuseAlpha atomic.Bool
 
-	// gzipRefusal makes that 401 gzip-encoded, as a real server behind a
-	// compressing layer would.
-	gzipRefusal atomic.Bool
+	// encodedRefusal makes that 401 carry a Content-Encoding, as a server behind
+	// a compressing layer would. Brotli rather than gzip on purpose: Go's
+	// transport negotiates and unwraps gzip by itself, so a gzip response never
+	// reaches ModifyResponse still encoded and could not show whether the
+	// rewrite clears the header.
+	encodedRefusal atomic.Bool
 }
 
 // targetBuilder lets a test choose the target layout. It runs once PUBLIC_URL is
@@ -175,22 +177,19 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 				// the rewrite has to survive.
 				w.Header().Set("WWW-Authenticate", `Bearer realm="upstream"`)
 				payload := []byte(`{"error":"unauthorized","detail":"token revoked upstream"}`)
-				if h.gzipRefusal.Load() {
-					w.Header().Set("Content-Encoding", "gzip")
-					w.WriteHeader(http.StatusUnauthorized)
-					gz := gzip.NewWriter(w)
-					_, _ = gz.Write(payload)
-					_ = gz.Close()
-					return
+				if h.encodedRefusal.Load() {
+					w.Header().Set("Content-Encoding", "br")
 				}
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write(payload)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"target":            target,
-				"saw_authorization": r.Header.Get("Authorization"),
-				"saw_workspace":     r.Header.Get("x-workspace-slug"),
+				"target":             target,
+				"saw_authorization":  r.Header.Get("Authorization"),
+				"saw_workspace":      r.Header.Get("x-workspace-slug"),
+				"saw_smuggled":       r.Header.Get("X-Api-Key"),
+				"saw_forwarded_user": r.Header.Get("X-Forwarded-User"),
 			})
 		}
 	}
@@ -1094,32 +1093,46 @@ func TestConsentAcceptsOriginWithoutDefaultPort(t *testing.T) {
 func TestBindingCookieIsSecureOverHTTPS(t *testing.T) {
 	h := newHarness(t)
 
-	secureFor := func(publicURL string) bool {
+	cookieFor := func(publicURL string) *http.Cookie {
 		h.srv.cfg.PublicURL = publicURL
 		if err := h.srv.cfg.derivePublic(); err != nil {
 			t.Fatal(err)
 		}
 		w := httptest.NewRecorder()
 		h.srv.browserSecret(w, httptest.NewRequest(http.MethodGet, "/authorize", nil))
-		for _, c := range w.Result().Cookies() {
-			if c.Name == consentCookie {
-				return c.Secure
-			}
+		got := w.Result().Cookies()
+		if len(got) != 1 {
+			t.Fatalf("browserSecret set %d cookies, want 1", len(got))
 		}
-		t.Fatalf("browserSecret set no %s cookie", consentCookie)
-		return false
+		return got[0]
 	}
 
+	// Over https the __Host- prefix is what stops a sibling host under the same
+	// registrable domain setting this cookie for the parent domain. A browser
+	// refuses a __Host- cookie that is not Secure, is not Path=/, or carries a
+	// Domain, so the name and the attributes have to agree.
 	for _, publicURL := range []string{"https://example.com", "HTTPS://example.com", "Https://example.com:8443"} {
-		if !secureFor(publicURL) {
+		c := cookieFor(publicURL)
+		if !c.Secure {
 			t.Errorf("PUBLIC_URL %q produced a binding cookie without Secure", publicURL)
+		}
+		if c.Name != "__Host-"+consentCookie {
+			t.Errorf("PUBLIC_URL %q named the cookie %q, want the __Host- prefix", publicURL, c.Name)
+		}
+		if c.Path != "/" || c.Domain != "" {
+			t.Errorf("PUBLIC_URL %q produced Path=%q Domain=%q, which a browser refuses under __Host-", publicURL, c.Path, c.Domain)
 		}
 	}
 
 	// Loopback http is the one supported case where Secure would stop the cookie
-	// being stored at all.
-	if secureFor("http://127.0.0.1:8080") {
+	// being stored at all, and __Host- requires Secure, so the prefix is dropped
+	// with it rather than producing a cookie the browser silently discards.
+	c := cookieFor("http://127.0.0.1:8080")
+	if c.Secure {
 		t.Error("PUBLIC_URL http://127.0.0.1:8080 produced a Secure cookie, which the browser will not send back over http")
+	}
+	if c.Name != consentCookie {
+		t.Errorf("over http the cookie is %q, want the unprefixed name", c.Name)
 	}
 }
 

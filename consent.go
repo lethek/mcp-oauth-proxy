@@ -45,12 +45,14 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
 <main>
   <h1>Authorize {{.ClientName}}</h1>
 
-  <p>An application is asking to act as you on the MCP server behind this proxy.
-  If you approve, it can do anything your account can do there.</p>
+  <p>An application is asking to act as you on {{.TargetName}}. If you approve,
+  it can do anything your account can do there.</p>
 
   <dl>
     <dt>Application name</dt>
     <dd>{{.ClientName}}</dd>
+    <dt>Will act on your behalf at</dt>
+    <dd>{{.TargetName}}</dd>
     <dt>Client ID</dt>
     <dd>{{.ClientID}}</dd>
     <dt>Will receive the authorization at</dt>
@@ -75,8 +77,14 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
 `))
 
 type consentView struct {
-	ClientName  string
-	ClientID    string
+	ClientName string
+	ClientID   string
+
+	// TargetName is which MCP server this authorization is for. With several
+	// targets behind one proxy, approving a client no longer implies which
+	// credential it will end up spending, so the question has to name it.
+	TargetName string
+
 	RedirectURI string
 	FlowID      string
 	ConsentPath string

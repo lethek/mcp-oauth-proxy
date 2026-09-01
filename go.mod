@@ -2,7 +2,10 @@ module github.com/lethek/mcp-oauth-proxy
 
 go 1.26
 
-require github.com/jackc/pgx/v5 v5.7.6
+require (
+	github.com/jackc/pgx/v5 v5.7.6
+	golang.org/x/net v0.21.0
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect

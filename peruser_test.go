@@ -42,7 +42,7 @@ func (h *harness) enrol(subject, target string, headers map[string]string) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	sealed, err := h.srv.sealer.seal(raw)
+	sealed, err := h.srv.sealer.seal(purposeUserCredential, raw)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -60,8 +60,9 @@ func TestPerUserCredentialIsInjected(t *testing.T) {
 	clientID := h.register(redirect)
 	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
 
-	// user-42 is the subject the test provider's userinfo returns.
-	h.enrol("user-42 (alice)", "alpha", map[string]string{
+	// user-42 is the bare sub the test provider returns. The key must be the sub
+	// alone, never the decorated form, or a rename orphans the row.
+	h.enrol("user-42", "alpha", map[string]string{
 		"Authorization":    "Bearer alices-own-token",
 		"x-workspace-slug": "alices-workspace",
 	})
@@ -167,7 +168,7 @@ func TestCredentialIsScopedToItsTarget(t *testing.T) {
 	access, _ := h.tokensFor(clientID, redirect, betaResource)
 
 	// Enrolled for alpha only, but calling beta.
-	h.enrol("user-42 (alice)", "alpha", map[string]string{"Authorization": "Bearer alpha-only"})
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer alpha-only"})
 
 	resp := h.mcpRequest("/beta/mcp", access)
 	defer resp.Body.Close()
@@ -284,5 +285,217 @@ func TestSettingsRejectsUnknownTarget(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("target %q: status %d, want 400", target, resp.StatusCode)
 		}
+	}
+}
+
+// TestCredentialKeyIsTheBareSubject pins the identifier durable rows are keyed
+// on.
+//
+// The provider returns both a sub and a preferred_username, and the readable
+// form combining them is what appears in logs. Keying storage on that combined
+// value was a real bug: a username is mutable, so a rename changes the key and
+// silently orphans every credential stored under the old one, leaving the user
+// told they are "not enrolled" with no way to recover the row.
+func TestCredentialKeyIsTheBareSubject(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+
+	// Enrolled under the decorated form, which is what a log line shows.
+	h.enrol("user-42 (alice)", "alpha", map[string]string{"Authorization": "Bearer decorated"})
+
+	resp := h.mcpRequest("/alpha/mcp", access)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("a credential stored under the decorated identity was accepted: status %d", resp.StatusCode)
+	}
+
+	// Enrolled under the bare sub, which is what the session records.
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer bare"})
+
+	resp = h.mcpRequest("/alpha/mcp", access)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 once stored under the bare sub", resp.StatusCode)
+	}
+	var saw struct {
+		Authorization string `json:"saw_authorization"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&saw); err != nil {
+		t.Fatal(err)
+	}
+	if saw.Authorization != "Bearer bare" {
+		t.Errorf("upstream saw %q, want the credential keyed on the bare sub", saw.Authorization)
+	}
+}
+
+// signIntoSettings walks the settings login so a test can act as a signed-in
+// user.
+func (h *harness) signIntoSettings() {
+	h.t.Helper()
+	start := h.get(h.proxy.URL + "/settings")
+	start.Body.Close()
+	toProvider := h.get(start.Header.Get("Location"))
+	toProvider.Body.Close()
+	h.get(toProvider.Header.Get("Location")).Body.Close()
+}
+
+// TestSettingsClearRemovesTheCredential covers the Clear button, which had no
+// test at all: the credential stops working and the catalogue stops claiming it
+// is configured.
+func TestSettingsClearRemovesTheCredential(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+
+	save := h.postForm("/settings", url.Values{
+		"target":                 {"alpha"},
+		"action":                 {"save"},
+		"field_Authorization":    {"a-token"},
+		"field_x-workspace-slug": {"acme"},
+	})
+	save.Body.Close()
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+
+	resp := h.mcpRequest("/alpha/mcp", access)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("before clearing: status %d, want 200", resp.StatusCode)
+	}
+
+	clear := h.postForm("/settings", url.Values{"target": {"alpha"}, "action": {"clear"}})
+	clear.Body.Close()
+	if clear.StatusCode != http.StatusFound {
+		t.Fatalf("clearing: status %d, want a redirect", clear.StatusCode)
+	}
+
+	resp = h.mcpRequest("/alpha/mcp", access)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("after clearing: status %d, want 403", resp.StatusCode)
+	}
+
+	page := h.get(h.proxy.URL + "/settings")
+	defer page.Body.Close()
+	body, err := io.ReadAll(page.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Not configured") {
+		t.Error("the catalogue still reports the target as configured")
+	}
+}
+
+// TestSettingsRejectsUnusableValues: a value that cannot become a header must be
+// refused at save time. Stored, it would produce a 502 on every later call with
+// nothing on screen to explain it.
+func TestSettingsRejectsUnusableValues(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+
+	for name, value := range map[string]string{
+		"a newline":         "token\nX-Admin: 1",
+		"a carriage return": "token\rX-Admin: 1",
+		"a null byte":       "token\x00",
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			resp := h.postForm("/settings", url.Values{
+				"target":                 {"alpha"},
+				"action":                 {"save"},
+				"field_Authorization":    {value},
+				"field_x-workspace-slug": {"acme"},
+			})
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status %d, want 400", resp.StatusCode)
+			}
+		})
+	}
+
+	t.Run("rejects an over-long value", func(t *testing.T) {
+		resp := h.postForm("/settings", url.Values{
+			"target":                 {"alpha"},
+			"action":                 {"save"},
+			"field_Authorization":    {strings.Repeat("x", maxCredentialValue+1)},
+			"field_x-workspace-slug": {"acme"},
+		})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("status %d, want 400", resp.StatusCode)
+		}
+	})
+}
+
+// TestSettingsLogoutEndsTheSession: without this the cookie outlives a logout at
+// the provider, on the one page that holds something worth stealing.
+func TestSettingsLogoutEndsTheSession(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+
+	page := h.get(h.proxy.URL + "/settings")
+	page.Body.Close()
+	if page.StatusCode != http.StatusOK {
+		t.Fatalf("signed in: status %d, want 200", page.StatusCode)
+	}
+
+	out := h.postForm("/settings/logout", url.Values{})
+	out.Body.Close()
+	if out.StatusCode != http.StatusFound {
+		t.Fatalf("logout: status %d, want a redirect", out.StatusCode)
+	}
+
+	after := h.get(h.proxy.URL + "/settings")
+	after.Body.Close()
+	if after.StatusCode != http.StatusFound {
+		t.Errorf("after logout: status %d, want a redirect back to the provider", after.StatusCode)
+	}
+}
+
+// TestOnlyAllowedHeadersReachTheUpstream: the injected credential is often not
+// the caller's own, so a second authentication header the upstream happens to
+// honour would let a caller override or sidestep it.
+func TestOnlyAllowedHeadersReachTheUpstream(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer the-real-one"})
+
+	req, err := http.NewRequest("POST", h.proxy.URL+"/alpha/mcp", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+access)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", "smuggled")
+	req.Header.Set("X-Forwarded-User", "someone-else")
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var saw struct {
+		Authorization string `json:"saw_authorization"`
+		Smuggled      string `json:"saw_smuggled"`
+		ForwardedUser string `json:"saw_forwarded_user"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&saw); err != nil {
+		t.Fatal(err)
+	}
+	if saw.Authorization != "Bearer the-real-one" {
+		t.Errorf("Authorization = %q, want the stored credential", saw.Authorization)
+	}
+	if saw.Smuggled != "" {
+		t.Errorf("X-Api-Key reached the upstream: %q", saw.Smuggled)
+	}
+	if saw.ForwardedUser != "" {
+		t.Errorf("X-Forwarded-User reached the upstream: %q", saw.ForwardedUser)
 	}
 }

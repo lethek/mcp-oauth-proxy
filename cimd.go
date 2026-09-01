@@ -34,9 +34,23 @@ const (
 	cimdTimeout   = 5 * time.Second
 	cimdCacheTTL  = 15 * time.Minute
 	cimdCacheSize = 256
+
+	// cimdFailureTTL remembers a failure briefly. The draft forbids caching an
+	// error response as if it were a document; this caches only the refusal to
+	// try again, which is what stops one caller turning repeated /authorize
+	// calls into repeated outbound requests.
+	cimdFailureTTL = 30 * time.Second
 )
 
 var errCIMDDisabled = errors.New("client id metadata documents are not enabled")
+
+// NAT64 translation prefixes. An address inside one of these is an IPv4
+// destination in disguise, so on a network with a NAT64 gateway it would reach
+// exactly the private range the v4 checks exclude.
+var (
+	_, nat64WellKnown, _ = net.ParseCIDR("64:ff9b::/96")
+	_, nat64Local, _     = net.ParseCIDR("64:ff9b:1::/48")
+)
 
 // validateCIMDURL applies the draft's rules for a usable client_id URL.
 func validateCIMDURL(raw string) (*url.URL, error) {
@@ -87,6 +101,7 @@ type cimdClient struct {
 
 type cimdEntry struct {
 	client  Client
+	err     error
 	expires time.Time
 }
 
@@ -125,8 +140,16 @@ func newCIMD(guardAddresses bool) *cimdClient {
 
 	return &cimdClient{
 		http: &http.Client{
-			Timeout:   cimdTimeout,
-			Transport: &http.Transport{DialContext: dialer.DialContext},
+			Timeout: cimdTimeout,
+			Transport: &http.Transport{
+				DialContext: dialer.DialContext,
+				// Bounded, because the hosts here are chosen by callers and an
+				// unbounded pool would keep a connection to each one alive.
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     30 * time.Second,
+				TLSHandshakeTimeout: cimdTimeout,
+			},
 			// A redirect could land anywhere, including somewhere the checks
 			// above were meant to exclude, and the draft requires the document
 			// to live at the client_id itself.
@@ -145,9 +168,21 @@ func isPublicIP(ip net.IP) bool {
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return false
 	}
-	// 100.64.0.0/10, carrier-grade NAT, which IsPrivate does not cover and which
-	// is where a tailnet or similar overlay usually sits.
-	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+	if v4 := ip.To4(); v4 != nil {
+		// 100.64.0.0/10, carrier-grade NAT, which IsPrivate does not cover and
+		// which is where a tailnet or similar overlay usually sits.
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return false
+		}
+		// 0.0.0.0/8, "this network". Only 0.0.0.0 itself is IsUnspecified.
+		if v4[0] == 0 {
+			return false
+		}
+		return true
+	}
+	// NAT64 well-known prefixes embed an IPv4 address, so a gateway on such a
+	// network would translate these straight back to a private v4 destination.
+	if nat64WellKnown.Contains(ip) || nat64Local.Contains(ip) {
 		return false
 	}
 	return true
@@ -155,32 +190,35 @@ func isPublicIP(ip net.IP) bool {
 
 // Fetch resolves a client_id URL to the client it describes.
 func (c *cimdClient) Fetch(ctx context.Context, clientID string) (Client, error) {
-	if cached, ok := c.cached(clientID); ok {
-		return cached, nil
+	if entry, ok := c.cached(clientID); ok {
+		return entry.client, entry.err
 	}
 
 	u, err := validateCIMDURL(clientID)
 	if err != nil {
-		return Client{}, fmt.Errorf("client_id %q is not a usable metadata document URL: %w", clientID, err)
+		return c.fail(clientID, fmt.Errorf("client_id %q is not a usable metadata document URL: %w", clientID, err))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return Client{}, err
+		return c.fail(clientID, err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return Client{}, fmt.Errorf("could not fetch the metadata document: %w", err)
+		return c.fail(clientID, fmt.Errorf("could not fetch the metadata document: %w", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return Client{}, fmt.Errorf("the metadata document answered %d", resp.StatusCode)
+		return c.fail(clientID, fmt.Errorf("the metadata document answered %d", resp.StatusCode))
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(ct, "json") {
-		return Client{}, fmt.Errorf("the metadata document is %q, not JSON", ct)
+	// Required, not merely checked when present: a host that returns no content
+	// type at all should not slip through a check meant to confirm this is a
+	// metadata document rather than someone else's web page.
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
+		return c.fail(clientID, fmt.Errorf("the metadata document is %q, not JSON", ct))
 	}
 
 	// One byte over the limit is read deliberately, so a document that is exactly
@@ -188,18 +226,18 @@ func (c *cimdClient) Fetch(ctx context.Context, clientID string) (Client, error)
 	// into something that happens to parse.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, cimdMaxBody+1))
 	if err != nil {
-		return Client{}, fmt.Errorf("could not read the metadata document: %w", err)
+		return c.fail(clientID, fmt.Errorf("could not read the metadata document: %w", err))
 	}
 	if len(body) > cimdMaxBody {
-		return Client{}, fmt.Errorf("the metadata document is larger than %d bytes", cimdMaxBody)
+		return c.fail(clientID, fmt.Errorf("the metadata document is larger than %d bytes", cimdMaxBody))
 	}
 
 	client, err := parseCIMD(clientID, body)
 	if err != nil {
-		return Client{}, err
+		return c.fail(clientID, err)
 	}
 
-	c.store(clientID, client)
+	c.store(clientID, client, nil)
 	return client, nil
 }
 
@@ -259,27 +297,38 @@ func parseCIMD(clientID string, body []byte) (Client, error) {
 	return Client{ID: clientID, Name: name, RedirectURIs: doc.RedirectURIs}, nil
 }
 
-func (c *cimdClient) cached(clientID string) (Client, bool) {
+func (c *cimdClient) cached(clientID string) (cimdEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.cache[clientID]
 	if !ok || time.Now().After(e.expires) {
-		return Client{}, false
+		return cimdEntry{}, false
 	}
-	return e.client, true
+	return e, true
 }
 
 // store bounds the cache by clearing it wholesale when it grows too large. A
 // proper eviction policy would be more code than this is worth: entries are tiny
 // and expire on their own, and the cap exists only so a stream of distinct URLs
 // cannot grow it without limit.
-func (c *cimdClient) store(clientID string, client Client) {
+func (c *cimdClient) store(clientID string, client Client, err error) {
+	ttl := cimdCacheTTL
+	if err != nil {
+		ttl = cimdFailureTTL
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.cache) >= cimdCacheSize {
 		c.cache = map[string]cimdEntry{}
 	}
-	c.cache[clientID] = cimdEntry{client: client, expires: time.Now().Add(cimdCacheTTL)}
+	c.cache[clientID] = cimdEntry{client: client, err: err, expires: time.Now().Add(ttl)}
+}
+
+// fail records a failure and returns it, so every error path memoises without
+// each one having to remember to.
+func (c *cimdClient) fail(clientID string, err error) (Client, error) {
+	c.store(clientID, Client{}, err)
+	return Client{}, err
 }
 
 // resolveClient finds the client behind a client_id, from a metadata document

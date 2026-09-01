@@ -132,12 +132,24 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
+		// Targets are logged individually. A single line cannot describe several
+		// of them, and the old one printed an empty upstream and only the first
+		// target's resource, which read as a misconfiguration rather than a
+		// summary.
+		for _, t := range cfg.Targets {
+			slog.Info("serving target",
+				"target", t.Name,
+				"path", t.MCPPath(),
+				"resource", t.Resource,
+				"credential_mode", t.Mode,
+				"upstream_mcp", t.UpstreamMCP)
+		}
 		slog.Info("listening",
 			"version", version,
 			"addr", cfg.ListenAddr,
 			"public_url", cfg.PublicURL,
-			"upstream_mcp", cfg.UpstreamMCP,
-			"resource", cfg.ResourceURI())
+			"targets", len(cfg.Targets),
+			"cimd_enabled", cfg.CIMDEnabled)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -189,8 +201,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.handleToken))
 	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.handleRevoke))
 
+	// The MCP endpoints are capped too. They demand a credential, so they share
+	// the looser backstop rather than the tight per-flow cap, but an
+	// unauthenticated request still costs a database round trip and leaving the
+	// busiest route as the only uncapped one is not a decision worth making by
+	// omission.
 	for _, t := range s.cfg.Targets {
-		h := s.handleMCP(t)
+		h := limited(s.credentialLimit, s.handleMCP(t))
 		mux.HandleFunc(t.MCPPath(), h)
 		mux.HandleFunc(t.MCPPath()+"/", h)
 	}
@@ -201,6 +218,7 @@ func (s *Server) routes() http.Handler {
 	// answer "who is this browser" outside it.
 	if s.cfg.HasPerUserTargets() {
 		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.handleSettings))
+		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.handleSettingsLogout))
 		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.handleSettingsCallback))
 		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.handleSettingsSave))
 	}

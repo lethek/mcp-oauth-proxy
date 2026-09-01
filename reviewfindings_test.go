@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"net/http"
 	"strings"
 	"testing"
@@ -17,13 +16,13 @@ import (
 // decompresses transparently, which hides the bug.
 func TestRewrittenUnauthorizedIsDecodable(t *testing.T) {
 	h := newHarnessWith(t, perUserTargets)
-	h.gzipRefusal.Store(true)
+	h.encodedRefusal.Store(true)
 	h.refuseAlpha.Store(true)
 
 	const redirect = "https://client.example/callback"
 	clientID := h.register(redirect)
 	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
-	h.enrol("user-42 (alice)", "alpha", map[string]string{"Authorization": "Bearer revoked"})
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer revoked"})
 
 	req, err := http.NewRequest("POST", h.proxy.URL+"/alpha/mcp", strings.NewReader("{}"))
 	if err != nil {
@@ -44,12 +43,11 @@ func TestRewrittenUnauthorizedIsDecodable(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The replacement body is plain JSON. A surviving Content-Encoding is a
+	// header the client will act on, and it would fail to decode exactly the
+	// advice this rewrite exists to deliver.
 	if enc := resp.Header.Get("Content-Encoding"); enc != "" {
-		// The body is the rewrite's own plaintext JSON, so a surviving encoding
-		// header is a lie a conforming client will act on.
-		if _, err := gzip.NewReader(bytes.NewReader(buf.Bytes())); err != nil {
-			t.Errorf("Content-Encoding is %q but the body is not %s decodable: %v", enc, enc, err)
-		}
+		t.Errorf("Content-Encoding = %q on a body that is not encoded", enc)
 	}
 	if !strings.Contains(buf.String(), "/settings") {
 		t.Errorf("the client could not read the enrolment advice; body = %q", buf.String())
@@ -65,7 +63,7 @@ func TestEncodedDotSegmentsDoNotReachUpstream(t *testing.T) {
 	const redirect = "https://client.example/callback"
 	clientID := h.register(redirect)
 	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
-	h.enrol("user-42 (alice)", "alpha", map[string]string{"Authorization": "Bearer alices-token"})
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer alices-token"})
 
 	resp := h.mcpRequest("/alpha/mcp/%2e%2e/%2e%2e/escaped", access)
 	resp.Body.Close()

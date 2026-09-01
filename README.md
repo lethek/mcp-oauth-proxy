@@ -185,7 +185,17 @@ own sign-in against the provider, so **its redirect URI,
 `PUBLIC_URL/callback`.**
 
 Credentials are stored encrypted with `ENCRYPTION_KEY`, keyed on the provider's
-subject and the target, and never logged.
+`sub` claim and the target, and never logged. The key is the bare `sub`, never a
+username or email: those are mutable, so keying on one would orphan a stored
+credential the moment someone renamed their account. A provider that does not
+return `sub` cannot be used for `per_user` targets, and sign-in fails rather than
+storing something under a value that may be reassigned.
+
+Only an allowlist of headers reaches the MCP server. The credential injected here
+is frequently not the caller's own, so any second authentication header the
+upstream happened to honour would let a caller override or sidestep it.
+
+Users can end a settings session at `POST /settings/logout`.
 
 Someone who has not enrolled gets **403** naming the settings page, and their
 request never reaches the MCP server. It is deliberately not a 401 challenge:

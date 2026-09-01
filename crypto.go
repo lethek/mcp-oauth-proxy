@@ -48,38 +48,52 @@ func newSealer(key []byte) (*sealer, error) {
 	return &sealer{aead: aead}, nil
 }
 
+// One key protects several unrelated things. The purpose is bound in as AEAD
+// additional data so a ciphertext produced for one can never be opened as
+// another, whatever a future struct happens to look like.
+//
+// Without this, safety rests on the plaintexts failing to unmarshal into each
+// other's types, which is a property of today's structs rather than a guarantee.
+// The first sealed value to gain a field named like another's would be
+// substitutable for it.
+const (
+	purposeUpstreamToken   = "upstream-token"
+	purposeUserCredential  = "user-credential"
+	purposeSettingsSession = "settings-session"
+)
+
 // seal encrypts plaintext and prefixes the nonce, so the result is
 // self-contained and safe to store as a single opaque column.
-func (s *sealer) seal(plaintext []byte) ([]byte, error) {
+func (s *sealer) seal(purpose string, plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, s.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return s.aead.Seal(nonce, nonce, plaintext, nil), nil
+	return s.aead.Seal(nonce, nonce, plaintext, []byte(purpose)), nil
 }
 
-func (s *sealer) open(sealed []byte) ([]byte, error) {
+func (s *sealer) open(purpose string, sealed []byte) ([]byte, error) {
 	n := s.aead.NonceSize()
 	if len(sealed) < n {
 		return nil, errors.New("ciphertext shorter than nonce")
 	}
-	return s.aead.Open(nil, sealed[:n], sealed[n:], nil)
+	return s.aead.Open(nil, sealed[:n], sealed[n:], []byte(purpose))
 }
 
 // sealString and openString are the cookie-safe forms, used for the settings
 // session. Base64url so the value survives a Set-Cookie round trip unchanged.
-func (s *sealer) sealString(plaintext []byte) (string, error) {
-	sealed, err := s.seal(plaintext)
+func (s *sealer) sealString(purpose string, plaintext []byte) (string, error) {
+	sealed, err := s.seal(purpose, plaintext)
 	if err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
-func (s *sealer) openString(v string) ([]byte, error) {
+func (s *sealer) openString(purpose, v string) ([]byte, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(v)
 	if err != nil {
 		return nil, err
 	}
-	return s.open(raw)
+	return s.open(purpose, raw)
 }

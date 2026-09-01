@@ -168,7 +168,7 @@ func TestEnvPrefix(t *testing.T) {
 
 func TestParseStaticHeaders(t *testing.T) {
 	t.Run("empty yields no headers", func(t *testing.T) {
-		got, err := parseStaticHeaders("")
+		got, err := parseStaticHeaders("UPSTREAM_STATIC_HEADERS", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -178,7 +178,7 @@ func TestParseStaticHeaders(t *testing.T) {
 	})
 
 	t.Run("parses pairs and trims", func(t *testing.T) {
-		got, err := parseStaticHeaders("Authorization: Bearer abc123\n  x-workspace-slug:  acme  \n")
+		got, err := parseStaticHeaders("UPSTREAM_STATIC_HEADERS", "Authorization: Bearer abc123\n  x-workspace-slug:  acme  \n")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -194,7 +194,7 @@ func TestParseStaticHeaders(t *testing.T) {
 	})
 
 	t.Run("keeps colons in the value", func(t *testing.T) {
-		got, err := parseStaticHeaders("X-Target: https://example.com:8443/path")
+		got, err := parseStaticHeaders("UPSTREAM_STATIC_HEADERS", "X-Target: https://example.com:8443/path")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -204,7 +204,7 @@ func TestParseStaticHeaders(t *testing.T) {
 	})
 
 	t.Run("skips blank lines", func(t *testing.T) {
-		got, err := parseStaticHeaders("\n\nA: 1\n\n\nB: 2\n")
+		got, err := parseStaticHeaders("UPSTREAM_STATIC_HEADERS", "\n\nA: 1\n\n\nB: 2\n")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -220,9 +220,66 @@ func TestParseStaticHeaders(t *testing.T) {
 		"one bad line": "A: 1\nbroken\nB: 2",
 	} {
 		t.Run("rejects "+name, func(t *testing.T) {
-			if _, err := parseStaticHeaders(raw); err == nil {
+			if _, err := parseStaticHeaders("UPSTREAM_STATIC_HEADERS", raw); err == nil {
 				t.Fatalf("want an error for %q, got none", raw)
 			}
 		})
+	}
+}
+
+func TestParseUserHeaderFields(t *testing.T) {
+	t.Run("parses a valid set", func(t *testing.T) {
+		got, err := parseUserHeaderFields(`[
+			{"header":"Authorization","label":"Token","prefix":"Bearer "},
+			{"header":"x-workspace-slug","label":"Workspace"}
+		]`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 || got[0].Prefix != "Bearer " || got[1].Header != "x-workspace-slug" {
+			t.Errorf("parsed as %+v", got)
+		}
+	})
+
+	t.Run("empty yields nothing", func(t *testing.T) {
+		got, err := parseUserHeaderFields("  ")
+		if err != nil || got != nil {
+			t.Errorf("got %v, %v; want nil, nil", got, err)
+		}
+	})
+
+	// Each of these would otherwise be discovered at request time, as a 502 with
+	// nothing on screen to explain it, rather than at boot.
+	for name, raw := range map[string]string{
+		"malformed json":        `[{"header":`,
+		"not an array":          `{"header":"A","label":"B"}`,
+		"empty header name":     `[{"header":"","label":"Token"}]`,
+		"invalid header name":   `[{"header":"Bad Header","label":"Token"}]`,
+		"header with a colon":   `[{"header":"A:B","label":"Token"}]`,
+		"missing label":         `[{"header":"Authorization","label":"  "}]`,
+		"prefix with a newline": `[{"header":"Authorization","label":"Token","prefix":"Bearer \n"}]`,
+		"duplicate field":       `[{"header":"A","label":"one"},{"header":"A","label":"two"}]`,
+		// Case-insensitive, because HTTP header names are.
+		"duplicate differing only in case": `[{"header":"a","label":"one"},{"header":"A","label":"two"}]`,
+		"empty array":                      `[]`,
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			if _, err := parseUserHeaderFields(raw); err == nil {
+				t.Errorf("accepted %s", name)
+			}
+		})
+	}
+}
+
+func TestDefaultDisplayName(t *testing.T) {
+	for in, want := range map[string]string{
+		"plane":   "Plane",
+		"forgejo": "Forgejo",
+		"git-mcp": "Git-mcp",
+		"":        "",
+	} {
+		if got := defaultDisplayName(in); got != want {
+			t.Errorf("defaultDisplayName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

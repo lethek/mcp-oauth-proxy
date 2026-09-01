@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -243,30 +244,47 @@ func (u *Upstream) postToken(ctx context.Context, form url.Values) (UpstreamToke
 // to a person for auditing and revocation. Best effort by design: a provider
 // without a userinfo endpoint must not stop anyone logging in, so the caller
 // treats an empty result as "unknown" rather than as a failure.
-func (u *Upstream) Subject(ctx context.Context, accessToken string) (string, error) {
+// UserIdentity separates the stable identifier from the readable decoration, so
+// a caller cannot accidentally key storage on something that changes.
+type UserIdentity struct {
+	// Subject is the OIDC sub claim. Durable rows are keyed on this.
+	Subject string
+	// Display is preferred_username or email, for logs and the settings page.
+	Display string
+}
+
+// Label is the readable form, used only where a human reads it.
+func (u UserIdentity) Label() string {
+	if u.Display == "" {
+		return u.Subject
+	}
+	return u.Subject + " (" + u.Display + ")"
+}
+
+func (u *Upstream) Identity(ctx context.Context, accessToken string) (UserIdentity, error) {
 	m, err := u.Meta(ctx)
 	if err != nil {
-		return "", err
+		return UserIdentity{}, err
 	}
 	if m.UserinfoEndpoint == "" {
-		return "", nil
+		return UserIdentity{}, errors.New("the provider publishes no userinfo endpoint, so users cannot be identified")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.UserinfoEndpoint, nil)
 	if err != nil {
-		return "", err
+		return UserIdentity{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := u.http.Do(req)
 	if err != nil {
-		return "", err
+		return UserIdentity{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("userinfo returned %d", resp.StatusCode)
+		return UserIdentity{}, fmt.Errorf("userinfo returned %d", resp.StatusCode)
 	}
 
 	var claims struct {
@@ -275,23 +293,23 @@ func (u *Upstream) Subject(ctx context.Context, accessToken string) (string, err
 		Email             string `json:"email"`
 	}
 	if err := json.Unmarshal(body, &claims); err != nil {
-		return "", fmt.Errorf("userinfo response was not JSON: %w", err)
+		return UserIdentity{}, fmt.Errorf("userinfo response was not JSON: %w", err)
 	}
 
-	// sub is the stable identifier; the friendlier claims only decorate it so a
-	// log line is readable without a second lookup. Choosing the decoration
-	// first states the username-beats-email preference once, rather than leaving
-	// it implicit in the order of a longer switch.
+	// Only sub identifies the account. It is the one claim OIDC requires to be
+	// stable and never reassigned, and it is what durable rows are keyed on.
+	//
+	// The friendlier claims are returned separately, for logs and for the
+	// settings page. They must not be folded into the identifier: a username is
+	// mutable, so a rename would silently orphan everything stored under the old
+	// value, and where a provider omits sub entirely a reused username would
+	// inherit the previous holder's stored credentials.
 	name := claims.PreferredUsername
 	if name == "" {
 		name = claims.Email
 	}
-	switch {
-	case claims.Sub != "" && name != "":
-		return claims.Sub + " (" + name + ")", nil
-	case claims.Sub != "":
-		return claims.Sub, nil
-	default:
-		return name, nil
+	if claims.Sub == "" {
+		return UserIdentity{}, errors.New("userinfo returned no sub claim, so there is no stable identifier to key on")
 	}
+	return UserIdentity{Subject: claims.Sub, Display: name}, nil
 }

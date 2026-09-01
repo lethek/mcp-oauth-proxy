@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // The enrolment page needs its own notion of "this browser is this person",
@@ -19,82 +21,96 @@ import (
 const (
 	settingsCookie  = "mcp_settings"
 	settingsSession = 12 * time.Hour
+
+	// maxCredentialValue bounds one pasted field. Tokens are short; this only
+	// stops a row growing without limit.
+	maxCredentialValue = 4096
 )
 
 // settingsIdentity is what the cookie carries. It is sealed rather than signed,
-// using the same key as the stored credentials, so the subject is not readable
-// by the browser holding it.
+// so the subject is not readable by the browser holding it, and it is bound to
+// its own purpose so no other sealed value can be substituted for it.
 type settingsIdentity struct {
 	Subject string `json:"sub"`
+	Display string `json:"name,omitempty"`
 	Expires int64  `json:"exp"`
 }
 
 func (s *Server) settingsRedirectURI() string { return s.cfg.PublicURL + "/settings/callback" }
 
-// identityFrom returns the signed-in subject, or "" when there is no usable
-// session. Any failure to open or decode the cookie is treated as absent: a
-// tampered or stale cookie should send the user back through the provider, not
-// produce an error page.
-func (s *Server) identityFrom(r *http.Request) string {
-	c, err := r.Cookie(settingsCookie)
+// identityFrom returns the signed-in user, or a zero value when there is no
+// usable session. Any failure to open or decode the cookie is treated as absent:
+// a tampered or stale cookie should send the user back through the provider,
+// not produce an error page.
+func (s *Server) identityFrom(r *http.Request) UserIdentity {
+	c, err := r.Cookie(s.cookieName(settingsCookie))
 	if err != nil {
-		return ""
+		return UserIdentity{}
 	}
-	raw, err := s.sealer.openString(c.Value)
+	raw, err := s.sealer.openString(purposeSettingsSession, c.Value)
 	if err != nil {
-		return ""
+		return UserIdentity{}
 	}
 	var id settingsIdentity
 	if err := json.Unmarshal(raw, &id); err != nil {
-		return ""
+		return UserIdentity{}
 	}
 	if id.Subject == "" || time.Now().Unix() > id.Expires {
-		return ""
+		return UserIdentity{}
 	}
-	return id.Subject
+	return UserIdentity{Subject: id.Subject, Display: id.Display}
 }
 
-func (s *Server) setIdentity(w http.ResponseWriter, subject string) error {
+func (s *Server) setIdentity(w http.ResponseWriter, identity UserIdentity) error {
 	raw, err := json.Marshal(settingsIdentity{
-		Subject: subject,
+		Subject: identity.Subject,
+		Display: identity.Display,
 		Expires: time.Now().Add(settingsSession).Unix(),
 	})
 	if err != nil {
 		return err
 	}
-	sealed, err := s.sealer.sealString(raw)
+	sealed, err := s.sealer.sealString(purposeSettingsSession, raw)
 	if err != nil {
 		return err
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     settingsCookie,
-		Value:    sealed,
-		Path:     "/settings",
-		HttpOnly: true,
-		Secure:   s.cfg.PublicScheme == "https",
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(settingsSession.Seconds()),
-	})
+	s.setCookie(w, settingsCookie, sealed, int(settingsSession.Seconds()))
 	return nil
+}
+
+// clearIdentity ends the settings session. Without it the cookie outlives a
+// logout at the provider by up to its full lifetime, on the one page that holds
+// something worth stealing.
+func (s *Server) clearIdentity(w http.ResponseWriter) {
+	s.setCookie(w, settingsCookie, "", -1)
+}
+
+func (s *Server) handleSettingsLogout(w http.ResponseWriter, r *http.Request) {
+	if !s.sameOrigin(r) {
+		http.Error(w, "This request did not come from the settings page.", http.StatusForbidden)
+		return
+	}
+	s.clearIdentity(w)
+	http.Redirect(w, r, s.cfg.PublicURL+"/settings", http.StatusFound)
 }
 
 // handleSettings renders the catalogue, sending the user through the provider
 // first when they are not signed in.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	subject := s.identityFrom(r)
-	if subject == "" {
+	identity := s.identityFrom(r)
+	if identity.Subject == "" {
 		s.startSettingsLogin(w, r)
 		return
 	}
 
-	enrolled, err := s.store.EnrolledTargets(r.Context(), subject)
+	enrolled, err := s.store.EnrolledTargets(r.Context(), identity.Subject)
 	if err != nil {
 		slog.Error("settings: could not read enrolments", "err", err)
 		http.Error(w, "Could not read your saved credentials.", http.StatusInternalServerError)
 		return
 	}
 
-	view := settingsView{Subject: subject, Notice: r.URL.Query().Get("notice")}
+	view := settingsView{Subject: identity.Label(), Notice: r.URL.Query().Get("notice")}
 	for _, t := range s.cfg.Targets {
 		if t.Mode != CredPerUser {
 			continue
@@ -148,7 +164,7 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), readBrowserSecret(r))
+	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r))
 	if err != nil {
 		http.Error(w, "This sign-in has expired or was already used. Open the settings page again.", http.StatusBadRequest)
 		return
@@ -165,21 +181,20 @@ func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Without a subject there is nothing to key a credential on, so this cannot
-	// fall through the way the MCP login does.
-	subject, err := s.upstream.Subject(r.Context(), tok.AccessToken)
-	if err != nil || subject == "" {
+	// Without a stable subject there is nothing to key a credential on.
+	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
+	if err != nil {
 		slog.Error("settings: could not resolve the user", "err", err)
 		http.Error(w, "The identity provider would not say who you are, so credentials cannot be stored.", http.StatusBadGateway)
 		return
 	}
 
-	if err := s.setIdentity(w, subject); err != nil {
+	if err := s.setIdentity(w, identity); err != nil {
 		slog.Error("settings: could not set the session cookie", "err", err)
 		http.Error(w, "Could not start your session.", http.StatusInternalServerError)
 		return
 	}
-	slog.Info("settings: signed in", "subject", subject)
+	slog.Info("settings: signed in", "subject", identity.Label())
 	http.Redirect(w, r, s.cfg.PublicURL+"/settings", http.StatusFound)
 }
 
@@ -191,8 +206,8 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "This request did not come from the settings page.", http.StatusForbidden)
 		return
 	}
-	subject := s.identityFrom(r)
-	if subject == "" {
+	identity := s.identityFrom(r)
+	if identity.Subject == "" {
 		http.Redirect(w, r, s.cfg.PublicURL+"/settings", http.StatusFound)
 		return
 	}
@@ -216,12 +231,12 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.PostForm.Get("action") == "clear" {
-		if err := s.store.DeleteUserCredential(r.Context(), subject, target.Name); err != nil {
+		if err := s.store.DeleteUserCredential(r.Context(), identity.Subject, target.Name); err != nil {
 			slog.Error("settings: could not clear the credential", "err", err, "target", target.Name)
 			http.Error(w, "Could not clear the credential.", http.StatusInternalServerError)
 			return
 		}
-		slog.Info("settings: credential cleared", "subject", subject, "target", target.Name)
+		slog.Info("settings: credential cleared", "subject", identity.Label(), "target", target.Name)
 		http.Redirect(w, r, s.cfg.PublicURL+"/settings?notice=cleared", http.StatusFound)
 		return
 	}
@@ -233,6 +248,18 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Every field is required: "+f.Label+" was empty.", http.StatusBadRequest)
 			return
 		}
+		if len(v) > maxCredentialValue {
+			http.Error(w, f.Label+" is too long.", http.StatusBadRequest)
+			return
+		}
+		// Rejected here rather than on the way out. A control character survives
+		// TrimSpace and is refused by the transport at request time, which would
+		// give this user a 502 on every subsequent call with nothing on screen to
+		// explain it, and a stored row that can only ever fail.
+		if !httpguts.ValidHeaderFieldValue(f.Prefix + v) {
+			http.Error(w, f.Label+" contains characters that are not allowed in an HTTP header.", http.StatusBadRequest)
+			return
+		}
 		headers[f.Header] = f.Prefix + v
 	}
 
@@ -241,20 +268,20 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Could not store the credential.", http.StatusInternalServerError)
 		return
 	}
-	sealed, err := s.sealer.seal(raw)
+	sealed, err := s.sealer.seal(purposeUserCredential, raw)
 	if err != nil {
 		slog.Error("settings: could not seal the credential", "err", err)
 		http.Error(w, "Could not store the credential.", http.StatusInternalServerError)
 		return
 	}
-	if err := s.store.PutUserCredential(r.Context(), subject, target.Name, sealed); err != nil {
+	if err := s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, sealed); err != nil {
 		slog.Error("settings: could not store the credential", "err", err, "target", target.Name)
 		http.Error(w, "Could not store the credential.", http.StatusInternalServerError)
 		return
 	}
 
 	// The values themselves are never logged, only that something was stored.
-	slog.Info("settings: credential stored", "subject", subject, "target", target.Name,
+	slog.Info("settings: credential stored", "subject", identity.Label(), "target", target.Name,
 		"headers", len(headers))
 	http.Redirect(w, r, s.cfg.PublicURL+"/settings?notice=saved", http.StatusFound)
 }
@@ -265,7 +292,7 @@ func (s *Server) userHeadersFor(r *http.Request, sessionID, target string) (map[
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.sealer.open(sealed)
+	raw, err := s.sealer.open(purposeUserCredential, sealed)
 	if err != nil {
 		return nil, err
 	}
