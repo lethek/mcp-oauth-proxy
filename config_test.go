@@ -122,6 +122,39 @@ func TestParseTargetsMulti(t *testing.T) {
 	}
 }
 
+func TestDisplayName(t *testing.T) {
+	t.Run("defaults to the capitalised name", func(t *testing.T) {
+		t.Setenv("TARGETS", "plane")
+		t.Setenv("TARGET_PLANE_UPSTREAM_MCP_URL", "http://plane:8211")
+
+		got, err := parseTargets("https://proxy.example")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got[0].DisplayName != "Plane" {
+			t.Errorf("DisplayName = %q, want %q", got[0].DisplayName, "Plane")
+		}
+	})
+
+	t.Run("an explicit value wins", func(t *testing.T) {
+		t.Setenv("TARGETS", "git-mcp")
+		t.Setenv("TARGET_GIT_MCP_UPSTREAM_MCP_URL", "http://forgejo-mcp:8080")
+		t.Setenv("TARGET_GIT_MCP_DISPLAY_NAME", "Forgejo")
+
+		got, err := parseTargets("https://proxy.example")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got[0].DisplayName != "Forgejo" {
+			t.Errorf("DisplayName = %q, want %q", got[0].DisplayName, "Forgejo")
+		}
+		// The identity used in URLs and lookups must not change with it.
+		if got[0].Name != "git-mcp" {
+			t.Errorf("Name = %q, want it untouched", got[0].Name)
+		}
+	})
+}
+
 func TestEnvPrefix(t *testing.T) {
 	for name, want := range map[string]string{
 		"plane":   "TARGET_PLANE_",

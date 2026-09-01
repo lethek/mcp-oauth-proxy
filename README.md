@@ -91,11 +91,16 @@ TARGETS=forgejo,plane
 
 TARGET_FORGEJO_UPSTREAM_MCP_URL=http://forgejo-mcp:8080
 TARGET_FORGEJO_CREDENTIAL_MODE=provider_token
+TARGET_FORGEJO_DISPLAY_NAME=Forgejo
 
 TARGET_PLANE_UPSTREAM_MCP_URL=http://plane-mcp-api:8211/http/api-key
 TARGET_PLANE_CREDENTIAL_MODE=static
 TARGET_PLANE_STATIC_HEADERS=Authorization: Bearer plane_api_xxx
 ```
+
+Target names must be lowercase letters, digits and hyphens, because they appear
+in URLs and in variable names. `..._DISPLAY_NAME` is what the enrolment page
+shows instead, defaulting to the name with its first letter capitalised.
 
 `CREDENTIAL_MODE` is one of:
 

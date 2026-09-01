@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Config is assembled entirely from the environment. Every field is required
@@ -97,6 +98,11 @@ type Target struct {
 	// Name is empty for a single-target deployment configured the original way,
 	// which keeps serving /mcp. Named targets are served at /<name>/mcp.
 	Name string
+
+	// DisplayName is what a person sees on the enrolment page. Names are
+	// constrained to lowercase because they appear in URLs, which reads badly in
+	// a heading, so this carries the presentable form.
+	DisplayName string
 
 	UpstreamMCP   string
 	Mode          CredentialMode
@@ -289,9 +295,13 @@ func parseTargets(publicURL string) ([]Target, error) {
 		p := envPrefix(name)
 		t := Target{
 			Name:        name,
+			DisplayName: strings.TrimSpace(os.Getenv(p + "DISPLAY_NAME")),
 			UpstreamMCP: strings.TrimRight(os.Getenv(p+"UPSTREAM_MCP_URL"), "/"),
 			Mode:        CredentialMode(os.Getenv(p + "CREDENTIAL_MODE")),
 			Resource:    publicURL + "/" + name + "/mcp",
+		}
+		if t.DisplayName == "" {
+			t.DisplayName = defaultDisplayName(name)
 		}
 		if t.UpstreamMCP == "" {
 			return nil, fmt.Errorf("missing required environment: %sUPSTREAM_MCP_URL", p)
@@ -339,6 +349,17 @@ func parseTargets(publicURL string) ([]Target, error) {
 		return nil, fmt.Errorf("TARGETS is set but names no targets")
 	}
 	return targets, nil
+}
+
+// defaultDisplayName capitalises the first letter, which is right for the
+// ordinary single-word name. Anything else should set DISPLAY_NAME rather than
+// have this guess at hyphens and acronyms.
+func defaultDisplayName(name string) string {
+	r := []rune(name)
+	if len(r) == 0 {
+		return name
+	}
+	return string(unicode.ToUpper(r[0])) + string(r[1:])
 }
 
 // parseUserHeaderFields reads the per-user field definitions. JSON rather than a

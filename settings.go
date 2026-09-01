@@ -99,14 +99,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if t.Mode != CredPerUser {
 			continue
 		}
-		row := targetRow{Name: t.Name, Fields: t.UserFields}
+		row := targetRow{Name: t.Name, Display: t.DisplayName, Fields: t.UserFields}
 		if at, ok := enrolled[t.Name]; ok {
 			row.Enrolled = true
 			row.UpdatedAt = at.UTC().Format("2006-01-02 15:04 MST")
 		}
 		view.Targets = append(view.Targets, row)
 	}
-	sort.Slice(view.Targets, func(i, j int) bool { return view.Targets[i].Name < view.Targets[j].Name })
+	sort.Slice(view.Targets, func(i, j int) bool { return view.Targets[i].Display < view.Targets[j].Display })
 
 	renderSettings(w, view)
 }
@@ -282,7 +282,10 @@ func (s *Server) userHeadersFor(r *http.Request, sessionID, target string) (map[
 // ---------- rendering ----------
 
 type targetRow struct {
+	// Name is the identifier posted back and matched against configuration.
+	// Display is only ever shown.
 	Name      string
+	Display   string
 	Fields    []UserHeaderField
 	Enrolled  bool
 	UpdatedAt string
@@ -315,7 +318,7 @@ var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype h
 {{if not .Targets}}<p>No target on this proxy asks for a credential of your own.</p>{{end}}
 {{range .Targets}}
 <div class="card">
-  <h2>{{.Name}}</h2>
+  <h2>{{.Display}}</h2>
   {{if .Enrolled}}<p class="state">Configured, last updated {{.UpdatedAt}}.</p>
   {{else}}<p class="state">Not configured. This target will refuse your requests until you set one.</p>{{end}}
   <form method="post" action="/settings">

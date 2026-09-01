@@ -114,7 +114,7 @@ func replaceWithEnrolAdvice(resp *http.Response, enrolURL string) error {
 // the problem rather than merely reporting that something is wrong.
 func (s *Server) notEnrolled(w http.ResponseWriter, t Target) {
 	oauthError(w, http.StatusForbidden, "access_denied",
-		"no credential is stored for you for "+t.Name+"; set one at "+s.cfg.PublicURL+"/settings")
+		"no credential is stored for you for "+t.DisplayName+"; set one at "+s.cfg.PublicURL+"/settings")
 }
 
 // stripTargetPrefix removes the "/<target>" segment before the request is

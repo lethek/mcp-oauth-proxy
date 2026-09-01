@@ -15,6 +15,7 @@ func perUserTargets(cfg *Config, upstreamURL string) []Target {
 	return []Target{
 		{
 			Name:        "alpha",
+			DisplayName: "Alpha Service",
 			UpstreamMCP: upstreamURL + "/alpha-upstream",
 			Mode:        CredPerUser,
 			UserFields: []UserHeaderField{
@@ -231,8 +232,8 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "alpha") {
-		t.Error("the catalogue does not list alpha")
+	if !strings.Contains(string(body), "Alpha Service") {
+		t.Error("the catalogue does not show the display name")
 	}
 	if strings.Contains(string(body), ">beta<") {
 		t.Error("the catalogue lists beta, which is not a per_user target")
