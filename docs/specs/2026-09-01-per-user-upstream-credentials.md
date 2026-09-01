@@ -1,7 +1,13 @@
 # Per-user upstream credentials
 
-Status: draft, for review
+Status: draft, for review. Superseded in part by the multiple-targets spec.
 Date: 2026-09-01
+
+> **Ordering note.** This is now scheduled after multiple-targets. That changes
+> two things here: `user_credentials` is keyed on `(subject, target)` rather than
+> `subject` alone, and `/settings` lists every target in per-user mode rather
+> than a single set of fields. The rest of this document stands. See
+> `2026-09-01-multiple-targets.md`.
 
 ## Problem
 
