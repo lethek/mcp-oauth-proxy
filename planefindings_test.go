@@ -76,6 +76,48 @@ func injectTransientFailure(t *testing.T, s *Store, event, table string, n int) 
 	})
 }
 
+// MOP-14: whether a session needs a subject is a property of the target it was
+// started for, not of the deployment. Asking whether any target anywhere is
+// per_user refused logins for the static and provider_token targets beside it,
+// which never look a subject up at all.
+func TestIdentityFailureOnlyBlocksAPerUserTarget(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.refuseUserinfo.Store(true)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+
+	// Walked by hand rather than through authorizeThroughConsentFor, because the
+	// point of half of it is the redirect that carries an error instead of a code.
+	backFrom := func(resource string) url.Values {
+		t.Helper()
+		flowID := h.consentFlowID(h.get(h.authorizeURLFor(clientID, redirect, s256(newSecret()), resource)))
+		consent := h.postForm("/consent", url.Values{"flow_id": {flowID}, "decision": {"approve"}})
+		consent.Body.Close()
+		toProvider := h.get(consent.Header.Get("Location"))
+		toProvider.Body.Close()
+		callback := h.get(toProvider.Header.Get("Location"))
+		callback.Body.Close()
+		u, err := url.Parse(callback.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.Query()
+	}
+
+	// beta forwards the provider's own token and never looks a subject up, so a
+	// provider that will not supply one must not block the login.
+	if q := backFrom(h.srv.cfg.Targets[1].Resource); q.Get("code") == "" {
+		t.Errorf("the provider_token target refused the login: %s", q.Get("error_description"))
+	}
+
+	// alpha finds the caller's stored credential by subject, so a session
+	// without one can do nothing and the failure belongs here.
+	if q := backFrom(h.srv.cfg.Targets[0].Resource); q.Get("error") != "server_error" {
+		t.Errorf("the per_user target issued a code with no subject; error = %q", q.Get("error"))
+	}
+}
+
 // proxyConfig is a config with the given number of hops in front, reached
 // through a proxy on 10.0.0.0/8, which is where the clientKey tests put theirs.
 func proxyConfig(t *testing.T, hops int) *Config {

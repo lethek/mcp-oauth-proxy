@@ -52,6 +52,10 @@ type harness struct {
 	// challenge header.
 	refuseAlpha atomic.Bool
 
+	// refuseUserinfo makes the provider decline to say who the user is, which is
+	// what a scope the deployment was not granted looks like.
+	refuseUserinfo atomic.Bool
+
 	// encodedRefusal makes that 401 carry a Content-Encoding, as a server behind
 	// a compressing layer would. Brotli rather than gzip on purpose: Go's
 	// transport negotiates and unwraps gzip by itself, so a gzip response never
@@ -145,6 +149,10 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	})
 
 	providerMux.HandleFunc("GET /login/oauth/userinfo", func(w http.ResponseWriter, r *http.Request) {
+		if h.refuseUserinfo.Load() {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "insufficient_scope"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"sub": "user-42", "preferred_username": "alice"})
 	})
 

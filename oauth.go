@@ -476,12 +476,16 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// refused later for a reason nobody can act on.
 	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
-		// Fatal only where the subject is load-bearing. With a per_user target
-		// it is the key the caller's stored credential is found by, so a session
-		// without one can do nothing and failing here is clearer than a 403
-		// later. Everywhere else the subject is audit metadata, and a provider
-		// that will not supply it must not block the login.
-		if s.cfg.HasPerUserTargets() {
+		// Fatal only for the target this session is actually for. With a per_user
+		// target the subject is the key the caller's stored credential is found
+		// by, so a session without one can do nothing and failing here is clearer
+		// than a 403 later. Everywhere else the subject is audit metadata, and a
+		// provider that will not supply it must not block the login.
+		//
+		// Asking whether the deployment has any per_user target anywhere refused
+		// logins for the static and provider_token targets beside it, which do
+		// not need a subject at all.
+		if s.targetForFlow(flow).Mode == CredPerUser {
 			slog.Error("callback: could not resolve the user", "err", err)
 			s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error",
 				"the identity provider would not say who you are")
@@ -526,6 +530,20 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("authorized a client", "client_id", flow.ClientID, "subject", identity.Label())
 	http.Redirect(w, r, dest.String(), http.StatusFound)
+}
+
+// targetForFlow returns the target a flow was started for, resolved the same way
+// /authorize resolved it: an empty resource means the single unnamed target,
+// which is the only case where the parameter is optional. A resource that no
+// longer matches a target cannot arise from a flow /authorize accepted, so the
+// first target stands as the fallback there too.
+func (s *Server) targetForFlow(flow Flow) Target {
+	if flow.Resource != "" {
+		if t, ok := s.cfg.TargetByResource(flow.Resource); ok {
+			return t
+		}
+	}
+	return s.cfg.Targets[0]
 }
 
 func (s *Server) redirectErr(w http.ResponseWriter, r *http.Request, redirectURI, state, code, desc string) {
