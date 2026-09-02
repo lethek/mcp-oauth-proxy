@@ -68,6 +68,28 @@ func TestTrustedProxyHopsRequireTrustedProxyCIDRs(t *testing.T) {
 	})
 }
 
+// MOP-16: PUBLIC_URL is concatenated with a suffix to build every advertised
+// URL, so only the path component was refused and a query or fragment swallowed
+// the suffix instead: "https://proxy.example?x=1" + "/callback" points at the
+// root with a nonsense parameter.
+func TestPublicURLMustBeABareOrigin(t *testing.T) {
+	for _, raw := range []string{
+		"https://proxy.example/prefix",
+		"https://proxy.example?x=1",
+		"https://proxy.example/?x=1",
+		"https://proxy.example#frag",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			minimalEnv(t)
+			t.Setenv("PUBLIC_URL", raw)
+
+			if _, err := LoadConfig(); err == nil {
+				t.Errorf("%q was accepted, but every advertised URL built from it is wrong", raw)
+			}
+		})
+	}
+}
+
 func TestParseTargetsLegacy(t *testing.T) {
 	t.Run("bare upstream is one unnamed target forwarding the provider token", func(t *testing.T) {
 		t.Setenv("UPSTREAM_MCP_URL", "http://mcp.internal:8080")

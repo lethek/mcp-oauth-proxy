@@ -272,10 +272,20 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// Every route is registered at the root and every advertised URL is built by
-	// appending to this, so a path component would produce metadata and redirect
-	// URIs that match nothing this process actually serves.
-	if u, err := url.Parse(c.PublicURL); err == nil && u.Path != "" {
-		return nil, fmt.Errorf("PUBLIC_URL must not have a path component, got %q", u.Path)
+	// appending to this, so anything after the origin lands in the middle of what
+	// this process publishes. A path produces metadata and redirect URIs matching
+	// nothing it serves; a query or fragment is worse, because the suffix is
+	// swallowed by it and "https://proxy.example?x=1" + "/callback" is a redirect
+	// URI pointing at the root with a nonsense parameter.
+	if u, err := url.Parse(c.PublicURL); err == nil {
+		switch {
+		case u.Path != "":
+			return nil, fmt.Errorf("PUBLIC_URL must not have a path component, got %q", u.Path)
+		case u.RawQuery != "" || u.ForceQuery:
+			return nil, fmt.Errorf("PUBLIC_URL must not have a query string, got %q", u.RawQuery)
+		case u.Fragment != "":
+			return nil, fmt.Errorf("PUBLIC_URL must not have a fragment, got %q", u.Fragment)
+		}
 	}
 
 	targets, err := parseTargets(c.PublicURL)
