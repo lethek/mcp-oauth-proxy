@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // twoTargets is the layout every test in this file uses: alpha and beta, each
@@ -85,6 +86,52 @@ func TestTokenIsBoundToItsTarget(t *testing.T) {
 	auth := resp.Header.Get("WWW-Authenticate")
 	if !strings.Contains(auth, "/.well-known/oauth-protected-resource/beta/mcp") {
 		t.Errorf("WWW-Authenticate = %q, want beta's resource metadata", auth)
+	}
+}
+
+// TestResourcelessTokenIsRefusedWithSeveralTargets covers the move from one
+// target to several. A session written while the deployment had a single
+// unnamed target carries an empty resource, and the audience check lets it through
+// only while there is exactly one target to mean. Once there are several, such
+// a token must fail at every named target, or a token minted for one of them
+// would be honoured at all the others.
+func TestResourcelessTokenIsRefusedWithSeveralTargets(t *testing.T) {
+	h := newHarnessWith(t, twoTargets)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+
+	// Written directly, as the single-target proxy would have: a valid sealed
+	// upstream token and no resource. The multi-target flow cannot produce one.
+	raw, err := json.Marshal(UpstreamToken{AccessToken: "upstream-access", TokenType: "Bearer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := h.srv.sealer.seal(purposeUpstreamToken, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := newSecret()
+	if err := h.srv.store.CreateSession(t.Context(), sessionID, "user-42", "", sealed); err != nil {
+		t.Fatal(err)
+	}
+	access := newSecret()
+	if err := h.srv.store.CreateAccessToken(t.Context(), access, sessionID, clientID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/alpha/mcp", "/beta/mcp"} {
+		resp := h.mcpRequest(path, access)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s with a resource-less token: status %d, want 401", path, resp.StatusCode)
+		}
+	}
+	if got := h.alphaHits.Load(); got != 0 {
+		t.Errorf("alpha upstream was reached %d times with a resource-less token", got)
+	}
+	if got := h.betaHits.Load(); got != 0 {
+		t.Errorf("beta upstream was reached %d times with a resource-less token", got)
 	}
 }
 

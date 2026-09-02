@@ -299,17 +299,10 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri was not registered by this client")
 		return
 	}
-	if q.Get("response_type") != "code" {
-		s.redirectErr(w, r, redirectURI, q.Get("state"), "unsupported_response_type", "only the code flow is supported")
-		return
-	}
-	if challenge == "" || q.Get("code_challenge_method") != "S256" {
-		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_request", "PKCE with S256 is required")
-		return
-	}
 	// Both are stored verbatim on the flow, and a request line may carry a
 	// megabyte of either. An S256 challenge is 43 characters and no sane client
-	// needs a long state.
+	// needs a long state. This sits first among the redirecting checks because
+	// every one of them echoes the state.
 	if len(challenge) > maxFlowParam || len(q.Get("state")) > maxFlowParam {
 		// The state is deliberately not echoed. Putting a 60 KB value the check
 		// just refused into the Location header produces the very thing the
@@ -317,6 +310,14 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		// size, so the client would see a transport failure instead of the error.
 		s.redirectErr(w, r, redirectURI, "", "invalid_request",
 			"state and code_challenge must each be shorter than "+strconv.Itoa(maxFlowParam)+" bytes")
+		return
+	}
+	if q.Get("response_type") != "code" {
+		s.redirectErr(w, r, redirectURI, q.Get("state"), "unsupported_response_type", "only the code flow is supported")
+		return
+	}
+	if challenge == "" || q.Get("code_challenge_method") != "S256" {
+		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_request", "PKCE with S256 is required")
 		return
 	}
 	// RFC 8707. The resource decides which upstream the resulting token may be

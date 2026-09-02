@@ -56,6 +56,9 @@ var (
 	// IPv4-compatible addresses, ::a.b.c.d. Deprecated but still routed by some
 	// stacks, and net.IP.To4 does not report them.
 	_, ipv4Compatible, _ = net.ParseCIDR("::/96")
+	// Teredo, RFC 4380. The last four octets are the client's v4 address with
+	// every bit flipped, so a Teredo host tunnels traffic to that address.
+	_, teredo, _ = net.ParseCIDR("2001::/32")
 )
 
 // embeddedIPv4 extracts the IPv4 destination an IPv6 address stands for, or nil
@@ -75,6 +78,8 @@ func embeddedIPv4(ip net.IP) net.IP {
 			return nil
 		}
 		return v4
+	case teredo.Contains(ip):
+		return net.IPv4(^v6[12], ^v6[13], ^v6[14], ^v6[15])
 	}
 	return nil
 }

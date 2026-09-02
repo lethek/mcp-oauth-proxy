@@ -32,7 +32,17 @@ const (
 
 	// unusedClientTTL bounds how long an anonymous registration survives without
 	// ever being used, so the clients table cannot grow without limit.
-	unusedClientTTL = 30 * 24 * time.Hour
+	//
+	// A day, not longer: /register admits 20 registrations a minute per address,
+	// each up to maxRedirectURIs * maxRedirectURILen, and the sweep is the only
+	// thing that reclaims them. At 30 days that product was 27 GB per address
+	// before anything was freed; at a day it is under 1 GB, and only while the
+	// sender keeps it up. A client that got as far as a token is not "unused":
+	// its refresh token row, rotated or not, refers to it for the refresh
+	// lifetime plus a day, so this only shortens the life of a registration
+	// that never finished. A day is enough for a registration whose browser
+	// step is left until tomorrow; one left longer has to register again.
+	unusedClientTTL = 24 * time.Hour
 )
 
 type Store struct {
@@ -517,6 +527,16 @@ func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID
 	// The token did not qualify. Only a token already marked used is a replay;
 	// a client-id mismatch on an unused token is not, and must not be reported
 	// as one or the caller below would tear the session down.
+	//
+	// This probe deliberately does not check client_id, unlike the UPDATE
+	// above. A spent token is dead whoever presents it, so nothing is gained by
+	// matching the client, and the client id is public: whoever stole the token
+	// took it from storage where the id sits beside it. Scoping the probe would
+	// only let a thief who presents (or registers) a different client id replay
+	// the token without tripping the theft signal, at no cost to anyone who
+	// knows the real id. The asymmetry is the point: the client binding above
+	// stops a wrong id from burning an unused token, while a used token is a
+	// replay regardless of who claims it.
 	var reusedSession string
 	if e := q.QueryRow(ctx,
 		`SELECT session_id FROM refresh_tokens WHERE token_hash=$1 AND used`, hash).

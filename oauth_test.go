@@ -659,6 +659,56 @@ func TestRefreshReuseRevokesTheSession(t *testing.T) {
 	}
 }
 
+// A spent token replayed under a different client id is still a replay. The
+// reuse probe is deliberately not scoped to the client (see takeRefreshToken),
+// so the session goes even when the presenter is another registered client.
+func TestRefreshReuseUnderAnotherClientStillRevokesTheSession(t *testing.T) {
+	h := newHarness(t)
+
+	redirect := "http://127.0.0.1:9999/cb"
+	clientID := h.register(redirect)
+	otherClient := h.register(redirect)
+	_, refreshToken := h.tokens(clientID, redirect)
+
+	rotated := h.postForm("/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {clientID},
+	})
+	if rotated.StatusCode != http.StatusOK {
+		t.Fatalf("legitimate refresh: status %d", rotated.StatusCode)
+	}
+	var rotatedTok struct {
+		AccessToken string `json:"access_token"`
+	}
+	_ = json.NewDecoder(rotated.Body).Decode(&rotatedTok)
+	rotated.Body.Close()
+
+	replay := h.postForm("/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {otherClient},
+	})
+	replay.Body.Close()
+	if replay.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-client replay: status %d, want 400", replay.StatusCode)
+	}
+
+	mcp, err := http.NewRequest(http.MethodPost, h.proxy.URL+"/mcp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcp.Header.Set("Authorization", "Bearer "+rotatedTok.AccessToken)
+	resp, err := h.client.Do(mcp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("cross-client replay left the session alive: status %d, want 401", resp.StatusCode)
+	}
+}
+
 func TestRevokeEndsTheSession(t *testing.T) {
 	h := newHarness(t)
 
@@ -718,6 +768,49 @@ func TestAuthorizeRejectsUnregisteredRedirectAndMissingPKCE(t *testing.T) {
 	loc, _ := url.Parse(resp.Header.Get("Location"))
 	if loc.Query().Get("error") != "invalid_request" {
 		t.Errorf("missing PKCE: error = %q", loc.Query().Get("error"))
+	}
+}
+
+// TestAuthorizeRefusesOversizedStateBeforeEchoingIt covers the error paths that
+// echo state into the redirect. Each of them must be reached only after the
+// length guard has run, or a 60 KB state comes straight back in the Location
+// header, which is what the guard exists to prevent.
+func TestAuthorizeRefusesOversizedStateBeforeEchoingIt(t *testing.T) {
+	h := newHarness(t)
+
+	redirect := "http://127.0.0.1:9999/cb"
+	clientID := h.register(redirect)
+	huge := strings.Repeat("s", 60*1024)
+
+	cases := map[string]url.Values{
+		"unsupported response_type": {
+			"client_id":             {clientID},
+			"redirect_uri":          {redirect},
+			"response_type":         {"token"},
+			"code_challenge":        {s256("v")},
+			"code_challenge_method": {"S256"},
+			"state":                 {huge},
+		},
+		"missing PKCE": {
+			"client_id":     {clientID},
+			"redirect_uri":  {redirect},
+			"response_type": {"code"},
+			"state":         {huge},
+		},
+	}
+	for name, q := range cases {
+		resp := h.get(h.proxy.URL + "/authorize?" + q.Encode())
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("%s: status %d, want a redirect carrying the error", name, resp.StatusCode)
+		}
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		if got := loc.Query().Get("error_description"); !strings.Contains(got, "must each be shorter than") {
+			t.Errorf("%s: error_description = %q, want the length guard", name, got)
+		}
+		if loc.Query().Has("state") {
+			t.Errorf("%s: the oversized state was echoed into the redirect (%d bytes)", name, len(resp.Header.Get("Location")))
+		}
 	}
 }
 

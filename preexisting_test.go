@@ -247,6 +247,14 @@ func TestIsPublicIPRejectsEmbeddedIPv4(t *testing.T) {
 		"64:ff9b::10.0.0.99":        false,
 		"64:ff9b::93.184.216.34":    false,
 		"64:ff9b:1:a00:0:1:808:808": false,
+		// Teredo, 2001:0:<server>:<flags>:<~port>:<~client v4>. The client
+		// address is stored with every bit flipped, so reading it raw would
+		// judge the wrong address: the first one here reads as 245.255.255.156
+		// undecoded, which is public.
+		"2001:0:4136:e378:8000:63bf:f5ff:ff9c": false, // 10.0.0.99
+		"2001:0:4136:e378:8000:63bf:80ff:fffe": false, // 127.0.0.1
+		"2001:0:4136:e378:8000:63bf:5601:fefe": false, // 169.254.1.1
+		"2001:0:4136:e378:8000:63bf:a247:27dd": true,  // 93.184.216.34
 		// An ordinary v6 address is unaffected.
 		"2606:2800:220::": true,
 		"fd00::1":         false,

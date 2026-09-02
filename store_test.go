@@ -495,6 +495,49 @@ func TestSweepKeepsClientsWithAnOutstandingCode(t *testing.T) {
 	}
 }
 
+// TestSweepBoundsRegistrationsThatNeverFinished pins unusedClientTTL to a day.
+// /register admits 20 registrations a minute per address and each may carry
+// 32 KB of redirect URIs; at the old 30-day TTL that grew by 27 GB per address
+// before the sweep freed anything. A registration that got as far as a token
+// is held by its refresh token row and is unaffected.
+func TestSweepBoundsRegistrationsThatNeverFinished(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	mkClient := func(name string) Client {
+		c := Client{ID: newSecret(), Name: name, RedirectURIs: []string{"https://a/cb"}}
+		if err := s.CreateClient(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	stale := mkClient("never finished, a day ago")
+	fresh := mkClient("never finished, this hour")
+	authorized := mkClient("finished, a day ago")
+	if err := s.CreateRefreshToken(ctx, newSecret(), mustSession(t, s), authorized.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Past the TTL, though not by the 30 days the sweep used to wait.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE clients SET created_at = now() - INTERVAL '25 hours' WHERE client_id <> $1`, fresh.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if _, err := s.GetClient(ctx, stale.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a registration that never finished survived a day: err = %v", err)
+	}
+	if _, err := s.GetClient(ctx, fresh.ID); err != nil {
+		t.Errorf("a registration made this hour was swept: %v", err)
+	}
+	if _, err := s.GetClient(ctx, authorized.ID); err != nil {
+		t.Errorf("a client holding a refresh token was swept: %v", err)
+	}
+}
+
 // TestSweepRunsAtStartup pins the first pass to process start. The loop used to
 // wait a full interval before its first sweep, so a deployment that rolls or
 // crash-loops more often than that never swept at all, and expired sessions
