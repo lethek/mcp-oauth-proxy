@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -73,6 +74,47 @@ func injectTransientFailure(t *testing.T, s *Store, event, table string, n int) 
 		_, _ = s.pool.Exec(ctx, `DROP FUNCTION IF EXISTS `+name)
 		_, _ = s.pool.Exec(ctx, `DROP SEQUENCE IF EXISTS `+name+`_seq`)
 	})
+}
+
+// proxyConfig is a config with the given number of hops in front, reached
+// through a proxy on 10.0.0.0/8, which is where the clientKey tests put theirs.
+func proxyConfig(t *testing.T, hops int) *Config {
+	t.Helper()
+	_, n, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Config{TrustedProxyHops: hops, TrustedProxyCIDRs: []*net.IPNet{n}}
+}
+
+// MOP-13: the hop count says how far into X-Forwarded-For to read, not who
+// wrote it. A caller reaching this process directly, past the ingress, used to
+// have its own header believed and could pick whichever bucket it liked.
+func TestClientKeyIgnoresForwardedForFromAnUntrustedPeer(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/authorize", nil)
+	r.RemoteAddr = "203.0.113.9:1234"
+	r.Header.Set("X-Forwarded-For", "198.51.100.7")
+
+	if got := clientKey(r, proxyConfig(t, 1)); got != "203.0.113.9" {
+		t.Errorf("key = %q, want the peer address: the header did not come from a declared proxy", got)
+	}
+}
+
+// MOP-13: and a caller cannot mint a fresh bucket per request that way either,
+// which is what makes the limit evadable rather than merely misattributed.
+func TestUntrustedPeerCannotRotateItsRateLimitBucket(t *testing.T) {
+	cfg := proxyConfig(t, 1)
+	l := newLimiter(2, time.Minute)
+
+	for i := range 5 {
+		r := httptest.NewRequest(http.MethodGet, "/authorize", nil)
+		r.RemoteAddr = "203.0.113.9:1234"
+		r.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(i))
+		allowed := l.allow(clientKey(r, cfg))
+		if want := i < 2; allowed != want {
+			t.Errorf("request %d: allowed = %v, want %v", i, allowed, want)
+		}
+	}
 }
 
 // MOP-6: a client_name cut on a byte boundary inside a multi-byte rune is not

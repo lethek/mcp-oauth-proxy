@@ -83,27 +83,27 @@ func TestClientKeyTrustsOnlyDeclaredHops(t *testing.T) {
 	}
 
 	// No declared hops: the header is entirely caller-supplied and is ignored.
-	if got := clientKey(req("1.2.3.4"), 0); got != "10.0.0.1" {
+	if got := clientKey(req("1.2.3.4"), proxyConfig(t, 0)); got != "10.0.0.1" {
 		t.Errorf("with no trusted hops, key = %q, want the peer address", got)
 	}
 
 	// One proxy: it appended the client and connected to us, so the client is
 	// the only entry and the peer is the proxy.
-	if got := clientKey(req("198.51.100.7"), 1); got != "198.51.100.7" {
+	if got := clientKey(req("198.51.100.7"), proxyConfig(t, 1)); got != "198.51.100.7" {
 		t.Errorf("with one trusted hop, key = %q, want the client from the header", got)
 	}
 
 	// Two proxies: the header is "client, proxy1" and the peer is proxy2.
-	if got := clientKey(req("198.51.100.7, 10.0.0.2"), 2); got != "198.51.100.7" {
+	if got := clientKey(req("198.51.100.7, 10.0.0.2"), proxyConfig(t, 2)); got != "198.51.100.7" {
 		t.Errorf("with two trusted hops, key = %q, want the client", got)
 	}
 
 	// A caller prepending entries cannot displace the one its proxy wrote,
 	// because a spoofed value lands to the LEFT of it.
-	if got := clientKey(req("spoofed, 198.51.100.7"), 1); got != "198.51.100.7" {
+	if got := clientKey(req("spoofed, 198.51.100.7"), proxyConfig(t, 1)); got != "198.51.100.7" {
 		t.Errorf("a spoofed prefix changed the key to %q", got)
 	}
-	if got := clientKey(req("spoofed, 198.51.100.7, 10.0.0.2"), 2); got != "198.51.100.7" {
+	if got := clientKey(req("spoofed, 198.51.100.7, 10.0.0.2"), proxyConfig(t, 2)); got != "198.51.100.7" {
 		t.Errorf("a spoofed prefix changed the key to %q", got)
 	}
 
@@ -112,17 +112,17 @@ func TestClientKeyTrustsOnlyDeclaredHops(t *testing.T) {
 	multi := req("")
 	multi.Header.Add("X-Forwarded-For", "spoofed")
 	multi.Header.Add("X-Forwarded-For", "198.51.100.7")
-	if got := clientKey(multi, 1); got != "198.51.100.7" {
+	if got := clientKey(multi, proxyConfig(t, 1)); got != "198.51.100.7" {
 		t.Errorf("a spoof split across header lines changed the key to %q", got)
 	}
 
 	// Fewer entries than declared hops means the header was stripped or the
 	// configuration is wrong. Reading further left would trust a caller-supplied
 	// value, so the peer is used instead.
-	if got := clientKey(req("1.2.3.4"), 9); got != "10.0.0.1" {
+	if got := clientKey(req("1.2.3.4"), proxyConfig(t, 9)); got != "10.0.0.1" {
 		t.Errorf("with more hops than entries, key = %q, want the peer address", got)
 	}
-	if got := clientKey(req(""), 1); got != "10.0.0.1" {
+	if got := clientKey(req(""), proxyConfig(t, 1)); got != "10.0.0.1" {
 		t.Errorf("with no header at all, key = %q, want the peer address", got)
 	}
 }
@@ -134,7 +134,7 @@ func TestClientKeyAggregatesIPv6(t *testing.T) {
 	key := func(addr string) string {
 		r := httptest.NewRequest(http.MethodGet, "/authorize", nil)
 		r.RemoteAddr = addr
-		return clientKey(r, 0)
+		return clientKey(r, proxyConfig(t, 0))
 	}
 
 	a := key("[2001:db8:1:2::1]:443")

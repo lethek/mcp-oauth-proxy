@@ -71,6 +71,7 @@ where a default is shown.
 | `SESSION_TTL` | Absolute cap on one authorization, however actively it is refreshed. Reaching it sends the user back through the provider. Go duration, default `2160h` (90 days). Must not be shorter than `REFRESH_TOKEN_TTL`. |
 | `CIMD_ENABLED` | Accept an https `client_id` as a Client ID Metadata Document. Default `false`. See below. |
 | `TRUSTED_PROXY_HOPS` | How many reverse proxies sit in front. Default `0`, meaning `X-Forwarded-For` is ignored. See below. |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated networks in CIDR notation that those proxies connect from, such as `10.0.0.0/8`. Required whenever `TRUSTED_PROXY_HOPS` is set. |
 | `LISTEN_ADDR` | Default `:8080`. |
 
 Generate a key with:
@@ -256,6 +257,13 @@ holds the client and the peer is the proxy: the caller is the rightmost entry.
 With two, it is the entry before that. Only `len(chain) - hops` is read, so
 anything a caller prepends lands to the left of what your own proxy wrote and can
 never displace it.
+
+**Also set `TRUSTED_PROXY_CIDRS` to the networks those proxies connect from.**
+The hop count says how far into the header to read; it says nothing about who
+wrote it. Anything able to reach this process directly, past the ingress, would
+otherwise present its own `X-Forwarded-For` and pick a fresh bucket per request.
+The header is read only when the peer is inside one of these networks, and the
+process refuses to start with a hop count and no networks.
 
 IPv6 callers are keyed on their /64, since a single host is routinely allocated
 one and keying on the full address would hand out unlimited fresh buckets.

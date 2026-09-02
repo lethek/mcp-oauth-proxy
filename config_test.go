@@ -1,6 +1,72 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// minimalEnv sets everything LoadConfig demands, so a test can vary the one
+// setting it is about.
+func minimalEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("PUBLIC_URL", "https://proxy.example")
+	t.Setenv("UPSTREAM_MCP_URL", "http://mcp.internal:8080")
+	t.Setenv("UPSTREAM_ISSUER", "https://idp.example")
+	t.Setenv("UPSTREAM_CLIENT_ID", "proxy")
+	t.Setenv("UPSTREAM_CLIENT_SECRET", "secret")
+	t.Setenv("DATABASE_URL", "postgres://localhost/proxy")
+	t.Setenv("ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+}
+
+// MOP-13: a hop count alone lets anything that can reach this process directly
+// present its own X-Forwarded-For, so the networks the proxies connect from have
+// to be stated too. Refusing at boot is the only place that can be said clearly.
+func TestTrustedProxyHopsRequireTrustedProxyCIDRs(t *testing.T) {
+	t.Run("hops without networks is refused", func(t *testing.T) {
+		minimalEnv(t)
+		t.Setenv("TRUSTED_PROXY_HOPS", "1")
+
+		_, err := LoadConfig()
+		if err == nil {
+			t.Fatal("a hop count with no trusted networks was accepted")
+		}
+		if !strings.Contains(err.Error(), "TRUSTED_PROXY_CIDRS") {
+			t.Errorf("error = %q, want it to name the setting that is missing", err)
+		}
+	})
+
+	t.Run("hops with networks is accepted", func(t *testing.T) {
+		minimalEnv(t)
+		t.Setenv("TRUSTED_PROXY_HOPS", "1")
+		t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 192.168.0.0/16")
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.TrustedProxyCIDRs) != 2 {
+			t.Fatalf("parsed %d networks, want 2", len(cfg.TrustedProxyCIDRs))
+		}
+	})
+
+	t.Run("a value that is not a network is refused", func(t *testing.T) {
+		minimalEnv(t)
+		t.Setenv("TRUSTED_PROXY_HOPS", "1")
+		t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.1")
+
+		if _, err := LoadConfig(); err == nil {
+			t.Fatal("a bare address was accepted where a network is required")
+		}
+	})
+
+	t.Run("no hops needs no networks", func(t *testing.T) {
+		minimalEnv(t)
+
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
 
 func TestParseTargetsLegacy(t *testing.T) {
 	t.Run("bare upstream is one unnamed target forwarding the provider token", func(t *testing.T) {

@@ -67,6 +67,12 @@ type Config struct {
 	// clientKey. Zero means the header is ignored entirely.
 	TrustedProxyHops int
 
+	// TrustedProxyCIDRs are the networks those proxies connect from. The header
+	// is read only when the peer is inside one of them, so a caller that reaches
+	// this process directly cannot choose its own rate-limit bucket. Required
+	// whenever TrustedProxyHops is non-zero.
+	TrustedProxyCIDRs []*net.IPNet
+
 	DatabaseURL string
 
 	// EncryptionKey protects upstream tokens at rest. 32 bytes, base64.
@@ -187,6 +193,27 @@ func LoadConfig() (*Config, error) {
 			return nil, fmt.Errorf("TRUSTED_PROXY_HOPS must be a non-negative integer, got %q", raw)
 		}
 		c.TrustedProxyHops = n
+	}
+
+	for _, part := range strings.Split(os.Getenv("TRUSTED_PROXY_CIDRS"), ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		_, n, err := net.ParseCIDR(p)
+		if err != nil {
+			return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS must be a comma-separated list of networks in CIDR notation, got %q", p)
+		}
+		c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, n)
+	}
+
+	// Counting hops says how far into the header to read; it says nothing about
+	// who wrote it. Without the networks the proxies connect from, anything that
+	// can reach this process directly supplies its own X-Forwarded-For and picks
+	// whichever rate-limit bucket it likes, which is worse than not reading the
+	// header at all. Refuse at boot rather than serve that.
+	if c.TrustedProxyHops > 0 && len(c.TrustedProxyCIDRs) == 0 {
+		return nil, fmt.Errorf("TRUSTED_PROXY_HOPS is set, so TRUSTED_PROXY_CIDRS must name the networks the proxies connect from")
 	}
 
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CIMD_ENABLED"))) {
