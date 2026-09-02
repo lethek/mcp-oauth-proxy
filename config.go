@@ -67,6 +67,12 @@ type Config struct {
 	// clientKey. Zero means the header is ignored entirely.
 	TrustedProxyHops int
 
+	// TrustedProxyCIDRs are the networks those proxies connect from. The header
+	// is read only when the peer is inside one of them, so a caller that reaches
+	// this process directly cannot choose its own rate-limit bucket. Required
+	// whenever TrustedProxyHops is non-zero.
+	TrustedProxyCIDRs []*net.IPNet
+
 	DatabaseURL string
 
 	// EncryptionKey protects upstream tokens at rest. 32 bytes, base64.
@@ -189,6 +195,27 @@ func LoadConfig() (*Config, error) {
 		c.TrustedProxyHops = n
 	}
 
+	for _, part := range strings.Split(os.Getenv("TRUSTED_PROXY_CIDRS"), ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		_, n, err := net.ParseCIDR(p)
+		if err != nil {
+			return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS must be a comma-separated list of networks in CIDR notation, got %q", p)
+		}
+		c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, n)
+	}
+
+	// Counting hops says how far into the header to read; it says nothing about
+	// who wrote it. Without the networks the proxies connect from, anything that
+	// can reach this process directly supplies its own X-Forwarded-For and picks
+	// whichever rate-limit bucket it likes, which is worse than not reading the
+	// header at all. Refuse at boot rather than serve that.
+	if c.TrustedProxyHops > 0 && len(c.TrustedProxyCIDRs) == 0 {
+		return nil, fmt.Errorf("TRUSTED_PROXY_HOPS is set, so TRUSTED_PROXY_CIDRS must name the networks the proxies connect from")
+	}
+
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CIMD_ENABLED"))) {
 	case "", "false", "0", "no":
 	case "true", "1", "yes":
@@ -245,10 +272,24 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// Every route is registered at the root and every advertised URL is built by
-	// appending to this, so a path component would produce metadata and redirect
-	// URIs that match nothing this process actually serves.
-	if u, err := url.Parse(c.PublicURL); err == nil && u.Path != "" {
-		return nil, fmt.Errorf("PUBLIC_URL must not have a path component, got %q", u.Path)
+	// appending to this, so anything after the origin lands in the middle of what
+	// this process publishes. A path produces metadata and redirect URIs matching
+	// nothing it serves; a query or fragment is worse, because the suffix is
+	// swallowed by it and "https://proxy.example?x=1" + "/callback" is a redirect
+	// URI pointing at the root with a nonsense parameter.
+	if u, err := url.Parse(c.PublicURL); err == nil {
+		switch {
+		case u.Path != "":
+			return nil, fmt.Errorf("PUBLIC_URL must not have a path component, got %q", u.Path)
+		case u.RawQuery != "" || u.ForceQuery:
+			return nil, fmt.Errorf("PUBLIC_URL must not have a query string, got %q", u.RawQuery)
+		case u.Fragment != "":
+			return nil, fmt.Errorf("PUBLIC_URL must not have a fragment, got %q", u.Fragment)
+		case u.User != nil:
+			// PublicOrigin is derived from u.Host, which drops these, so the origin
+			// this process compares against would not be the string it advertises.
+			return nil, fmt.Errorf("PUBLIC_URL must not carry credentials")
+		}
 	}
 
 	targets, err := parseTargets(c.PublicURL)

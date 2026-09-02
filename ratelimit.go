@@ -14,7 +14,8 @@ import (
 // which.
 //
 // The key comes from the peer address, or from X-Forwarded-For when the
-// deployment declares how many proxies sit in front (TRUSTED_PROXY_HOPS).
+// deployment declares how many proxies sit in front (TRUSTED_PROXY_HOPS) and
+// which networks they connect from (TRUSTED_PROXY_CIDRS).
 //
 // Ignoring the header entirely was the previous behaviour and is worse than it
 // sounds: behind an ingress every caller shares one bucket, so a single
@@ -85,15 +86,21 @@ func (l *limiter) allow(key string) bool {
 
 // clientKey identifies the caller for rate-limiting purposes.
 //
-// trustedHops is how many reverse proxies sit in front of this process. With
-// none, the peer address is used and X-Forwarded-For is ignored, because it is
-// then entirely caller-supplied. With one or more, that many entries are walked
-// back from the RIGHT of the header: each hop appends the address it saw, so the
-// rightmost entries are the ones our own infrastructure wrote and the caller
-// cannot forge. Anything further left is attacker-controlled and never read.
-func clientKey(r *http.Request, trustedHops int) string {
+// TrustedProxyHops is how many reverse proxies sit in front of this process.
+// With none, the peer address is used and X-Forwarded-For is ignored, because it
+// is then entirely caller-supplied. With one or more, that many entries are
+// walked back from the RIGHT of the header: each hop appends the address it saw,
+// so the rightmost entries are the ones our own infrastructure wrote and the
+// caller cannot forge. Anything further left is attacker-controlled and never
+// read.
+//
+// That arithmetic only holds if a proxy really did write the header, so the peer
+// must be one. A caller reaching this process directly, past the ingress, would
+// otherwise send whatever X-Forwarded-For it liked and draw on a bucket of its
+// own choosing, which is the evasion the hop count exists to prevent.
+func clientKey(r *http.Request, cfg *Config) string {
 	peer := hostOnly(r.RemoteAddr)
-	if trustedHops <= 0 {
+	if cfg.TrustedProxyHops <= 0 || !isTrustedProxy(peer, cfg.TrustedProxyCIDRs) {
 		return aggregate(peer)
 	}
 
@@ -115,7 +122,7 @@ func clientKey(r *http.Request, trustedHops int) string {
 	// "client" and the peer is the proxy. The caller is chain[0], which is
 	// len(chain)-1. Anything an attacker prepends lands to the LEFT of the entry
 	// the proxy wrote, so it can never displace it.
-	idx := len(chain) - trustedHops
+	idx := len(chain) - cfg.TrustedProxyHops
 	if idx < 0 || idx >= len(chain) {
 		// Fewer entries than declared hops. Something is misconfigured or the
 		// header was stripped, and reading further left would mean trusting a
@@ -123,6 +130,22 @@ func clientKey(r *http.Request, trustedHops int) string {
 		return aggregate(peer)
 	}
 	return aggregate(hostOnly(chain[idx]))
+}
+
+// isTrustedProxy reports whether the peer is one of the reverse proxies the
+// deployment declared, and so whether the X-Forwarded-For it presents was
+// written by our own infrastructure.
+func isTrustedProxy(peer string, trusted []*net.IPNet) bool {
+	ip := net.ParseIP(peer)
+	if ip == nil {
+		return false
+	}
+	for _, n := range trusted {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func hostOnly(addr string) string {
@@ -147,9 +170,9 @@ func aggregate(host string) string {
 // limited caps an endpoint by caller address. Applying this at the routing
 // table rather than inside each handler means the limits for every endpoint are
 // visible in one list, and a new endpoint cannot quietly ship without one.
-func limited(l *limiter, trustedHops int, h http.HandlerFunc) http.HandlerFunc {
+func limited(l *limiter, cfg *Config, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := clientKey(r, trustedHops)
+		key := clientKey(r, cfg)
 		if !l.allow(key) {
 			slog.Warn("rate limited", "peer", key, "path", r.URL.Path)
 			w.Header().Set("Retry-After", "60")

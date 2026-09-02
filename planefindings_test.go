@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +16,8 @@ import (
 )
 
 // Tests for the Plane work items filed against HEAD 699e2dc (MOP-5, MOP-6,
-// MOP-9). Each one reproduced before its fix.
+// MOP-9) and against the v0.7.0..main review (MOP-12 to MOP-16). Each one
+// reproduced before its fix.
 
 // injectFailure makes every statement of the given kind on a table fail, the
 // way a statement timeout, a failover or a saturated pool would, and removes
@@ -37,6 +40,170 @@ func injectFailure(t *testing.T, s *Store, event, table string) (clear func()) {
 	}
 	t.Cleanup(clear)
 	return clear
+}
+
+// injectTransientFailure fails the first n statements of the given kind on a
+// table and lets everything after them through, which is what a failover or a
+// statement timeout looks like from the caller's side.
+//
+// The counter is a sequence rather than a table because nextval is not rolled
+// back with the transaction the exception aborts, so each failed attempt still
+// advances it.
+func injectTransientFailure(t *testing.T, s *Store, event, table string, n int) {
+	t.Helper()
+	ctx := context.Background()
+	name := "transient_" + strings.ToLower(event) + "_" + table
+	if _, err := s.pool.Exec(ctx, `CREATE SEQUENCE `+name+`_seq`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `CREATE OR REPLACE FUNCTION `+name+`() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF nextval('`+name+`_seq') <= `+strconv.Itoa(n)+` THEN
+				RAISE EXCEPTION 'injected transient `+event+` failure on `+table+`';
+			END IF;
+			RETURN NEW;
+		END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `CREATE TRIGGER `+name+` BEFORE `+event+` ON `+table+
+		` FOR EACH ROW EXECUTE FUNCTION `+name+`()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(ctx, `DROP TRIGGER IF EXISTS `+name+` ON `+table)
+		_, _ = s.pool.Exec(ctx, `DROP FUNCTION IF EXISTS `+name)
+		_, _ = s.pool.Exec(ctx, `DROP SEQUENCE IF EXISTS `+name+`_seq`)
+	})
+}
+
+// MOP-15: the display name is sealed into the settings cookie and nothing
+// obliged the provider to keep it short. A browser drops a cookie over roughly
+// 4 KiB without reporting it, so an overlong preferred_username locked the user
+// out of the enrolment page with nothing on screen to explain it.
+func TestOversizedDisplayNameDoesNotBreakTheSettingsCookie(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.hugeClaims.Store(true)
+	h.signIntoSettings()
+
+	var cookie *http.Cookie
+	u, err := url.Parse(h.proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range h.client.Jar.Cookies(u) {
+		if strings.Contains(c.Name, settingsCookie) {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("no settings cookie was set")
+	}
+	// 4096 is the per-cookie limit browsers converge on, counting name and value.
+	if n := len(cookie.Name) + len(cookie.Value); n >= 4096 {
+		t.Errorf("the settings cookie is %d bytes, over what a browser will keep", n)
+	}
+
+	// And the session it carries still works, which is what the cap is for.
+	page := h.get(h.proxy.URL + "/settings")
+	defer page.Body.Close()
+	if page.StatusCode != http.StatusOK {
+		t.Errorf("the settings page answered %d, want 200 for a signed-in user", page.StatusCode)
+	}
+}
+
+// MOP-15, the other claim in that cookie: sub is what durable rows are keyed on,
+// so an oversized one cannot be cut without risking a collision with another
+// account. It is refused instead.
+func TestOversizedSubjectIsRefused(t *testing.T) {
+	if _, err := identityFromClaims(strings.Repeat("s", 256), "alice"); err == nil {
+		t.Error("a sub of 256 characters was accepted as an identifier")
+	}
+	if _, err := identityFromClaims(strings.Repeat("s", 255), "alice"); err != nil {
+		t.Errorf("a sub of 255 characters was refused: %v", err)
+	}
+}
+
+// MOP-14: whether a session needs a subject is a property of the target it was
+// started for, not of the deployment. Asking whether any target anywhere is
+// per_user refused logins for the static and provider_token targets beside it,
+// which never look a subject up at all.
+func TestIdentityFailureOnlyBlocksAPerUserTarget(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.refuseUserinfo.Store(true)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+
+	// Walked by hand rather than through authorizeThroughConsentFor, because the
+	// point of half of it is the redirect that carries an error instead of a code.
+	backFrom := func(resource string) url.Values {
+		t.Helper()
+		flowID := h.consentFlowID(h.get(h.authorizeURLFor(clientID, redirect, s256(newSecret()), resource)))
+		consent := h.postForm("/consent", url.Values{"flow_id": {flowID}, "decision": {"approve"}})
+		consent.Body.Close()
+		toProvider := h.get(consent.Header.Get("Location"))
+		toProvider.Body.Close()
+		callback := h.get(toProvider.Header.Get("Location"))
+		callback.Body.Close()
+		u, err := url.Parse(callback.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.Query()
+	}
+
+	// beta forwards the provider's own token and never looks a subject up, so a
+	// provider that will not supply one must not block the login.
+	if q := backFrom(h.srv.cfg.Targets[1].Resource); q.Get("code") == "" {
+		t.Errorf("the provider_token target refused the login: %s", q.Get("error_description"))
+	}
+
+	// alpha finds the caller's stored credential by subject, so a session
+	// without one can do nothing and the failure belongs here.
+	if q := backFrom(h.srv.cfg.Targets[0].Resource); q.Get("error") != "server_error" {
+		t.Errorf("the per_user target issued a code with no subject; error = %q", q.Get("error"))
+	}
+}
+
+// proxyConfig is a config with the given number of hops in front, reached
+// through a proxy on 10.0.0.0/8, which is where the clientKey tests put theirs.
+func proxyConfig(t *testing.T, hops int) *Config {
+	t.Helper()
+	_, n, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Config{TrustedProxyHops: hops, TrustedProxyCIDRs: []*net.IPNet{n}}
+}
+
+// MOP-13: the hop count says how far into X-Forwarded-For to read, not who
+// wrote it. A caller reaching this process directly, past the ingress, used to
+// have its own header believed and could pick whichever bucket it liked.
+func TestClientKeyIgnoresForwardedForFromAnUntrustedPeer(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/authorize", nil)
+	r.RemoteAddr = "203.0.113.9:1234"
+	r.Header.Set("X-Forwarded-For", "198.51.100.7")
+
+	if got := clientKey(r, proxyConfig(t, 1)); got != "203.0.113.9" {
+		t.Errorf("key = %q, want the peer address: the header did not come from a declared proxy", got)
+	}
+}
+
+// MOP-13: and a caller cannot mint a fresh bucket per request that way either,
+// which is what makes the limit evadable rather than merely misattributed.
+func TestUntrustedPeerCannotRotateItsRateLimitBucket(t *testing.T) {
+	cfg := proxyConfig(t, 1)
+	l := newLimiter(2, time.Minute)
+
+	for i := range 5 {
+		r := httptest.NewRequest(http.MethodGet, "/authorize", nil)
+		r.RemoteAddr = "203.0.113.9:1234"
+		r.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(i))
+		allowed := l.allow(clientKey(r, cfg))
+		if want := i < 2; allowed != want {
+			t.Errorf("request %d: allowed = %v, want %v", i, allowed, want)
+		}
+	}
 }
 
 // MOP-6: a client_name cut on a byte boundary inside a multi-byte rune is not
@@ -97,24 +264,31 @@ func TestCIMDTruncatesClientNameOnRunes(t *testing.T) {
 	}
 }
 
-// MOP-9: the provider has already rotated the refresh token by the time the
-// persist runs, so a transient database failure there must not fail the request
-// that holds the only usable copy of the new token.
-func TestRefreshedUpstreamTokenIsServedWhenThePersistFails(t *testing.T) {
-	h := newHarness(t)
-	ctx := context.Background()
-
+// expiredSession stores a session whose upstream token is already past its
+// expiry, so the next read of it has to refresh.
+func expiredSession(t *testing.T, h *harness) string {
+	t.Helper()
 	sessionID := newSecret()
 	expired := UpstreamToken{
 		AccessToken:  "stale-access-token",
 		RefreshToken: "stale-refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
-	if err := h.srv.persistToken(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, expired, true); err != nil {
+	if err := h.srv.persistToken(context.Background(), sessionID, "subject",
+		h.srv.cfg.Targets[0].Resource, expired, true); err != nil {
 		t.Fatal(err)
 	}
+	return sessionID
+}
 
-	injectFailure(t, h.srv.store, "UPDATE", "sessions")
+// MOP-9, MOP-12: the provider has already rotated the refresh token by the time
+// the persist runs, so what comes back is the only copy of the new pair. A blip
+// in the store must not throw it away, which is what a single attempt did.
+func TestRefreshedUpstreamTokenSurvivesATransientPersistFailure(t *testing.T) {
+	h := newHarness(t)
+	sessionID := expiredSession(t, h)
+
+	injectTransientFailure(t, h.srv.store, "UPDATE", "sessions", 2)
 
 	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
 	tok, err := h.srv.currentUpstreamToken(req, sessionID)
@@ -126,6 +300,32 @@ func TestRefreshedUpstreamTokenIsServedWhenThePersistFails(t *testing.T) {
 	}
 	if n := h.providerTokenHits.Load(); n != 1 {
 		t.Errorf("provider token endpoint called %d times, want 1", n)
+	}
+
+	// The point of the retry: the rotated pair reached the store, so a later
+	// refresh has a token the provider will still honour.
+	stored, err := h.srv.loadToken(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RefreshToken != "upstream-refresh-token" {
+		t.Errorf("stored refresh token is %q, want the rotated one", stored.RefreshToken)
+	}
+}
+
+// MOP-12: when the retries are exhausted the rotated pair really is lost and
+// the session is finished. Serving the request anyway hid that until some later
+// refresh failed against a token the provider had already retired, which no log
+// line connected back to this moment.
+func TestRefreshFailsWhenTheRotatedTokenCannotBePersisted(t *testing.T) {
+	h := newHarness(t)
+	sessionID := expiredSession(t, h)
+
+	injectFailure(t, h.srv.store, "UPDATE", "sessions")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	if _, err := h.srv.currentUpstreamToken(req, sessionID); err == nil {
+		t.Fatal("the refresh reported success after the rotated token was lost")
 	}
 }
 

@@ -204,8 +204,8 @@ func (s *Server) routes() http.Handler {
 	// Every unauthenticated endpoint is capped here rather than inside its
 	// handler, so this list is the whole story and adding a route without a limit
 	// is a visible omission rather than a forgotten line.
-	mux.HandleFunc("POST /register", limited(s.registerLimit, s.cfg.TrustedProxyHops, s.handleRegister))
-	mux.HandleFunc("GET /authorize", limited(s.flowLimit, s.cfg.TrustedProxyHops, s.handleAuthorize))
+	mux.HandleFunc("POST /register", limited(s.registerLimit, s.cfg, s.handleRegister))
+	mux.HandleFunc("GET /authorize", limited(s.flowLimit, s.cfg, s.handleAuthorize))
 	// The consent screen stands between /authorize and the provider. Without it
 	// an anonymous registration could be used to collect someone else's
 	// credentials, so nothing may reach /callback that did not pass through here.
@@ -213,17 +213,17 @@ func (s *Server) routes() http.Handler {
 	// share the looser backstop. /token in particular is dialled by the MCP
 	// client rather than a browser, and a hosted client refreshes for every one
 	// of its users from a single address.
-	mux.HandleFunc("POST /consent", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleConsent))
-	mux.HandleFunc("GET /callback", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleCallback))
-	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleToken))
-	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleRevoke))
+	mux.HandleFunc("POST /consent", limited(s.credentialLimit, s.cfg, s.handleConsent))
+	mux.HandleFunc("GET /callback", limited(s.credentialLimit, s.cfg, s.handleCallback))
+	mux.HandleFunc("POST /token", limited(s.credentialLimit, s.cfg, s.handleToken))
+	mux.HandleFunc("POST /revoke", limited(s.credentialLimit, s.cfg, s.handleRevoke))
 
 	// The MCP endpoints are capped on their own bucket. They demand a credential
 	// and are the busiest route, so a shared cap would let ordinary traffic here
 	// refuse the authorization endpoints; an unauthenticated request still costs
 	// a database round trip, so leaving them uncapped is not right either.
 	for _, t := range s.cfg.Targets {
-		h := limited(s.mcpLimit, s.cfg.TrustedProxyHops, s.handleMCP(t))
+		h := limited(s.mcpLimit, s.cfg, s.handleMCP(t))
 		mux.HandleFunc(t.MCPPath(), h)
 		mux.HandleFunc(t.MCPPath()+"/", h)
 	}
@@ -233,10 +233,10 @@ func (s *Server) routes() http.Handler {
 	// consent flow, which is bound to one MCP client's authorization and cannot
 	// answer "who is this browser" outside it.
 	if s.cfg.HasPerUserTargets() {
-		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg.TrustedProxyHops, s.handleSettings))
-		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleSettingsLogout))
-		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleSettingsCallback))
-		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg.TrustedProxyHops, s.handleSettingsSave))
+		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg, s.handleSettings))
+		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg, s.handleSettingsLogout))
+		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg, s.handleSettingsCallback))
+		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg, s.handleSettingsSave))
 	}
 
 	// Liveness only. It says this process is up, not that the provider or the
