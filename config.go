@@ -285,6 +285,10 @@ func LoadConfig() (*Config, error) {
 			return nil, fmt.Errorf("PUBLIC_URL must not have a query string, got %q", u.RawQuery)
 		case u.Fragment != "":
 			return nil, fmt.Errorf("PUBLIC_URL must not have a fragment, got %q", u.Fragment)
+		case u.User != nil:
+			// PublicOrigin is derived from u.Host, which drops these, so the origin
+			// this process compares against would not be the string it advertises.
+			return nil, fmt.Errorf("PUBLIC_URL must not carry credentials")
 		}
 	}
 

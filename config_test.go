@@ -78,6 +78,7 @@ func TestPublicURLMustBeABareOrigin(t *testing.T) {
 		"https://proxy.example?x=1",
 		"https://proxy.example/?x=1",
 		"https://proxy.example#frag",
+		"https://user:pw@proxy.example",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			minimalEnv(t)
