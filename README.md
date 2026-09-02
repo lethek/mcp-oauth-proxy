@@ -57,7 +57,7 @@ where a default is shown.
 
 | Variable | Meaning |
 | --- | --- |
-| `PUBLIC_URL` | The origin clients dial, e.g. `https://git-mcp.example.com`. Used as the OAuth issuer and as the base of every advertised URL, so it must match reality. Must be `https` unless it is loopback. No trailing slash. Spelling out a default port is fine; it is normalised before being compared against a browser's `Origin`. |
+| `PUBLIC_URL` | The origin clients dial, e.g. `https://git-mcp.example.com`. Used as the OAuth issuer and as the base of every advertised URL, so it must match reality. Must be `https` unless it is loopback. No trailing slash. A bare origin, so no path, query string, fragment or credentials; anything else is refused at boot. Spelling out a default port is fine; it is normalised before being compared against a browser's `Origin`. |
 | `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set. |
 | `TARGETS` | Comma-separated names, to serve several MCP servers from one proxy. See below. |
 | `UPSTREAM_ISSUER` | The OAuth provider's origin. Discovery is read from `/.well-known/openid-configuration`, falling back to `/.well-known/oauth-authorization-server`. |
