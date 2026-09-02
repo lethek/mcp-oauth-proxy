@@ -76,6 +76,53 @@ func injectTransientFailure(t *testing.T, s *Store, event, table string, n int) 
 	})
 }
 
+// MOP-15: the display name is sealed into the settings cookie and nothing
+// obliged the provider to keep it short. A browser drops a cookie over roughly
+// 4 KiB without reporting it, so an overlong preferred_username locked the user
+// out of the enrolment page with nothing on screen to explain it.
+func TestOversizedDisplayNameDoesNotBreakTheSettingsCookie(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.hugeClaims.Store(true)
+	h.signIntoSettings()
+
+	var cookie *http.Cookie
+	u, err := url.Parse(h.proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range h.client.Jar.Cookies(u) {
+		if strings.Contains(c.Name, settingsCookie) {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("no settings cookie was set")
+	}
+	// 4096 is the per-cookie limit browsers converge on, counting name and value.
+	if n := len(cookie.Name) + len(cookie.Value); n >= 4096 {
+		t.Errorf("the settings cookie is %d bytes, over what a browser will keep", n)
+	}
+
+	// And the session it carries still works, which is what the cap is for.
+	page := h.get(h.proxy.URL + "/settings")
+	defer page.Body.Close()
+	if page.StatusCode != http.StatusOK {
+		t.Errorf("the settings page answered %d, want 200 for a signed-in user", page.StatusCode)
+	}
+}
+
+// MOP-15, the other claim in that cookie: sub is what durable rows are keyed on,
+// so an oversized one cannot be cut without risking a collision with another
+// account. It is refused instead.
+func TestOversizedSubjectIsRefused(t *testing.T) {
+	if _, err := identityFromClaims(strings.Repeat("s", 256), "alice"); err == nil {
+		t.Error("a sub of 256 characters was accepted as an identifier")
+	}
+	if _, err := identityFromClaims(strings.Repeat("s", 255), "alice"); err != nil {
+		t.Errorf("a sub of 255 characters was refused: %v", err)
+	}
+}
+
 // MOP-14: whether a session needs a subject is a property of the target it was
 // started for, not of the deployment. Asking whether any target anywhere is
 // per_user refused logins for the static and provider_token targets beside it,

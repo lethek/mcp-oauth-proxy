@@ -326,6 +326,16 @@ func (u *Upstream) postToken(ctx context.Context, form url.Values) (UpstreamToke
 	return out, nil
 }
 
+const (
+	// maxSubject is the length OIDC Core gives sub. Anything longer is not a
+	// subject this proxy can key on.
+	maxSubject = 255
+
+	// maxDisplayName keeps the readable name to something a person can read on
+	// the enrolment page, and out of the settings cookie's size budget.
+	maxDisplayName = 100
+)
+
 // Subject asks the provider who the token belongs to, so a session can be tied
 // to a person for auditing and revocation. Best effort by design: a provider
 // without a userinfo endpoint must not stop anyone logging in, so the caller
@@ -382,20 +392,42 @@ func (u *Upstream) Identity(ctx context.Context, accessToken string) (UserIdenti
 		return UserIdentity{}, fmt.Errorf("userinfo response was not JSON: %w", err)
 	}
 
-	// Only sub identifies the account. It is the one claim OIDC requires to be
-	// stable and never reassigned, and it is what durable rows are keyed on.
-	//
-	// The friendlier claims are returned separately, for logs and for the
-	// settings page. They must not be folded into the identifier: a username is
-	// mutable, so a rename would silently orphan everything stored under the old
-	// value, and where a provider omits sub entirely a reused username would
-	// inherit the previous holder's stored credentials.
 	name := claims.PreferredUsername
 	if name == "" {
 		name = claims.Email
 	}
-	if claims.Sub == "" {
+	return identityFromClaims(claims.Sub, name)
+}
+
+// identityFromClaims turns the two claims that matter into an identity.
+//
+// Only sub identifies the account. It is the one claim OIDC requires to be
+// stable and never reassigned, and it is what durable rows are keyed on. The
+// friendlier name is kept separate, for logs and for the settings page, and must
+// not be folded into the identifier: a username is mutable, so a rename would
+// silently orphan everything stored under the old value, and where a provider
+// omits sub entirely a reused username would inherit the previous holder's
+// stored credentials.
+//
+// Both are sealed into the settings cookie, and a browser drops a cookie over
+// roughly 4 KiB without reporting it, which locks the user out of the enrolment
+// page with nothing on screen or in the log to say why. Neither claim has a
+// length the provider is obliged to respect, and the userinfo body is read up to
+// a megabyte, so the lengths are imposed here.
+//
+// The name is decoration, so it is cut, on runes rather than bytes so the cut
+// cannot leave invalid UTF-8. sub is keyed on, and a cut one could collide with
+// another account's, so an oversized one is refused instead.
+func identityFromClaims(sub, name string) (UserIdentity, error) {
+	if sub == "" {
 		return UserIdentity{}, errors.New("userinfo returned no sub claim, so there is no stable identifier to key on")
 	}
-	return UserIdentity{Subject: claims.Sub, Display: name}, nil
+	if len(sub) > maxSubject {
+		return UserIdentity{}, fmt.Errorf("userinfo returned a sub claim of %d bytes, over the %d OIDC allows",
+			len(sub), maxSubject)
+	}
+	if r := []rune(name); len(r) > maxDisplayName {
+		name = string(r[:maxDisplayName])
+	}
+	return UserIdentity{Subject: sub, Display: name}, nil
 }
