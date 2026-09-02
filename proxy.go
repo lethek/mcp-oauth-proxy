@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"hash/fnv"
@@ -427,22 +428,48 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 	if refreshed.RefreshToken == "" {
 		refreshed.RefreshToken = fresh.RefreshToken
 	}
-	// subject and resource are ignored on an update; both belong to the session
-	// as created and a refresh must not be able to change either.
-	if err := s.persistToken(r.Context(), sessionID, "", "", refreshed, false); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			// Revoked while we were at the provider; nothing of this session
-			// may be served.
-			return tok, err
-		}
-		// The provider has already rotated the refresh token, so this is the
-		// only copy of the new pair. Failing the request would throw it away
-		// and leave the session holding a refresh token the provider no longer
-		// honours. Serve it: this request gets through, and if the store is
-		// still down the next refresh fails loudly instead.
-		slog.Error("could not persist the refreshed upstream token; serving it unpersisted", "err", err, "session", sessionID)
-		return refreshed, nil
+	if err := s.persistRefreshed(r.Context(), sessionID, refreshed); err != nil {
+		// The rotated pair could not be recorded, so the session now holds a
+		// refresh token the provider will not honour again and is finished.
+		// Serving this request anyway would hide that until some later refresh
+		// failed for a reason nobody could trace back to here.
+		slog.Error("could not persist the refreshed upstream token; the session is now unusable",
+			"err", err, "session", sessionID)
+		return tok, err
 	}
 	slog.Info("refreshed the upstream token", "session", sessionID)
 	return refreshed, nil
+}
+
+// persistRefreshed writes a rotated upstream token back to its session.
+//
+// The provider invalidates the old refresh token the moment it issues a new
+// one, so what comes back from a refresh is the only copy of the pair. A write
+// that fails here costs the user their session, and a store that fails one
+// statement is often serving again a moment later, so a failure is retried
+// briefly rather than taken as final.
+//
+// A revoked session is the exception. There is no row to write back to and
+// nothing of the session may be served, so ErrNotFound returns immediately.
+func (s *Server) persistRefreshed(ctx context.Context, sessionID string, tok UpstreamToken) error {
+	const attempts = 3
+	var err error
+	for i := range attempts {
+		if i > 0 {
+			select {
+			case <-time.After(time.Duration(i) * 100 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		// subject and resource are ignored on an update; both belong to the
+		// session as created and a refresh must not be able to change either.
+		err = s.persistToken(ctx, sessionID, "", "", tok, false)
+		if err == nil || errors.Is(err, ErrNotFound) {
+			return err
+		}
+		slog.Warn("could not persist the refreshed upstream token; retrying",
+			"err", err, "session", sessionID, "attempt", i+1)
+	}
+	return err
 }
