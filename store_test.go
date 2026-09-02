@@ -10,12 +10,17 @@ import (
 
 // newTestStore connects to the database named by TEST_DATABASE_URL and clears
 // it. Without that variable the database-backed tests skip, so `go test ./...`
-// still works on a machine with no Postgres.
+// still works on a machine with no Postgres. Under CI they fail instead: a
+// green run that exercised none of the OAuth, proxy or settings tests is how
+// two "passing" fixes shipped broken.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("TEST_DATABASE_URL is not set under CI; the database-backed tests would be skipped")
+		}
 		t.Skip("TEST_DATABASE_URL is not set; skipping the database-backed tests")
 	}
 

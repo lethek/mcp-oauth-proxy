@@ -6,8 +6,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// querier is what a statement runs against: the pool on its own, or the
+// transaction of a Grant. Both satisfy it.
+type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 var (
 	ErrNotFound = errors.New("not found")
@@ -342,8 +350,12 @@ func (s *Store) CreateAuthCode(ctx context.Context, code string, a AuthCode) err
 
 // TakeAuthCode enforces single use by deleting on read.
 func (s *Store) TakeAuthCode(ctx context.Context, code string) (AuthCode, error) {
+	return takeAuthCode(ctx, s.pool, code)
+}
+
+func takeAuthCode(ctx context.Context, q querier, code string) (AuthCode, error) {
 	var a AuthCode
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`DELETE FROM auth_codes WHERE code_hash=$1 AND created_at > now() - $2::interval
 		 RETURNING session_id, client_id, redirect_uri, code_challenge`,
 		hashToken(code), codeTTL.String()).
@@ -391,28 +403,69 @@ func (s *Store) LookupAccessToken(ctx context.Context, token string) (sessionID,
 // transaction.
 //
 // Separately, a failure between them leaves the client holding nothing usable
-// while an access token it never received sits in the database, and the
-// authorization code it would need to retry with has already been consumed. The
-// pair is one grant, so it is one write.
+// while an access token it never received sits in the database. The pair is one
+// grant, so it is one write. The serving path goes further and uses a Grant, so
+// the code or refresh token being redeemed is consumed in that same write.
 func (s *Store) CreateTokenPair(ctx context.Context, access, refresh, sessionID, clientID string, accessTTL time.Duration) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO access_tokens (token_hash, session_id, client_id, expires_at) VALUES ($1,$2,$3, now() + $4::interval)`,
-		hashToken(access), sessionID, clientID, accessTTL.String()); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO refresh_tokens (token_hash, session_id, client_id) VALUES ($1,$2,$3)`,
-		hashToken(refresh), sessionID, clientID); err != nil {
+	if err := createTokenPair(ctx, tx, access, refresh, sessionID, clientID, accessTTL); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
+
+func createTokenPair(ctx context.Context, q querier, access, refresh, sessionID, clientID string, accessTTL time.Duration) error {
+	if _, err := q.Exec(ctx,
+		`INSERT INTO access_tokens (token_hash, session_id, client_id, expires_at) VALUES ($1,$2,$3, now() + $4::interval)`,
+		hashToken(access), sessionID, clientID, accessTTL.String()); err != nil {
+		return err
+	}
+	_, err := q.Exec(ctx,
+		`INSERT INTO refresh_tokens (token_hash, session_id, client_id) VALUES ($1,$2,$3)`,
+		hashToken(refresh), sessionID, clientID)
+	return err
+}
+
+// Grant is one transaction spanning the consumption of an authorization code
+// or refresh token and the issue of the tokens it buys.
+//
+// Consumed on read alone, a failure writing the new tokens left the client with
+// nothing it could retry: the code was gone, or the refresh token was marked
+// used so that the retry looked like a replay and revoked the session. Inside
+// one transaction the failure rolls the consumption back too.
+type Grant struct {
+	s  *Store
+	tx pgx.Tx
+}
+
+func (s *Store) BeginGrant(ctx context.Context) (*Grant, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Grant{s: s, tx: tx}, nil
+}
+
+func (g *Grant) TakeAuthCode(ctx context.Context, code string) (AuthCode, error) {
+	return takeAuthCode(ctx, g.tx, code)
+}
+
+func (g *Grant) TakeRefreshToken(ctx context.Context, token, clientID string) (string, error) {
+	return g.s.takeRefreshToken(ctx, g.tx, token, clientID)
+}
+
+func (g *Grant) CreateTokenPair(ctx context.Context, access, refresh, sessionID, clientID string, accessTTL time.Duration) error {
+	return createTokenPair(ctx, g.tx, access, refresh, sessionID, clientID, accessTTL)
+}
+
+func (g *Grant) Commit(ctx context.Context) error { return g.tx.Commit(ctx) }
+
+// Rollback is safe to defer after a Commit; it does nothing then.
+func (g *Grant) Rollback(ctx context.Context) { _ = g.tx.Rollback(ctx) }
 
 // CreateRefreshToken writes one token on its own. See CreateAccessToken: the
 // serving path uses CreateTokenPair instead.
@@ -430,6 +483,10 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, client
 // Rotation alone only detects theft; acting on that signal is what contains it,
 // so the caller revokes the session.
 func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (sessionID string, err error) {
+	return s.takeRefreshToken(ctx, s.pool, token, clientID)
+}
+
+func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID string) (sessionID string, err error) {
 	hash := hashToken(token)
 
 	// The client binding is part of the same statement, so a request naming the
@@ -439,7 +496,7 @@ func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (s
 	// burn the caller's only valid token, and the legitimate retry that followed
 	// then looked like a replay and revoked the whole session. A wrong client id
 	// is an ordinary mistake and must not be able to destroy a session.
-	err = s.pool.QueryRow(ctx,
+	err = q.QueryRow(ctx,
 		`UPDATE refresh_tokens r SET used=true, used_at=now()
 		 FROM sessions s
 		 WHERE r.token_hash=$1
@@ -461,7 +518,7 @@ func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (s
 	// a client-id mismatch on an unused token is not, and must not be reported
 	// as one or the caller below would tear the session down.
 	var reusedSession string
-	if e := s.pool.QueryRow(ctx,
+	if e := q.QueryRow(ctx,
 		`SELECT session_id FROM refresh_tokens WHERE token_hash=$1 AND used`, hash).
 		Scan(&reusedSession); e == nil {
 		return reusedSession, ErrTokenReused

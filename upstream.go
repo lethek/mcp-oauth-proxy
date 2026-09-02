@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // upstreamMeta is the subset of the provider's discovery document we use.
@@ -64,6 +66,12 @@ type Upstream struct {
 	fetchedAt time.Time
 	failedAt  time.Time
 	failErr   error
+
+	// fetches collapses concurrent discovery fetches into one. The backoff
+	// above only starts once a fetch has failed, so without this every caller
+	// that arrived while a fetch was still hanging started its own, and an
+	// outage at the provider made 20 waiting callers into 40 requests.
+	fetches singleflight.Group
 }
 
 func NewUpstream(cfg *Config) *Upstream {
@@ -94,6 +102,42 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 		return nil, failErr
 	}
 
+	// One fetch runs on behalf of everyone waiting. It is detached from the
+	// first caller's context so that caller going away does not fail the rest;
+	// the client timeout bounds it instead. A waiter whose own context ends
+	// stops waiting and leaves the fetch to finish for the others.
+	ch := u.fetches.DoChan("meta", func() (any, error) {
+		return u.fetch(context.WithoutCancel(ctx))
+	})
+	var res singleflight.Result
+	select {
+	case res = <-ch:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if res.Err == nil {
+		return res.Val.(*upstreamMeta), nil
+	}
+
+	// A document we already hold is served past its TTL rather than discarded.
+	// The TTL exists so a rotated endpoint is eventually picked up, not so a
+	// thirty-second provider restart takes every authorization down while a
+	// perfectly usable document sits in memory.
+	//
+	// Staleness is bounded all the same. Serving a document indefinitely because
+	// refresh keeps failing would restore the very failure the TTL was added to
+	// prevent: a rotated endpoint that never takes effect, with nothing but a log
+	// line to say so.
+	if m != nil && time.Since(fetchedAt) < discoveryMaxStale {
+		slog.Warn("serving stale provider discovery; refresh failed", "err", res.Err)
+		return m, nil
+	}
+	return nil, res.Err
+}
+
+// fetch tries both well-known paths and records the outcome for Meta's
+// backoff.
+func (u *Upstream) fetch(ctx context.Context) (*upstreamMeta, error) {
 	var lastErr error
 	for _, p := range []string{"/.well-known/openid-configuration", "/.well-known/oauth-authorization-server"} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.cfg.UpstreamIssuer+p, nil)
@@ -151,20 +195,6 @@ func (u *Upstream) Meta(ctx context.Context) (*upstreamMeta, error) {
 	u.failedAt = time.Now()
 	u.failErr = err
 	u.mu.Unlock()
-
-	// A document we already hold is served past its TTL rather than discarded.
-	// The TTL exists so a rotated endpoint is eventually picked up, not so a
-	// thirty-second provider restart takes every authorization down while a
-	// perfectly usable document sits in memory.
-	//
-	// Staleness is bounded all the same. Serving a document indefinitely because
-	// refresh keeps failing would restore the very failure the TTL was added to
-	// prevent: a rotated endpoint that never takes effect, with nothing but a log
-	// line to say so.
-	if m != nil && time.Since(fetchedAt) < discoveryMaxStale {
-		slog.Warn("serving stale provider discovery; refresh failed", "err", err)
-		return m, nil
-	}
 	return nil, err
 }
 

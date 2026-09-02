@@ -330,8 +330,8 @@ func parseCIMD(clientID string, body []byte) (Client, error) {
 	}
 
 	name := strings.TrimSpace(doc.ClientName)
-	if len(name) > 100 {
-		name = name[:100]
+	if r := []rune(name); len(r) > 100 {
+		name = string(r[:100])
 	}
 	if name == "" {
 		name = clientID

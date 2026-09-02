@@ -430,7 +430,18 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 	// subject and resource are ignored on an update; both belong to the session
 	// as created and a refresh must not be able to change either.
 	if err := s.persistToken(r.Context(), sessionID, "", "", refreshed, false); err != nil {
-		return refreshed, err
+		if errors.Is(err, ErrNotFound) {
+			// Revoked while we were at the provider; nothing of this session
+			// may be served.
+			return tok, err
+		}
+		// The provider has already rotated the refresh token, so this is the
+		// only copy of the new pair. Failing the request would throw it away
+		// and leave the session holding a refresh token the provider no longer
+		// honours. Serve it: this request gets through, and if the store is
+		// still down the next refresh fails loudly instead.
+		slog.Error("could not persist the refreshed upstream token; serving it unpersisted", "err", err, "session", sessionID)
+		return refreshed, nil
 	}
 	slog.Info("refreshed the upstream token", "session", sessionID)
 	return refreshed, nil

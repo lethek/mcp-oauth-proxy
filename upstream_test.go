@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,6 +47,48 @@ func TestDiscoveryFailureIsRememberedBriefly(t *testing.T) {
 	// Recovery must not be blocked for longer than the retry window.
 	if discoveryRetryAfter > 30*time.Second {
 		t.Errorf("discoveryRetryAfter is %s, long enough to delay recovery noticeably", discoveryRetryAfter)
+	}
+}
+
+// TestConcurrentDiscoveryFetchesAreCollapsed (MOP-7): the backoff only starts
+// once a fetch has failed, so callers that arrived while the first fetch was
+// still hanging each started their own. Against a hung provider, 20 callers
+// made 40 requests. One fetch should run on behalf of everyone waiting.
+func TestConcurrentDiscoveryFetchesAreCollapsed(t *testing.T) {
+	var hits atomic.Int64
+	release := make(chan struct{})
+
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		<-release
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer hung.Close()
+
+	u := NewUpstream(&Config{UpstreamIssuer: hung.URL})
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			if _, err := u.Meta(ctx); err == nil {
+				t.Error("Meta succeeded against a provider returning 503")
+			}
+		})
+	}
+
+	// Let the first request reach the provider and the rest pile up behind it.
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	// One fetch tries both well-known paths, so two requests is the floor.
+	if got := hits.Load(); got > 2 {
+		t.Errorf("20 concurrent Meta calls made %d discovery requests, want at most 2", got)
 	}
 }
 

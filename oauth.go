@@ -225,9 +225,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// The name is shown on the consent screen, so keep it to something a person
 	// can read rather than a wall of text chosen by the registrant.
+	// Cut on runes, not bytes: a byte cut inside a multi-byte character leaves
+	// invalid UTF-8, which Postgres refuses to store.
 	name := strings.TrimSpace(req.ClientName)
-	if len(name) > 100 {
-		name = name[:100]
+	if r := []rune(name); len(r) > 100 {
+		name = string(r[:100])
 	}
 	if name == "" {
 		name = "an unnamed application"
@@ -563,31 +565,64 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 	f := r.PostForm
-	rec, err := s.store.TakeAuthCode(r.Context(), f.Get("code"))
+	// The code is consumed and the tokens it buys are written in one
+	// transaction, so a failure writing them puts the code back for a retry.
+	g, err := s.store.BeginGrant(r.Context())
+	if err != nil {
+		slog.Error("token: could not begin the grant", "err", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "could not issue tokens")
+		return
+	}
+	defer g.Rollback(r.Context())
+
+	rec, err := g.TakeAuthCode(r.Context(), f.Get("code"))
 	if err != nil {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the authorization code is unknown, expired or already used")
 		return
 	}
-	if rec.ClientID != f.Get("client_id") {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "this code was issued to a different client")
+	if reason := codeExchangeMismatch(rec, f); reason != "" {
+		// The code is spent either way: a failed PKCE check must not leave it
+		// available for another guess.
+		if err := g.Commit(r.Context()); err != nil {
+			slog.Error("token: could not spend a mismatched code", "err", err)
+		}
+		oauthError(w, http.StatusBadRequest, "invalid_grant", reason)
 		return
+	}
+	s.issue(w, r, g, rec.SessionID, rec.ClientID)
+}
+
+// codeExchangeMismatch says why the exchange does not match the code's
+// authorization request, or "" when it does.
+func codeExchangeMismatch(rec AuthCode, f url.Values) string {
+	if rec.ClientID != f.Get("client_id") {
+		return "this code was issued to a different client"
 	}
 	if rec.RedirectURI != f.Get("redirect_uri") {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri does not match the authorization request")
-		return
+		return "redirect_uri does not match the authorization request"
 	}
 	if verifier := f.Get("code_verifier"); verifier == "" || s256(verifier) != rec.CodeChallenge {
-		oauthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
-		return
+		return "PKCE verification failed"
 	}
-	s.issue(w, r, rec.SessionID, rec.ClientID)
+	return ""
 }
 
 func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
+	// Consumed in the same transaction that issues the replacement, so a
+	// failure writing the new pair leaves this token unused. Consumed on its
+	// own, the client's retry looked like a replay and revoked the session.
+	g, err := s.store.BeginGrant(r.Context())
+	if err != nil {
+		slog.Error("token: could not begin the grant", "err", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "could not issue tokens")
+		return
+	}
+	defer g.Rollback(r.Context())
+
 	// The client id is passed in and matched inside the same statement that
 	// consumes the token, so a wrong or missing one leaves the token unused.
 	clientID := r.PostForm.Get("client_id")
-	sessionID, err := s.store.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
+	sessionID, err := g.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
 	if errors.Is(err, ErrTokenReused) {
 		// Either the client replayed a token it should have discarded, or someone
 		// else is holding a copy. We cannot tell which, and only one of those is
@@ -606,18 +641,23 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the refresh token is unknown, expired, or was issued to a different client")
 		return
 	}
-	s.issue(w, r, sessionID, clientID)
+	s.issue(w, r, g, sessionID, clientID)
 }
 
-// issue mints the pair of credentials the client will actually use. These are
-// ours, not the provider's — the upstream token never leaves this process.
-func (s *Server) issue(w http.ResponseWriter, r *http.Request, sessionID, clientID string) {
+// issue mints the pair of credentials the client will actually use and commits
+// the grant. These are ours, not the provider's — the upstream token never
+// leaves this process.
+func (s *Server) issue(w http.ResponseWriter, r *http.Request, g *Grant, sessionID, clientID string) {
 	access, refresh := newSecret(), newSecret()
-	// One transaction, because the two writes are one grant. Storing the access
-	// token and then failing on the refresh token leaves the client a 500 for a
-	// grant it cannot retry — the authorization code was consumed on read — and
-	// a usable access token in the database that nobody holds.
-	if err := s.store.CreateTokenPair(r.Context(), access, refresh, sessionID, clientID, accessTokenTTL); err != nil {
+	// The two writes and the consumption before them are one grant, so they
+	// commit together. Anything less leaves the client a 500 for a grant it
+	// cannot retry, and possibly a usable access token in the database that
+	// nobody holds.
+	err := g.CreateTokenPair(r.Context(), access, refresh, sessionID, clientID, accessTokenTTL)
+	if err == nil {
+		err = g.Commit(r.Context())
+	}
+	if err != nil {
 		slog.Error("token: could not issue the token pair", "err", err)
 		oauthError(w, http.StatusInternalServerError, "server_error", "could not issue tokens")
 		return
