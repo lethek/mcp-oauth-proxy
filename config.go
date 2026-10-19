@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +136,12 @@ type Target struct {
 
 	// UserFields are the values a user supplies for themselves in per_user mode.
 	UserFields []UserHeaderField
+
+	// AllowedGroups limits authorization for this target to members of at least
+	// one of these provider groups. Empty admits everyone the provider admits.
+	// It matters most for a static target, where every caller acts with the same
+	// credential and nothing upstream tells them apart.
+	AllowedGroups []string
 
 	// Resource is this target's RFC 8707 identifier and the audience of every
 	// token issued for it. Computed once, because comparing it is on the path of
@@ -428,6 +435,18 @@ func parseTargets(publicURL string) ([]Target, error) {
 		}
 		t.UserFields = fields
 
+		rawGroups := os.Getenv(p + "ALLOWED_GROUPS")
+		for _, g := range strings.Split(rawGroups, ",") {
+			if g = strings.TrimSpace(g); g != "" {
+				t.AllowedGroups = append(t.AllowedGroups, g)
+			}
+		}
+		// A value that names no group would otherwise read as "no restriction",
+		// opening the target to everyone while the config says it is limited.
+		if strings.TrimSpace(rawGroups) != "" && len(t.AllowedGroups) == 0 {
+			return nil, fmt.Errorf("%sALLOWED_GROUPS is set but names no groups", p)
+		}
+
 		targets = append(targets, t)
 	}
 
@@ -484,6 +503,19 @@ func parseUserHeaderFields(raw string) ([]UserHeaderField, error) {
 		return nil, fmt.Errorf("names no fields")
 	}
 	return fields, nil
+}
+
+// Admits reports whether someone in these groups may authorize for the target.
+func (t Target) Admits(groups []string) bool {
+	if len(t.AllowedGroups) == 0 {
+		return true
+	}
+	for _, g := range groups {
+		if slices.Contains(t.AllowedGroups, g) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasPerUserTargets reports whether the enrolment page has anything to offer.

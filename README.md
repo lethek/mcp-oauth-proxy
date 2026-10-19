@@ -216,6 +216,30 @@ Note also that rotating `ENCRYPTION_KEY` already invalidates every session; with
 per-user credentials stored it also destroys those, and everyone must enrol
 again.
 
+### Limiting a target to some groups
+
+By default everyone the provider admits can authorize for every target. A
+`static` target shares one credential among all of them, so that may be too
+wide. `..._ALLOWED_GROUPS` limits a target to members of at least one of the
+named groups, compared exactly, case included:
+
+```
+TARGET_QUICKBOOKS_ALLOWED_GROUPS=admins
+UPSTREAM_SCOPES=openid profile email groups
+```
+
+Groups come from the `groups` claim at the provider's userinfo endpoint, which
+must be an array of strings. Most providers send it only when the `groups`
+scope is requested, so add it to `UPSTREAM_SCOPES` and allow it on the
+provider's client. A caller outside the groups, or one whose groups cannot be
+read, gets `access_denied` at the end of the authorization flow and no token.
+
+The check runs when a client authorizes, not on every request or refresh.
+Removing someone from a group therefore takes effect when their session ends,
+at most `SESSION_TTL` later. To make it immediate, delete their rows from the
+`sessions` table (matched on `subject` and `resource`), which cascades to the
+tokens issued from them.
+
 ### Static upstream credentials
 
 By default the proxy forwards the provider's own token to the MCP server. Some
