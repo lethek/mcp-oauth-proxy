@@ -61,6 +61,10 @@ type harness struct {
 	// short, so the proxy has to.
 	hugeClaims atomic.Bool
 
+	// groups, when set, is sent as the userinfo groups claim. Unset sends no
+	// claim at all, the way a provider does when the scope was not requested.
+	groups atomic.Pointer[[]string]
+
 	// encodedRefusal makes that 401 carry a Content-Encoding, as a server behind
 	// a compressing layer would. Brotli rather than gzip on purpose: Go's
 	// transport negotiates and unwraps gzip by itself, so a gzip response never
@@ -165,7 +169,11 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"sub": "user-42", "preferred_username": "alice"})
+		claims := map[string]any{"sub": "user-42", "preferred_username": "alice"}
+		if g := h.groups.Load(); g != nil {
+			claims["groups"] = *g
+		}
+		writeJSON(w, http.StatusOK, claims)
 	})
 
 	// The same test server doubles as the MCP endpoint, so a request that gets

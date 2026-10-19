@@ -494,6 +494,16 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("callback: could not resolve the user; continuing without a subject", "err", err)
 	}
 
+	// Checked before any session exists, so a refused caller holds nothing. An
+	// identity that could not be resolved has no groups and is refused too.
+	if t := s.targetForFlow(flow); !t.Admits(identity.Groups) {
+		slog.Warn("callback: user is not in a group allowed for the target", "target", t.Name,
+			"subject", identity.Label(), "groups", identity.Groups, "allowed", t.AllowedGroups)
+		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "access_denied",
+			"your account is not allowed to use "+t.DisplayName)
+		return
+	}
+
 	sessionID := newSecret()
 	if err := s.persistToken(r.Context(), sessionID, identity.Subject, flow.Resource, tok, true); err != nil {
 		slog.Error("callback: could not store session", "err", err)

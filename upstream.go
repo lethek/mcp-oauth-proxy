@@ -347,6 +347,9 @@ type UserIdentity struct {
 	Subject string
 	// Display is preferred_username or email, for logs and the settings page.
 	Display string
+	// Groups is the groups claim, read for targets with ALLOWED_GROUPS. It is
+	// never sealed into the settings cookie.
+	Groups []string
 }
 
 // Label is the readable form, used only where a human reads it.
@@ -387,6 +390,9 @@ func (u *Upstream) Identity(ctx context.Context, accessToken string) (UserIdenti
 		Sub               string `json:"sub"`
 		PreferredUsername string `json:"preferred_username"`
 		Email             string `json:"email"`
+		// Raw, so a provider that sends groups in some other shape does not
+		// fail the whole sign-in for targets that never look at them.
+		Groups json.RawMessage `json:"groups"`
 	}
 	if err := json.Unmarshal(body, &claims); err != nil {
 		return UserIdentity{}, fmt.Errorf("userinfo response was not JSON: %w", err)
@@ -396,7 +402,17 @@ func (u *Upstream) Identity(ctx context.Context, accessToken string) (UserIdenti
 	if name == "" {
 		name = claims.Email
 	}
-	return identityFromClaims(claims.Sub, name)
+	id, err := identityFromClaims(claims.Sub, name)
+	if err != nil {
+		return id, err
+	}
+	// Anything but an array of strings counts as no groups, which refuses a
+	// restricted target rather than guessing at what the provider meant.
+	var groups []string
+	if json.Unmarshal(claims.Groups, &groups) == nil {
+		id.Groups = groups
+	}
+	return id, nil
 }
 
 // identityFromClaims turns the two claims that matter into an identity.
