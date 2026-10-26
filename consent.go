@@ -3,6 +3,7 @@ package main
 import (
 	"html/template"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -110,11 +111,29 @@ func renderConsent(w http.ResponseWriter, v consentView) {
 	// form-action has to name the provider as well as this origin. The browser
 	// applies it to every hop of the redirect chain a submission triggers, so
 	// listing only 'self' blocks the redirect to the provider that approval
-	// depends on, leaving the page apparently doing nothing.
+	// depends on, leaving the page apparently doing nothing. The client's
+	// redirect_uri is the last hop of both Cancel and Approve, so it is named too.
 	formAction := append([]string{"'self'"}, v.ProviderOrigins...)
+	if src := redirectSource(v.RedirectURI); src != "" {
+		formAction = append(formAction, src)
+	}
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'none'; style-src 'unsafe-inline'; form-action "+strings.Join(formAction, " ")+
 			"; frame-ancestors 'none'; base-uri 'none'")
 	w.WriteHeader(http.StatusOK)
 	_ = consentTemplate.Execute(w, v)
+}
+
+// redirectSource turns a registered redirect URI into a CSP source expression:
+// its origin for http and https, or a scheme-source such as "com.example.app:"
+// for a native app's private-use scheme, which has no origin.
+func redirectSource(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return ""
+	}
+	if u.Scheme == "http" || u.Scheme == "https" {
+		return canonicalOrigin(u)
+	}
+	return u.Scheme + ":"
 }
