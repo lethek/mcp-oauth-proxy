@@ -353,6 +353,8 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		CodeChallenge:    challenge,
 		UpstreamVerifier: newSecret(),
 		Resource:         res,
+		Target:           target.Name,
+		Stamp:            target.Stamp(),
 		BrowserSecret:    s.browserSecret(w, r),
 	}
 	if err := s.store.CreateFlow(r.Context(), flow); err != nil {
@@ -444,6 +446,14 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	target, ok := s.targetForFlow(flow)
+	if !ok {
+		slog.Warn("callback: the target changed while the user was authorizing", "target", flow.Target)
+		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "temporarily_unavailable",
+			"the server's configuration changed during sign-in; start again from your client")
+		return
+	}
+
 	// RFC 9207 section 2.4. iss is compared exactly, and a provider that says it
 	// sends iss must have sent it: otherwise a mix-up response with the parameter
 	// stripped would pass. Without discovery neither can be checked, so refuse
@@ -498,7 +508,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		// Asking whether the deployment has any per_user target anywhere refused
 		// logins for the static and provider_token targets beside it, which do
 		// not need a subject at all.
-		if s.targetForFlow(flow).Mode == CredPerUser {
+		if target.Mode == CredPerUser {
 			slog.Error("callback: could not resolve the user", "err", err)
 			s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error",
 				"the identity provider would not say who you are")
@@ -509,16 +519,16 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Checked before any session exists, so a refused caller holds nothing. An
 	// identity that could not be resolved has no groups and is refused too.
-	if t := s.targetForFlow(flow); !t.Admits(identity.Groups) {
-		slog.Warn("callback: user is not in a group allowed for the target", "target", t.Name,
-			"subject", identity.Label(), "groups", identity.Groups, "allowed", t.AllowedGroups)
+	if !target.Admits(identity.Groups) {
+		slog.Warn("callback: user is not in a group allowed for the target", "target", target.Name,
+			"subject", identity.Label(), "groups", identity.Groups, "allowed", target.AllowedGroups)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "access_denied",
-			"your account is not allowed to use "+t.DisplayName)
+			"your account is not allowed to use "+target.DisplayName)
 		return
 	}
 
 	sessionID := newSecret()
-	if err := s.persistToken(r.Context(), sessionID, identity.Subject, flow.Resource, tok, true); err != nil {
+	if err := s.createSession(r.Context(), sessionID, identity.Subject, flow.Resource, target, tok); err != nil {
 		slog.Error("callback: could not store session", "err", err)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error", "could not store the session")
 		return
@@ -555,18 +565,27 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, dest.String(), http.StatusFound)
 }
 
-// targetForFlow returns the target a flow was started for, resolved the same way
-// /authorize resolved it: an empty resource means the single unnamed target,
-// which is the only case where the parameter is optional. A resource that no
-// longer matches a target cannot arise from a flow /authorize accepted, so the
-// first target stands as the fallback there too.
-func (s *Server) targetForFlow(flow Flow) Target {
-	if flow.Resource != "" {
-		if t, ok := s.cfg.TargetByResource(flow.Resource); ok {
-			return t
+// targetForFlow returns the target a flow was started for, and whether the flow
+// is still good for it. A flow is refused when its resource names no target,
+// when a multi-target deployment received one with no resource, or when the
+// target's stamp is no longer the one /authorize resolved. There is no fallback
+// to the first target: with several, that hands the user a session for a server
+// they did not approve.
+func (s *Server) targetForFlow(flow Flow) (Target, bool) {
+	var t Target
+	switch {
+	case flow.Resource != "":
+		found, ok := s.cfg.TargetByResource(flow.Resource)
+		if !ok {
+			return Target{}, false
 		}
+		t = found
+	case s.cfg.MultiTarget():
+		return Target{}, false
+	default:
+		t = s.cfg.Targets[0]
 	}
-	return s.cfg.Targets[0]
+	return t, flow.Stamp != "" && flow.Stamp == t.Stamp()
 }
 
 func (s *Server) redirectErr(w http.ResponseWriter, r *http.Request, redirectURI, state, code, desc string) {
@@ -752,30 +771,40 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 // ---------- shared helpers ----------
 
-// persistToken seals the provider's token into the session. subject and resource
-// are set only on creation; a refresh updates the token and leaves both alone.
-func (s *Server) persistToken(ctx context.Context, sessionID, subject, resource string, tok UpstreamToken, create bool) error {
+// sealUpstreamToken seals the provider's token under the stamp of the target
+// the session is for.
+func (s *Server) sealUpstreamToken(stamp string, tok UpstreamToken) ([]byte, error) {
 	raw, err := json.Marshal(tok)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	sealed, err := s.sealer.seal(purposeUpstreamToken, raw)
+	return s.sealer.seal(boundPurpose(purposeUpstreamToken, stamp), raw)
+}
+
+func (s *Server) createSession(ctx context.Context, sessionID, subject, resource string, target Target, tok UpstreamToken) error {
+	stamp := target.Stamp()
+	sealed, err := s.sealUpstreamToken(stamp, tok)
 	if err != nil {
 		return err
 	}
-	if create {
-		return s.store.CreateSession(ctx, sessionID, subject, resource, sealed)
-	}
-	return s.store.UpdateSessionToken(ctx, sessionID, sealed)
+	return s.store.CreateSession(ctx, sessionID, subject, resource, target.Name, stamp, sealed)
 }
 
-func (s *Server) loadToken(ctx context.Context, sessionID string) (UpstreamToken, error) {
+func (s *Server) updateSessionToken(ctx context.Context, sessionID, stamp string, tok UpstreamToken) error {
+	sealed, err := s.sealUpstreamToken(stamp, tok)
+	if err != nil {
+		return err
+	}
+	return s.store.UpdateSessionToken(ctx, sessionID, stamp, sealed)
+}
+
+func (s *Server) loadToken(ctx context.Context, sessionID, stamp string) (UpstreamToken, error) {
 	var tok UpstreamToken
-	sealed, err := s.store.SessionToken(ctx, sessionID)
+	sealed, err := s.store.SessionToken(ctx, sessionID, stamp)
 	if err != nil {
 		return tok, err
 	}
-	raw, err := s.sealer.open(purposeUpstreamToken, sealed)
+	raw, err := s.sealer.open(boundPurpose(purposeUpstreamToken, stamp), sealed)
 	if err != nil {
 		return tok, errors.New("stored token could not be decrypted; the encryption key may have changed")
 	}

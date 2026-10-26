@@ -274,8 +274,8 @@ func expiredSession(t *testing.T, h *harness) string {
 		RefreshToken: "stale-refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
-	if err := h.srv.persistToken(context.Background(), sessionID, "subject",
-		h.srv.cfg.Targets[0].Resource, expired, true); err != nil {
+	if err := h.srv.createSession(context.Background(), sessionID, "subject",
+		h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired); err != nil {
 		t.Fatal(err)
 	}
 	return sessionID
@@ -291,7 +291,7 @@ func TestRefreshedUpstreamTokenSurvivesATransientPersistFailure(t *testing.T) {
 	injectTransientFailure(t, h.srv.store, "UPDATE", "sessions", 2)
 
 	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-	tok, err := h.srv.currentUpstreamToken(req, sessionID)
+	tok, err := h.srv.currentUpstreamToken(req, sessionID, h.srv.cfg.Targets[0].Stamp())
 	if err != nil {
 		t.Fatalf("the request that obtained the fresh token failed: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestRefreshedUpstreamTokenSurvivesATransientPersistFailure(t *testing.T) {
 
 	// The point of the retry: the rotated pair reached the store, so a later
 	// refresh has a token the provider will still honour.
-	stored, err := h.srv.loadToken(context.Background(), sessionID)
+	stored, err := h.srv.loadToken(context.Background(), sessionID, h.srv.cfg.Targets[0].Stamp())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +324,7 @@ func TestRefreshFailsWhenTheRotatedTokenCannotBePersisted(t *testing.T) {
 	injectFailure(t, h.srv.store, "UPDATE", "sessions")
 
 	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-	if _, err := h.srv.currentUpstreamToken(req, sessionID); err == nil {
+	if _, err := h.srv.currentUpstreamToken(req, sessionID, h.srv.cfg.Targets[0].Stamp()); err == nil {
 		t.Fatal("the refresh reported success after the rotated token was lost")
 	}
 }

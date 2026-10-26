@@ -62,6 +62,12 @@ const (
 	purposeSettingsSession = "settings-session"
 )
 
+// boundPurpose ties a sealed value to the stamp of the target it was made for.
+// The sealer authenticates the purpose string, so a value sealed under one stamp
+// cannot be opened under another, and a replica that predates stamps, which
+// opens with the plain purpose, cannot open it at all.
+func boundPurpose(purpose, stamp string) string { return purpose + "\x00" + stamp }
+
 // seal encrypts plaintext and prefixes the nonce, so the result is
 // self-contained and safe to store as a single opaque column.
 func (s *sealer) seal(purpose string, plaintext []byte) ([]byte, error) {

@@ -1143,7 +1143,7 @@ func TestRefreshAbortsWhenTheSessionIsRevokedWhileWaiting(t *testing.T) {
 		RefreshToken: "stale-refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
-	if err := h.srv.persistToken(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, expired, true); err != nil {
+	if err := h.srv.createSession(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1159,7 +1159,7 @@ func TestRefreshAbortsWhenTheSessionIsRevokedWhileWaiting(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-		tok, err := h.srv.currentUpstreamToken(req, sessionID)
+		tok, err := h.srv.currentUpstreamToken(req, sessionID, h.srv.cfg.Targets[0].Stamp())
 		done <- result{tok, err}
 	}()
 

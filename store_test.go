@@ -46,7 +46,7 @@ func newTestStore(t *testing.T) *Store {
 func mustSession(t *testing.T, s *Store) string {
 	t.Helper()
 	id := newSecret()
-	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", []byte("sealed")); err != nil {
+	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", "test", "config:test", []byte("sealed")); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	return id
@@ -143,7 +143,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.LookupAccessToken(ctx, access); err != nil {
+	if _, err := s.LookupAccessToken(ctx, access); err != nil {
 		t.Fatalf("access token should work before revocation: %v", err)
 	}
 
@@ -151,7 +151,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token after revocation: err = %v, want ErrNotFound", err)
 	}
 	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); !errors.Is(err, ErrNotFound) {
@@ -160,7 +160,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 	if _, err := s.TakeAuthCode(ctx, code); !errors.Is(err, ErrNotFound) {
 		t.Errorf("auth code after revocation: err = %v, want ErrNotFound", err)
 	}
-	if _, err := s.SessionToken(ctx, session); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SessionToken(ctx, session, "config:test"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("session after revocation: err = %v, want ErrNotFound", err)
 	}
 }
@@ -225,7 +225,7 @@ func TestExpiredCredentialsAreRefused(t *testing.T) {
 	if err := s.CreateAccessToken(ctx, access, session, "c1", -time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expired access token: err = %v, want ErrNotFound", err)
 	}
 
@@ -261,13 +261,13 @@ func TestSessionLifetimeOutranksTokenLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token outlived its session: err = %v, want ErrNotFound", err)
 	}
 	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); errors.Is(err, nil) {
 		t.Error("refresh succeeded against a session past its absolute lifetime")
 	}
-	if _, err := s.SessionToken(ctx, session); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SessionToken(ctx, session, "config:test"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("SessionToken on an over-age session: err = %v, want ErrNotFound", err)
 	}
 }
@@ -319,14 +319,52 @@ func TestSweepClearsAbandonedSessionsAndClients(t *testing.T) {
 		t.Fatalf("Sweep: %v", err)
 	}
 
-	if _, err := s.SessionToken(ctx, abandoned); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SessionToken(ctx, abandoned, "config:test"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("abandoned session survived the sweep: err = %v", err)
 	}
-	if _, err := s.SessionToken(ctx, live); err != nil {
+	if _, err := s.SessionToken(ctx, live, "config:test"); err != nil {
 		t.Errorf("session with a live token was swept: %v", err)
 	}
 	if _, err := s.GetClient(ctx, unused.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unused client survived the sweep: err = %v", err)
+	}
+}
+
+func TestEmptyStampSessionsAreRefused(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	id := newSecret()
+	if err := s.CreateSession(ctx, id, "sub", "https://p/mcp", "", "", []byte("sealed")); err != nil {
+		t.Fatal(err)
+	}
+	access := newSecret()
+	if err := s.CreateAccessToken(ctx, access, id, "client", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+		t.Errorf("empty-stamp session was honoured: %v", err)
+	}
+	if _, err := s.SessionToken(ctx, id, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("empty stamp read a token: %v", err)
+	}
+}
+
+func TestSessionTokenRequiresTheSessionsStamp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := newSecret()
+	if err := s.CreateSession(ctx, id, "sub", "r", "plane", "config:a", []byte("sealed")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SessionToken(ctx, id, "config:a"); err != nil {
+		t.Fatalf("matching stamp: %v", err)
+	}
+	if _, err := s.SessionToken(ctx, id, "config:b"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a different stamp read the token: %v", err)
+	}
+	if err := s.UpdateSessionToken(ctx, id, "config:b", []byte("x")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a different stamp wrote the token: %v", err)
 	}
 }
 
@@ -335,7 +373,7 @@ func TestUpdateSessionTokenReportsAVanishedSession(t *testing.T) {
 	ctx := context.Background()
 	session := mustSession(t, s)
 
-	if err := s.UpdateSessionToken(ctx, session, []byte("still here")); err != nil {
+	if err := s.UpdateSessionToken(ctx, session, "config:test", []byte("still here")); err != nil {
 		t.Fatalf("update on a live session: %v", err)
 	}
 
@@ -345,7 +383,7 @@ func TestUpdateSessionTokenReportsAVanishedSession(t *testing.T) {
 	if err := s.RevokeSession(ctx, session); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateSessionToken(ctx, session, []byte("gone")); !errors.Is(err, ErrNotFound) {
+	if err := s.UpdateSessionToken(ctx, session, "config:test", []byte("gone")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("update on a revoked session: err = %v, want ErrNotFound", err)
 	}
 }

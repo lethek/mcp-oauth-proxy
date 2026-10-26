@@ -156,3 +156,24 @@ func TestSealIsBoundToItsPurpose(t *testing.T) {
 		t.Errorf("its own purpose failed to open: %v", err)
 	}
 }
+
+func TestBoundPurposeTiesAValueToItsStamp(t *testing.T) {
+	s, err := newSealer(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := s.seal(boundPurpose(purposeUpstreamToken, "config:a"), []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.open(boundPurpose(purposeUpstreamToken, "config:a"), sealed); err != nil {
+		t.Fatalf("same stamp: %v", err)
+	}
+	if _, err := s.open(boundPurpose(purposeUpstreamToken, "config:b"), sealed); err == nil {
+		t.Error("opened under a different stamp")
+	}
+	// What a replica that predates stamps would do.
+	if _, err := s.open(purposeUpstreamToken, sealed); err == nil {
+		t.Error("opened under the plain purpose; an older replica would not fail closed")
+	}
+}
