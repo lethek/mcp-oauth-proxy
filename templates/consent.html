@@ -1,0 +1,41 @@
+{{define "title"}}Allow {{.ClientName}}?{{end}}
+{{define "content"}}
+<main class="card">
+  <p class="eyebrow">Access request</p>
+  <h1>Allow {{.ClientName}} to access {{.TargetName}}?</h1>
+  <p class="lede">If you approve, it can do anything your account can do there.</p>
+
+  <div class="facts">
+    <dl>
+      <div>
+        <dt>Application</dt>
+        <dd>{{.ClientName}}</dd>
+      </div>
+      <div>
+        <dt>Sends you back to</dt>
+        <dd class="mono">{{.RedirectURI}}</dd>
+      </div>
+    </dl>
+    <details>
+      <summary>Technical details</summary>
+      <p class="mono">Client ID: {{.ClientID}}</p>
+    </details>
+  </div>
+
+  <div class="callout" role="note">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5M12 18h.01"/></svg>
+    <p>Anyone can register an application here, and its name is whatever it chose to
+    call itself. Approve only if you just started this yourself and the address
+    above is the one you expect.</p>
+  </div>
+
+  <form method="POST" action="{{.ConsentPath}}">
+    <input type="hidden" name="flow_id" value="{{.FlowID}}">
+    <div class="actions">
+      <button type="submit" name="decision" value="deny" class="btn">Cancel</button>
+      <button type="submit" name="decision" value="approve" class="btn btn-primary">Allow access</button>
+    </div>
+  </form>
+</main>
+<p class="fine">After you allow access you will be asked to sign in with your identity provider.</p>
+{{end}}

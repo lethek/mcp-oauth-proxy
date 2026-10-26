@@ -1,0 +1,46 @@
+{{define "title"}}Your credentials{{end}}
+{{define "content"}}
+<header class="page-head">
+  <h1>Your credentials</h1>
+  <p class="lede">Some servers behind this proxy need a credential of your own, such as a
+  personal access token. Save yours here and it is used whenever your apps call that server.</p>
+</header>
+
+<div class="account">
+  <span><span class="muted">Signed in as</span> <strong>{{.Subject}}</strong></span>
+  <form method="post" action="/settings/logout">
+    <button type="submit" class="btn btn-sm">Sign out</button>
+  </form>
+</div>
+<p class="fine">Signing out ends this page's session only. If you are still signed in at
+your identity provider, you will be signed straight back in.</p>
+
+{{if .Notice}}<p class="banner" role="status">{{if eq .Notice "saved"}}Credential saved.{{else}}Credential removed.{{end}}</p>{{end}}
+
+{{if not .Targets}}<div class="card empty"><p>No server on this proxy asks for a credential of your own.</p></div>{{end}}
+{{range .Targets}}{{$name := .Name}}
+<section class="card">
+  <div class="card-head">
+    <h2>{{.Display}}</h2>
+    {{if .Enrolled}}<span class="pill pill-ok">Configured</span>{{else}}<span class="pill">Not configured</span>{{end}}
+  </div>
+  {{if .Enrolled}}<p class="muted">Last updated {{.UpdatedAt}}. Saved values are never shown again, so enter a new one to replace it.</p>
+  {{else}}<p class="muted">Requests to this server are refused until you save a credential.</p>{{end}}
+  <form method="post" action="/settings">
+    <input type="hidden" name="target" value="{{$name}}">
+    {{range .Fields}}
+    <div class="field">
+      <label for="cred-{{$name}}-{{.Header}}">{{.Label}}</label>
+      <input class="input" type="text" id="cred-{{$name}}-{{.Header}}" name="field_{{.Header}}" autocomplete="off" spellcheck="false" required>
+      {{if .Prefix}}<p class="hint">Paste the value only. The prefix is added for you.</p>{{end}}
+    </div>
+    {{end}}
+    <div class="row">
+      <button type="submit" name="action" value="save" class="btn btn-primary">{{if .Enrolled}}Replace credential{{else}}Save credential{{end}}</button>
+      {{/* formnovalidate: every field is required, so without it the browser blocks Remove until a new value is typed. */}}
+      {{if .Enrolled}}<button type="submit" name="action" value="clear" class="btn btn-danger" formnovalidate>Remove</button>{{end}}
+    </div>
+  </form>
+</section>
+{{end}}
+{{end}}

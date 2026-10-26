@@ -11,6 +11,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY *.go ./
+COPY templates ./templates
 ARG VERSION=dev
 # BuildKit supplies these per requested platform.
 ARG TARGETOS
