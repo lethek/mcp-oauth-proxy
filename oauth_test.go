@@ -1528,6 +1528,41 @@ func TestConsentCSPAllowsTheProviderRedirect(t *testing.T) {
 	}
 }
 
+// TestConsentCSPAllowsTheClientRedirect covers the last hop of the same chain.
+// Cancel redirects straight to the client's redirect_uri, and approval ends
+// there too once the provider and /callback have bounced the browser along.
+// With the client unlisted, Chrome blocked both in a real browser with the same
+// "violates ... form-action" error, so the client never heard back.
+func TestConsentCSPAllowsTheClientRedirect(t *testing.T) {
+	h := newHarness(t)
+
+	for _, tc := range []struct{ redirect, want string }{
+		{"http://127.0.0.1:9999/cb", "http://127.0.0.1:9999"},
+		{"https://Client.Example:443/oauth/cb?x=1", "https://client.example"},
+		// A private-use scheme has no origin, so it is named as a scheme-source.
+		{"com.example.app:/oauth/cb", "com.example.app:"},
+	} {
+		clientID := h.register(tc.redirect)
+		resp := h.get(h.authorizeURL(clientID, tc.redirect, s256("v")))
+		resp.Body.Close()
+
+		csp := resp.Header.Get("Content-Security-Policy")
+		var formAction []string
+		for _, d := range strings.Split(csp, ";") {
+			if f := strings.Fields(d); len(f) > 0 && f[0] == "form-action" {
+				formAction = f[1:]
+			}
+		}
+		if !slices.Contains(formAction, tc.want) {
+			t.Errorf("redirect_uri %q: form-action %v does not name %q, so the browser blocks the redirect back to the client.\nCSP: %s",
+				tc.redirect, formAction, tc.want, csp)
+		}
+		if !slices.Contains(formAction, "'self'") || !slices.Contains(formAction, h.provider.URL) {
+			t.Errorf("redirect_uri %q: form-action %v lost 'self' or the provider", tc.redirect, formAction)
+		}
+	}
+}
+
 func TestFormActionOriginsPrefersTheDiscoveredEndpoint(t *testing.T) {
 	h := newHarness(t)
 
