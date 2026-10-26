@@ -23,6 +23,8 @@ type upstreamMeta struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
 	UserinfoEndpoint      string `json:"userinfo_endpoint"`
+
+	IssParameterSupported bool `json:"authorization_response_iss_parameter_supported"`
 }
 
 // UpstreamToken is what the provider hands back, and what we store encrypted.

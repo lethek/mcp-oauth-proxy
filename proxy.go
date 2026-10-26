@@ -241,6 +241,8 @@ var upstreamAllowedHeaders = map[string]bool{
 	"Content-Type":         true,
 	"Content-Length":       true,
 	"Last-Event-Id":        true,
+	"Mcp-Method":           true,
+	"Mcp-Name":             true,
 	"Mcp-Protocol-Version": true,
 	"Mcp-Session-Id":       true,
 	"User-Agent":           true,
