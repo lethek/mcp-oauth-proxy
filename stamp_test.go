@@ -75,3 +75,11 @@ func TestStampEncodingIsUnambiguous(t *testing.T) {
 		t.Error("different definitions encode to the same stamp")
 	}
 }
+
+func TestStampDistinguishesInvalidUTF8(t *testing.T) {
+	a := Target{Name: "a", UpstreamMCP: "https://x.example/p\xff"}
+	b := Target{Name: "a", UpstreamMCP: "https://x.example/p\xfe"}
+	if a.Stamp() == b.Stamp() {
+		t.Error("URLs differing only in invalid bytes share a stamp")
+	}
+}
