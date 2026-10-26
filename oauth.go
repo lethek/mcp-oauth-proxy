@@ -173,19 +173,20 @@ func (s *Server) handleAuthorizationServerMetadata(w http.ResponseWriter, r *htt
 	writeJSON(w, http.StatusOK, map[string]any{
 		// Clients decide between a metadata document and dynamic registration on
 		// this flag, so it has to reflect what is actually accepted.
-		"client_id_metadata_document_supported":      s.cfg.CIMDEnabled,
-		"issuer":                                     s.cfg.PublicURL,
-		"authorization_endpoint":                     s.cfg.PublicURL + "/authorize",
-		"token_endpoint":                             s.cfg.PublicURL + "/token",
-		"registration_endpoint":                      s.cfg.PublicURL + "/register",
-		"revocation_endpoint":                        s.cfg.PublicURL + "/revoke",
-		"response_types_supported":                   []string{"code"},
-		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":           []string{"S256"},
-		"token_endpoint_auth_methods_supported":      []string{"none"},
-		"revocation_endpoint_auth_methods_supported": []string{"none"},
-		"scopes_supported":                           []string{"mcp"},
-		"resource_parameter_supported":               true,
+		"client_id_metadata_document_supported":          s.cfg.CIMDEnabled,
+		"issuer":                                         s.cfg.PublicURL,
+		"authorization_endpoint":                         s.cfg.PublicURL + "/authorize",
+		"token_endpoint":                                 s.cfg.PublicURL + "/token",
+		"registration_endpoint":                          s.cfg.PublicURL + "/register",
+		"revocation_endpoint":                            s.cfg.PublicURL + "/revoke",
+		"response_types_supported":                       []string{"code"},
+		"grant_types_supported":                          []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":               []string{"S256"},
+		"token_endpoint_auth_methods_supported":          []string{"none"},
+		"revocation_endpoint_auth_methods_supported":     []string{"none"},
+		"scopes_supported":                               []string{"mcp"},
+		"resource_parameter_supported":                   true,
+		"authorization_response_iss_parameter_supported": true,
 	})
 }
 

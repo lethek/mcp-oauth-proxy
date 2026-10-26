@@ -47,6 +47,23 @@ func TestPrepareUpstreamHeaders(t *testing.T) {
 		}
 	})
 
+	// The 2026-07-28 transport requires these on every request so gateways can
+	// route without parsing the body.
+	t.Run("MCP routing headers reach the upstream", func(t *testing.T) {
+		r := httptest.NewRequest("POST", "/mcp", nil)
+		r.Header.Set("Mcp-Method", "tools/call")
+		r.Header.Set("Mcp-Name", "list_issues")
+
+		prepareUpstreamHeaders(r, nil)
+
+		if got := r.Header.Get("Mcp-Method"); got != "tools/call" {
+			t.Errorf("Mcp-Method = %q, want tools/call", got)
+		}
+		if got := r.Header.Get("Mcp-Name"); got != "list_issues" {
+			t.Errorf("Mcp-Name = %q, want list_issues", got)
+		}
+	})
+
 	t.Run("token mode reports unsettled and clears the caller's token", func(t *testing.T) {
 		r := httptest.NewRequest("POST", "/mcp", nil)
 		r.Header.Set("Authorization", "Bearer caller-token")

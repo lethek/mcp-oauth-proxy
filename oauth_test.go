@@ -16,6 +16,23 @@ import (
 	"time"
 )
 
+// The proxy always sends iss on authorization responses, so the metadata must
+// say so; 2026-07-28 clients look for the flag.
+func TestMetadataAdvertisesIssParameter(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.get(h.proxy.URL + "/.well-known/oauth-authorization-server")
+	defer resp.Body.Close()
+	var meta map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta["authorization_response_iss_parameter_supported"] != true {
+		t.Errorf("authorization_response_iss_parameter_supported = %v, want true",
+			meta["authorization_response_iss_parameter_supported"])
+	}
+}
+
 // harness wires a proxy against a stub OAuth provider, both on loopback.
 type harness struct {
 	t *testing.T
