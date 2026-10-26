@@ -384,11 +384,11 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	if !s.sameOrigin(r) {
 		slog.Warn("consent: cross-origin submission refused", "origin", r.Header.Get("Origin"))
-		http.Error(w, "This request did not come from the authorization page.", http.StatusForbidden)
+		renderError(w, http.StatusForbidden, "Request blocked", "This request did not come from the authorization page. Start again from your app.")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Malformed form submission.", http.StatusBadRequest)
+		renderError(w, http.StatusBadRequest, "Could not read the form", "The form submission was malformed. Start again from your app.")
 		return
 	}
 	flowID := r.PostForm.Get("flow_id")
@@ -401,7 +401,7 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 		// path either and there is no reason to have two different rules.
 		flow, err := s.store.TakeFlow(r.Context(), flowID, binding)
 		if err != nil {
-			http.Error(w, "This authorization request has expired. Start again from your client.", http.StatusBadRequest)
+			renderError(w, http.StatusBadRequest, "This request has expired", "Start again from the app you were using.")
 			return
 		}
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "access_denied", "the user declined the request")
@@ -414,7 +414,8 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	flow, err := s.store.ApproveFlow(r.Context(), flowID, binding)
 	if err != nil {
 		slog.Warn("consent: approval refused", "flow_bound", binding != "")
-		http.Error(w, "This authorization request has expired, was already used, or was not the one shown in this browser. Start again from your client.", http.StatusBadRequest)
+		renderError(w, http.StatusBadRequest, "This request can't be approved",
+			"It has expired, was already used, or was not the one shown in this browser. Start again from the app you were using.")
 		return
 	}
 
@@ -439,7 +440,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Without a flow we have no registered redirect_uri to send the user back
 		// to, so this has to terminate here.
-		http.Error(w, "This authorization request has expired or was already used. Start again from your client.", http.StatusBadRequest)
+		renderError(w, http.StatusBadRequest, "This request has expired", "It has expired or was already used. Start again from the app you were using.")
 		return
 	}
 
@@ -538,7 +539,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	dest, err := url.Parse(flow.RedirectURI)
 	if err != nil {
 		slog.Error("callback: stored redirect_uri no longer parses", "err", err)
-		http.Error(w, "The registered redirect address is unusable.", http.StatusBadRequest)
+		renderError(w, http.StatusBadRequest, "Could not return to the app", "The app's registered return address is not usable. Contact the app's developer.")
 		return
 	}
 	rq := dest.Query()

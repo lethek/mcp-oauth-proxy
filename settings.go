@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -87,7 +86,7 @@ func (s *Server) clearIdentity(w http.ResponseWriter) {
 
 func (s *Server) handleSettingsLogout(w http.ResponseWriter, r *http.Request) {
 	if !s.sameOrigin(r) {
-		http.Error(w, "This request did not come from the settings page.", http.StatusForbidden)
+		renderSettingsError(w, http.StatusForbidden, "Request blocked", "This request did not come from the settings page.")
 		return
 	}
 	s.clearIdentity(w)
@@ -106,7 +105,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	enrolled, err := s.store.EnrolledTargets(r.Context(), identity.Subject)
 	if err != nil {
 		slog.Error("settings: could not read enrolments", "err", err)
-		http.Error(w, "Could not read your saved credentials.", http.StatusInternalServerError)
+		renderError(w, http.StatusInternalServerError, "Something went wrong", "Your saved credentials could not be read. Try again in a moment.")
 		return
 	}
 
@@ -131,7 +130,7 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 	meta, err := s.upstream.Meta(r.Context())
 	if err != nil {
 		slog.Error("settings: provider discovery failed", "err", err)
-		http.Error(w, "The identity provider is not reachable.", http.StatusBadGateway)
+		renderError(w, http.StatusBadGateway, "Sign-in unavailable", "The identity provider could not be reached. Try again in a moment.")
 		return
 	}
 
@@ -139,13 +138,13 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 	verifier := newSecret()
 	if err := s.store.CreateSettingsFlow(r.Context(), flowID, verifier, s.browserSecret(w, r)); err != nil {
 		slog.Error("settings: could not start a login", "err", err)
-		http.Error(w, "Could not start the sign-in.", http.StatusInternalServerError)
+		renderError(w, http.StatusInternalServerError, "Something went wrong", "The sign-in could not be started. Try again in a moment.")
 		return
 	}
 
 	dest, err := url.Parse(meta.AuthorizationEndpoint)
 	if err != nil {
-		http.Error(w, "The identity provider's authorization endpoint is unusable.", http.StatusBadGateway)
+		renderError(w, http.StatusBadGateway, "Sign-in unavailable", "The identity provider's sign-in address is not usable. Contact the administrator of this proxy.")
 		return
 	}
 	q := dest.Query()
@@ -166,18 +165,18 @@ func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) 
 
 	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r))
 	if err != nil {
-		http.Error(w, "This sign-in has expired or was already used. Open the settings page again.", http.StatusBadRequest)
+		renderSettingsError(w, http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the settings page again to sign in.")
 		return
 	}
 	if e := q.Get("error"); e != "" {
-		http.Error(w, "The identity provider refused the sign-in: "+e, http.StatusForbidden)
+		renderSettingsError(w, http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
 		return
 	}
 
 	tok, err := s.upstream.ExchangeWithRedirect(r.Context(), q.Get("code"), verifier, s.settingsRedirectURI())
 	if err != nil {
 		slog.Error("settings: upstream exchange failed", "err", err)
-		http.Error(w, "The identity provider rejected the sign-in.", http.StatusBadGateway)
+		renderSettingsError(w, http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
 		return
 	}
 
@@ -185,13 +184,13 @@ func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) 
 	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
 		slog.Error("settings: could not resolve the user", "err", err)
-		http.Error(w, "The identity provider would not say who you are, so credentials cannot be stored.", http.StatusBadGateway)
+		renderSettingsError(w, http.StatusBadGateway, "Sign-in failed", "The identity provider would not say who you are, so credentials cannot be stored.")
 		return
 	}
 
 	if err := s.setIdentity(w, identity); err != nil {
 		slog.Error("settings: could not set the session cookie", "err", err)
-		http.Error(w, "Could not start your session.", http.StatusInternalServerError)
+		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "Your session could not be started. Try again.")
 		return
 	}
 	slog.Info("settings: signed in", "subject", identity.Label())
@@ -203,7 +202,7 @@ func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	if !s.sameOrigin(r) {
 		slog.Warn("settings: cross-origin submission refused", "origin", r.Header.Get("Origin"))
-		http.Error(w, "This request did not come from the settings page.", http.StatusForbidden)
+		renderSettingsError(w, http.StatusForbidden, "Request blocked", "This request did not come from the settings page.")
 		return
 	}
 	identity := s.identityFrom(r)
@@ -212,7 +211,7 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Malformed form submission.", http.StatusBadRequest)
+		renderSettingsError(w, http.StatusBadRequest, "Could not read the form", "The form submission was malformed. Go back and try again.")
 		return
 	}
 
@@ -226,14 +225,14 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if target.Name == "" {
-		http.Error(w, "Unknown target.", http.StatusBadRequest)
+		renderSettingsError(w, http.StatusBadRequest, "Unknown server", "That server is not one this proxy keeps personal credentials for.")
 		return
 	}
 
 	if r.PostForm.Get("action") == "clear" {
 		if err := s.store.DeleteUserCredential(r.Context(), identity.Subject, target.Name); err != nil {
 			slog.Error("settings: could not clear the credential", "err", err, "target", target.Name)
-			http.Error(w, "Could not clear the credential.", http.StatusInternalServerError)
+			renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be removed. Try again.")
 			return
 		}
 		slog.Info("settings: credential cleared", "subject", identity.Label(), "target", target.Name)
@@ -245,11 +244,11 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	for _, f := range target.UserFields {
 		v := strings.TrimSpace(r.PostForm.Get("field_" + f.Header))
 		if v == "" {
-			http.Error(w, "Every field is required: "+f.Label+" was empty.", http.StatusBadRequest)
+			renderSettingsError(w, http.StatusBadRequest, "A field was empty", "Every field is required, and "+f.Label+" was empty.")
 			return
 		}
 		if len(v) > maxCredentialValue {
-			http.Error(w, f.Label+" is too long.", http.StatusBadRequest)
+			renderSettingsError(w, http.StatusBadRequest, "A value is too long", f.Label+" is too long.")
 			return
 		}
 		// Rejected here rather than on the way out. A control character survives
@@ -257,7 +256,7 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		// give this user a 502 on every subsequent call with nothing on screen to
 		// explain it, and a stored row that can only ever fail.
 		if !httpguts.ValidHeaderFieldValue(f.Prefix + v) {
-			http.Error(w, f.Label+" contains characters that are not allowed in an HTTP header.", http.StatusBadRequest)
+			renderSettingsError(w, http.StatusBadRequest, "A value is not valid", f.Label+" contains characters that are not allowed in an HTTP header. Check that you pasted only the token.")
 			return
 		}
 		headers[f.Header] = f.Prefix + v
@@ -265,18 +264,18 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 
 	raw, err := json.Marshal(headers)
 	if err != nil {
-		http.Error(w, "Could not store the credential.", http.StatusInternalServerError)
+		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
 	sealed, err := s.sealer.seal(purposeUserCredential, raw)
 	if err != nil {
 		slog.Error("settings: could not seal the credential", "err", err)
-		http.Error(w, "Could not store the credential.", http.StatusInternalServerError)
+		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
 	if err := s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, sealed); err != nil {
 		slog.Error("settings: could not store the credential", "err", err, "target", target.Name)
-		http.Error(w, "Could not store the credential.", http.StatusInternalServerError)
+		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
 
@@ -324,60 +323,57 @@ type settingsView struct {
 	Targets []targetRow
 }
 
-var settingsTemplate = template.Must(template.New("settings").Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP credentials</title>
-<style>
- body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.5}
- h1{font-size:1.4rem} h2{font-size:1.1rem;margin-bottom:.25rem}
- .card{border:1px solid #ccc;border-radius:.5rem;padding:1rem;margin:1rem 0}
- .state{color:#555;font-size:.9rem;margin-top:0}
- label{display:block;margin:.75rem 0 .25rem;font-size:.9rem}
- input[type=text]{width:100%;padding:.5rem;box-sizing:border-box}
- button{padding:.5rem 1rem;margin-top:.75rem}
- .notice{background:#eef;border:1px solid #99c;padding:.5rem 1rem;border-radius:.5rem}
- .who{color:#555;font-size:.9rem}
-</style></head><body>
-<h1>MCP credentials</h1>
-<p class="who">Signed in as {{.Subject}}
-  <form method="post" action="/settings/logout" style="display:inline">
-    <button type="submit">Sign out</button>
-  </form>
-</p>
-<p class="who">Signing out clears this page's session only. An active session at
-the identity provider will sign you straight back in.</p>
-{{if .Notice}}<p class="notice">{{if eq .Notice "saved"}}Credential saved.{{else}}Credential cleared.{{end}}</p>{{end}}
-{{if not .Targets}}<p>No target on this proxy asks for a credential of your own.</p>{{end}}
-{{range .Targets}}
-<div class="card">
-  <h2>{{.Display}}</h2>
-  {{if .Enrolled}}<p class="state">Configured, last updated {{.UpdatedAt}}.</p>
-  {{else}}<p class="state">Not configured. This target will refuse your requests until you set one.</p>{{end}}
-  <form method="post" action="/settings">
-    <input type="hidden" name="target" value="{{.Name}}">
-    {{range .Fields}}
-    <label for="{{$.Subject}}-{{.Header}}">{{.Label}}</label>
-    <input type="text" id="{{$.Subject}}-{{.Header}}" name="field_{{.Header}}" autocomplete="off" spellcheck="false" required>
-    {{end}}
-    <button type="submit" name="action" value="save">{{if .Enrolled}}Replace{{else}}Save{{end}}</button>
-    {{if .Enrolled}}<button type="submit" name="action" value="clear">Clear</button>{{end}}
+// Remove carries formnovalidate. Every field is required, so without it the
+// browser refuses to submit the form until the person has typed a new value,
+// which makes removing a credential impossible without first replacing it.
+var settingsTemplate = newPage(`{{define "title"}}Your credentials{{end}}
+{{define "content"}}
+<header class="page-head">
+  <h1>Your credentials</h1>
+  <p class="lede">Some servers behind this proxy need a credential of your own, such as a
+  personal access token. Save yours here and it is used whenever your apps call that server.</p>
+</header>
+
+<div class="account">
+  <span><span class="muted">Signed in as</span> <strong>{{.Subject}}</strong></span>
+  <form method="post" action="/settings/logout">
+    <button type="submit" class="btn btn-sm">Sign out</button>
   </form>
 </div>
+<p class="fine">Signing out ends this page's session only. If you are still signed in at
+your identity provider, you will be signed straight back in.</p>
+
+{{if .Notice}}<p class="banner" role="status">{{if eq .Notice "saved"}}Credential saved.{{else}}Credential removed.{{end}}</p>{{end}}
+
+{{if not .Targets}}<div class="card empty"><p>No server on this proxy asks for a credential of your own.</p></div>{{end}}
+{{range .Targets}}{{$name := .Name}}
+<section class="card">
+  <div class="card-head">
+    <h2>{{.Display}}</h2>
+    {{if .Enrolled}}<span class="pill pill-ok">Configured</span>{{else}}<span class="pill">Not configured</span>{{end}}
+  </div>
+  {{if .Enrolled}}<p class="muted">Last updated {{.UpdatedAt}}. Saved values are never shown again, so enter a new one to replace it.</p>
+  {{else}}<p class="muted">Requests to this server are refused until you save a credential.</p>{{end}}
+  <form method="post" action="/settings">
+    <input type="hidden" name="target" value="{{$name}}">
+    {{range .Fields}}
+    <div class="field">
+      <label for="cred-{{$name}}-{{.Header}}">{{.Label}}</label>
+      <input class="input" type="text" id="cred-{{$name}}-{{.Header}}" name="field_{{.Header}}" autocomplete="off" spellcheck="false" required>
+      {{if .Prefix}}<p class="hint">Paste the value only. The prefix is added for you.</p>{{end}}
+    </div>
+    {{end}}
+    <div class="row">
+      <button type="submit" name="action" value="save" class="btn btn-primary">{{if .Enrolled}}Replace credential{{else}}Save credential{{end}}</button>
+      {{if .Enrolled}}<button type="submit" name="action" value="clear" class="btn btn-danger" formnovalidate>Remove</button>{{end}}
+    </div>
+  </form>
+</section>
 {{end}}
-</body></html>`))
+{{end}}`)
 
 func renderSettings(w http.ResponseWriter, v settingsView) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "same-origin")
-	w.Header().Set("X-Frame-Options", "DENY")
 	// The form posts only to this origin, unlike consent, which has to redirect
 	// on to the provider.
-	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
-	w.WriteHeader(http.StatusOK)
-	if err := settingsTemplate.Execute(w, v); err != nil {
-		slog.Error("settings: render failed", "err", err)
-	}
+	writePage(w, http.StatusOK, settingsTemplate, "'self'", v)
 }
