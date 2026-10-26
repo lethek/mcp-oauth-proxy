@@ -355,7 +355,7 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 		// will not help, so a challenge would only put a well-behaved client into a
 		// retry loop. The upstream is never contacted.
 		if t.Mode == CredPerUser {
-			headers, err := s.userHeadersFor(r, sessionID, t.Name)
+			headers, err := s.userHeadersFor(r, sessionID, t)
 			switch {
 			case err == nil:
 			case errors.Is(err, ErrNotFound):

@@ -42,11 +42,20 @@ func (h *harness) enrol(subject, target string, headers map[string]string) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	sealed, err := h.srv.sealer.seal(purposeUserCredential, raw)
+	var tgt Target
+	for _, t := range h.srv.cfg.Targets {
+		if t.Name == target {
+			tgt = t
+		}
+	}
+	if tgt.Name == "" {
+		h.t.Fatalf("enrol: no target named %q", target)
+	}
+	sealed, err := h.srv.sealer.seal(boundPurpose(purposeUserCredential, tgt.Stamp()), raw)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	if err := h.srv.store.PutUserCredential(h.t.Context(), subject, target, sealed); err != nil {
+	if err := h.srv.store.PutUserCredential(h.t.Context(), subject, target, tgt.Stamp(), sealed); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -243,6 +252,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 	// Enrol through the form.
 	save := h.postForm("/settings", url.Values{
 		"target":                 {"alpha"},
+		"stamp":                  {h.srv.cfg.Targets[0].Stamp()},
 		"action":                 {"save"},
 		"field_Authorization":    {"pasted-token"},
 		"field_x-workspace-slug": {"acme"},
@@ -351,6 +361,7 @@ func TestSettingsClearRemovesTheCredential(t *testing.T) {
 
 	save := h.postForm("/settings", url.Values{
 		"target":                 {"alpha"},
+		"stamp":                  {h.srv.cfg.Targets[0].Stamp()},
 		"action":                 {"save"},
 		"field_Authorization":    {"a-token"},
 		"field_x-workspace-slug": {"acme"},
@@ -367,7 +378,7 @@ func TestSettingsClearRemovesTheCredential(t *testing.T) {
 		t.Fatalf("before clearing: status %d, want 200", resp.StatusCode)
 	}
 
-	clear := h.postForm("/settings", url.Values{"target": {"alpha"}, "action": {"clear"}})
+	clear := h.postForm("/settings", url.Values{"target": {"alpha"}, "stamp": {h.srv.cfg.Targets[0].Stamp()}, "action": {"clear"}})
 	clear.Body.Close()
 	if clear.StatusCode != http.StatusFound {
 		t.Fatalf("clearing: status %d, want a redirect", clear.StatusCode)
@@ -405,6 +416,7 @@ func TestSettingsRejectsUnusableValues(t *testing.T) {
 		t.Run("rejects "+name, func(t *testing.T) {
 			resp := h.postForm("/settings", url.Values{
 				"target":                 {"alpha"},
+				"stamp":                  {h.srv.cfg.Targets[0].Stamp()},
 				"action":                 {"save"},
 				"field_Authorization":    {value},
 				"field_x-workspace-slug": {"acme"},
@@ -419,6 +431,7 @@ func TestSettingsRejectsUnusableValues(t *testing.T) {
 	t.Run("rejects an over-long value", func(t *testing.T) {
 		resp := h.postForm("/settings", url.Values{
 			"target":                 {"alpha"},
+			"stamp":                  {h.srv.cfg.Targets[0].Stamp()},
 			"action":                 {"save"},
 			"field_Authorization":    {strings.Repeat("x", maxCredentialValue+1)},
 			"field_x-workspace-slug": {"acme"},
@@ -497,5 +510,126 @@ func TestOnlyAllowedHeadersReachTheUpstream(t *testing.T) {
 	}
 	if saw.ForwardedUser != "" {
 		t.Errorf("X-Forwarded-User reached the upstream: %q", saw.ForwardedUser)
+	}
+}
+
+// A form rendered under one definition and submitted after the definition
+// changed carries a stale stamp. Saving it would store a credential meant for a
+// different destination, so nothing is stored.
+func TestSettingsSaveWithAStaleStampStoresNothing(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+
+	resp := h.postForm("/settings", url.Values{
+		"target":                 {"alpha"},
+		"stamp":                  {"config:stale"},
+		"action":                 {"save"},
+		"field_Authorization":    {"typed-for-the-old-destination"},
+		"field_x-workspace-slug": {"acme"},
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409", resp.StatusCode)
+	}
+	got, err := h.srv.store.EnrolledTargets(t.Context(), "user-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("a stale save stored %d credential(s)", len(got))
+	}
+
+	// A form with no stamp at all is just as stale.
+	resp = h.postForm("/settings", url.Values{
+		"target":                 {"alpha"},
+		"action":                 {"save"},
+		"field_Authorization":    {"x"},
+		"field_x-workspace-slug": {"acme"},
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("no stamp: status %d, want 409", resp.StatusCode)
+	}
+}
+
+// Clearing under a stale stamp must not delete the credential that belongs to
+// the definition being served now.
+func TestSettingsClearWithAStaleStampDeletesNothing(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer keep", "x-workspace-slug": "w"})
+
+	resp := h.postForm("/settings", url.Values{"target": {"alpha"}, "stamp": {"config:stale"}, "action": {"clear"}})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409", resp.StatusCode)
+	}
+	got, err := h.srv.store.EnrolledTargets(t.Context(), "user-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[StampedName{"alpha", h.srv.cfg.Targets[0].Stamp()}]; !ok {
+		t.Error("a stale clear deleted the current credential")
+	}
+}
+
+// What the settings page stores must be readable through the proxy path, which
+// opens it under the stamp-bound purpose. A credential sealed under the plain
+// purpose would be stored and then fail on every request.
+func TestSettingsSaveIsSealedUnderTheStamp(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+
+	save := h.postForm("/settings", url.Values{
+		"target":                 {"alpha"},
+		"stamp":                  {h.srv.cfg.Targets[0].Stamp()},
+		"action":                 {"save"},
+		"field_Authorization":    {"pasted-token"},
+		"field_x-workspace-slug": {"acme"},
+	})
+	save.Body.Close()
+	if save.StatusCode != http.StatusFound {
+		t.Fatalf("saving: status %d, want a redirect", save.StatusCode)
+	}
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+	resp := h.mcpRequest("/alpha/mcp", access)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	var saw struct {
+		Authorization string `json:"saw_authorization"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&saw); err != nil {
+		t.Fatal(err)
+	}
+	if saw.Authorization != "Bearer pasted-token" {
+		t.Errorf("upstream saw %q, want the credential saved through the page", saw.Authorization)
+	}
+}
+
+// A credential saved under another definition of the same name does not make
+// the page claim the target is configured.
+func TestSettingsPageIgnoresACredentialFromAnotherStamp(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	h.signIntoSettings()
+	if err := h.srv.store.PutUserCredential(t.Context(), "user-42", "alpha", "config:other", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+
+	page := h.get(h.proxy.URL + "/settings")
+	defer page.Body.Close()
+	body, err := io.ReadAll(page.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Not configured") || strings.Contains(string(body), "Configured</span>") {
+		t.Error("the page reports a credential from another stamp as configured")
+	}
+	if !strings.Contains(string(body), `name="stamp" value="`+h.srv.cfg.Targets[0].Stamp()+`"`) {
+		t.Error("the form does not carry the current stamp")
 	}
 }

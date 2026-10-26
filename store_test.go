@@ -616,3 +616,110 @@ func TestSweepRunsAtStartup(t *testing.T) {
 	}
 	cancel()
 }
+
+func TestCredentialKeyMigratesInPlace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Put the table back in the shape the previous release created.
+	if _, err := s.pool.Exec(ctx, `
+DROP TABLE user_credentials;
+CREATE TABLE user_credentials (
+    subject TEXT NOT NULL, target TEXT NOT NULL, sealed_headers BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (subject, target));
+INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ('u', 'plane', '\x01');`); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 { // the second run must be a no-op
+		if err := s.migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	}
+
+	var stamp string
+	if err := s.pool.QueryRow(ctx, `SELECT stamp FROM user_credentials WHERE subject='u' AND target='plane'`).Scan(&stamp); err != nil || stamp != "" {
+		t.Fatalf("existing row: stamp %q, err %v", stamp, err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("b")); err != nil {
+		t.Fatalf("a second stamp for the same user and target must coexist: %v", err)
+	}
+}
+
+func TestCredentialsUnderDifferentStampsCoexist(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A2")); err != nil { // replaces its own
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteUserCredential(ctx, "u", "plane", "config:a"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.EnrolledTargets(ctx, "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[StampedName{"plane", "config:a"}]; ok {
+		t.Error("clear for one stamp left its own row")
+	}
+	if _, ok := got[StampedName{"plane", "config:b"}]; !ok {
+		t.Error("clear for one stamp removed another stamp's row")
+	}
+}
+
+func TestCredentialIsReadOnlyThroughASessionWithTheSameStamp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := newSecret()
+	if err := s.CreateSession(ctx, id, "u", "r", "plane", "config:a", []byte("tok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserCredentialForSession(ctx, id, "plane"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a credential for another stamp was returned: %v", err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.UserCredentialForSession(ctx, id, "plane"); err != nil || string(b) != "A" {
+		t.Errorf("got %q, %v; want the credential for the session's own stamp", b, err)
+	}
+}
+
+func TestEmptyStampCredentialIsRefused(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.PutUserCredential(context.Background(), "u", "plane", "", []byte("x")); err == nil {
+		t.Error("stored a credential with no stamp")
+	}
+}
+
+func TestCredentialKeyMigrationOnAFreshDatabase(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP TABLE user_credentials`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := s.migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	}
+	for _, stamp := range []string{"config:a", "config:b"} {
+		if err := s.PutUserCredential(ctx, "u", "plane", stamp, []byte("x")); err != nil {
+			t.Fatalf("stamp %s: %v", stamp, err)
+		}
+	}
+}

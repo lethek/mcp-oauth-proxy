@@ -158,18 +158,38 @@ ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used BOOLEAN NOT NULL DEFAUL
 ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
 
 -- What a user supplied for themselves, for a target whose MCP server wants its
--- own credential rather than the provider's token. Keyed on (subject, target)
--- because one person may hold a different credential at each.
+-- own credential rather than the provider's token. Keyed on (subject, target,
+-- stamp) because one person may hold a different credential at each target, and
+-- at each definition of it.
 --
 -- No foreign key to sessions: a credential outlives any single authorization and
 -- must survive the user re-authorising.
 CREATE TABLE IF NOT EXISTS user_credentials (
     subject        TEXT NOT NULL,
     target         TEXT NOT NULL,
+    stamp          TEXT NOT NULL DEFAULT '',
     sealed_headers BYTEA NOT NULL,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (subject, target)
+    PRIMARY KEY (subject, target, stamp)
 );
+ALTER TABLE user_credentials ADD COLUMN IF NOT EXISTS stamp TEXT NOT NULL DEFAULT '';
+-- A database created before stamps keyed this table on (subject, target). The
+-- advisory lock lets two replicas boot together without both rewriting the key.
+DO $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('mcp-oauth-proxy-credential-key'));
+    IF (SELECT count(*) FROM information_schema.key_column_usage k
+          JOIN information_schema.table_constraints c
+            ON c.constraint_name = k.constraint_name
+           AND c.constraint_schema = k.constraint_schema
+           AND c.table_name = k.table_name
+         WHERE c.table_name = 'user_credentials'
+           AND c.table_schema = current_schema()
+           AND c.constraint_type = 'PRIMARY KEY') = 2 THEN
+        ALTER TABLE user_credentials DROP CONSTRAINT user_credentials_pkey;
+        ALTER TABLE user_credentials ADD PRIMARY KEY (subject, target, stamp);
+    END IF;
+END $$;
 
 -- An in-flight login for the enrolment page. Separate from flows because there
 -- is no MCP client involved: nobody registered, there is no redirect_uri to
@@ -591,28 +611,36 @@ func (s *Store) SessionForToken(ctx context.Context, token string) (string, erro
 
 // ---------- per-user credentials ----------
 
-// PutUserCredential replaces whatever the subject had for this target. Replacing
-// rather than erroring on a duplicate is the point: rotating a leaked token is
-// the same action as setting one for the first time.
-func (s *Store) PutUserCredential(ctx context.Context, subject, target string, sealed []byte) error {
+// StampedName is a target name together with the stamp a credential was saved
+// under.
+type StampedName struct{ Name, Stamp string }
+
+// PutUserCredential replaces whatever the subject had for this target under this
+// stamp. Replacing rather than erroring on a duplicate is the point: rotating a
+// leaked token is the same action as setting one for the first time.
+func (s *Store) PutUserCredential(ctx context.Context, subject, target, stamp string, sealed []byte) error {
+	if stamp == "" {
+		return errors.New("a credential needs the stamp of the target it is for")
+	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ($1,$2,$3)
-		 ON CONFLICT (subject, target)
+		`INSERT INTO user_credentials (subject, target, stamp, sealed_headers) VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (subject, target, stamp)
 		 DO UPDATE SET sealed_headers = EXCLUDED.sealed_headers, updated_at = now()`,
-		subject, target, sealed)
+		subject, target, stamp, sealed)
 	return err
 }
 
 // UserCredentialForSession resolves a session straight to its owner's credential
 // for a target, in one query. Every proxied request in per_user mode needs it, so
 // fetching the subject and then the credential would cost a second round trip on
-// that path.
+// that path. The credential must have been saved under the stamp the session was
+// issued under.
 func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target string) ([]byte, error) {
 	var sealed []byte
 	err := s.pool.QueryRow(ctx,
 		`SELECT c.sealed_headers FROM sessions s
-		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2
-		 WHERE s.id = $1 AND s.subject <> ''`,
+		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2 AND c.stamp = s.stamp
+		 WHERE s.id = $1 AND s.subject <> '' AND s.stamp <> ''`,
 		sessionID, target).Scan(&sealed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -621,29 +649,32 @@ func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target 
 }
 
 // EnrolledTargets is the set a subject has already configured, for the catalogue.
-func (s *Store) EnrolledTargets(ctx context.Context, subject string) (map[string]time.Time, error) {
+// It is keyed on the stamp as well as the name, so the catalogue shows a target
+// as configured only when the credential belongs to the definition being served
+// now.
+func (s *Store) EnrolledTargets(ctx context.Context, subject string) (map[StampedName]time.Time, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT target, updated_at FROM user_credentials WHERE subject=$1`, subject)
+		`SELECT target, stamp, updated_at FROM user_credentials WHERE subject=$1`, subject)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := map[string]time.Time{}
+	out := map[StampedName]time.Time{}
 	for rows.Next() {
-		var target string
+		var target, stamp string
 		var at time.Time
-		if err := rows.Scan(&target, &at); err != nil {
+		if err := rows.Scan(&target, &stamp, &at); err != nil {
 			return nil, err
 		}
-		out[target] = at
+		out[StampedName{target, stamp}] = at
 	}
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteUserCredential(ctx context.Context, subject, target string) error {
+func (s *Store) DeleteUserCredential(ctx context.Context, subject, target, stamp string) error {
 	_, err := s.pool.Exec(ctx,
-		`DELETE FROM user_credentials WHERE subject=$1 AND target=$2`, subject, target)
+		`DELETE FROM user_credentials WHERE subject=$1 AND target=$2 AND stamp=$3`, subject, target, stamp)
 	return err
 }
 

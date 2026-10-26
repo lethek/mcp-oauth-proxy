@@ -28,6 +28,7 @@ your identity provider, you will be signed straight back in.</p>
   {{else}}<p class="muted">Requests to this server are refused until you save a credential.</p>{{end}}
   <form method="post" action="/settings">
     <input type="hidden" name="target" value="{{$name}}">
+    <input type="hidden" name="stamp" value="{{.Stamp}}">
     {{range .Fields}}
     <div class="field">
       <label for="cred-{{$name}}-{{.Header}}">{{.Label}}</label>

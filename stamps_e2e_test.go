@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -171,5 +172,40 @@ func TestCallbackRefusesAFlowWithNoUsableResource(t *testing.T) {
 				t.Errorf("redirect %q: want an error and no code", loc)
 			}
 		})
+	}
+}
+
+// Two pods with different definitions of one name each keep their own
+// credential; neither overwrites the other, and neither can use the other's.
+func TestReplicasWithDifferentDefinitionsKeepTheirOwnCredentials(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+	old := h.srv.cfg.Targets[0]
+	changed := old
+	changed.UpstreamMCP += "/v2"
+
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer old", "x-workspace-slug": "w"})
+	// The same user, under the other definition, as the second pod would store it.
+	raw, _ := json.Marshal(map[string]string{"Authorization": "Bearer new", "x-workspace-slug": "w"})
+	sealed, err := h.srv.sealer.seal(boundPurpose(purposeUserCredential, changed.Stamp()), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.srv.store.PutUserCredential(t.Context(), "user-42", "alpha", changed.Stamp(), sealed); err != nil {
+		t.Fatal(err)
+	}
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, old.Resource)
+	resp := h.mcpRequest("/alpha/mcp", access)
+	defer resp.Body.Close()
+	var saw struct {
+		Authorization string `json:"saw_authorization"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&saw); err != nil {
+		t.Fatal(err)
+	}
+	if saw.Authorization != "Bearer old" {
+		t.Errorf("upstream saw %q; the session's own definition must get its own credential", saw.Authorization)
 	}
 }
