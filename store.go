@@ -71,6 +71,30 @@ func NewStore(ctx context.Context, url string, refreshTTL, sessionTTL time.Durat
 
 func (s *Store) Close() { s.pool.Close() }
 
+// credentialKeyMigration rewrites the key of user_credentials in a database
+// created before stamps, which keyed it on (subject, target). The advisory lock
+// lets two replicas boot together without both rewriting the key.
+//
+// The table is found with a regclass cast, which resolves through search_path
+// exactly as the statements around it do. Asking information_schema for
+// current_schema() instead can look in a different schema than they use.
+const credentialKeyMigration = `
+DO $$
+DECLARE
+    pk_name text;
+    pk_cols int;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('mcp-oauth-proxy-credential-key'));
+    SELECT conname, cardinality(conkey) INTO pk_name, pk_cols
+      FROM pg_constraint
+     WHERE conrelid = 'user_credentials'::regclass AND contype = 'p';
+    IF pk_cols = 2 THEN
+        EXECUTE format('ALTER TABLE user_credentials DROP CONSTRAINT %I', pk_name);
+        ALTER TABLE user_credentials ADD PRIMARY KEY (subject, target, stamp);
+    END IF;
+END $$;
+`
+
 // migrate is deliberately a single idempotent statement block rather than a
 // migration framework. The schema is small and this runs on every boot. The
 // ALTERs bring a database created by an earlier version up to date.
@@ -173,23 +197,7 @@ CREATE TABLE IF NOT EXISTS user_credentials (
     PRIMARY KEY (subject, target, stamp)
 );
 ALTER TABLE user_credentials ADD COLUMN IF NOT EXISTS stamp TEXT NOT NULL DEFAULT '';
--- A database created before stamps keyed this table on (subject, target). The
--- advisory lock lets two replicas boot together without both rewriting the key.
-DO $$
-BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('mcp-oauth-proxy-credential-key'));
-    IF (SELECT count(*) FROM information_schema.key_column_usage k
-          JOIN information_schema.table_constraints c
-            ON c.constraint_name = k.constraint_name
-           AND c.constraint_schema = k.constraint_schema
-           AND c.table_name = k.table_name
-         WHERE c.table_name = 'user_credentials'
-           AND c.table_schema = current_schema()
-           AND c.constraint_type = 'PRIMARY KEY') = 2 THEN
-        ALTER TABLE user_credentials DROP CONSTRAINT user_credentials_pkey;
-        ALTER TABLE user_credentials ADD PRIMARY KEY (subject, target, stamp);
-    END IF;
-END $$;
+`+credentialKeyMigration+`
 
 -- An in-flight login for the enrolment page. Separate from flows because there
 -- is no MCP client involved: nobody registered, there is no redirect_uri to

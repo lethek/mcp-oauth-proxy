@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // newTestStore connects to the database named by TEST_DATABASE_URL and clears
@@ -795,5 +797,80 @@ func TestSweepStrayCredentials(t *testing.T) {
 	}
 	if _, ok := got[StampedName{"plane", "config:stray"}]; ok {
 		t.Error("the stray config credential survived")
+	}
+}
+
+// legacyCredentialsTable puts user_credentials back in the shape the previous
+// release created, in the default schema.
+func legacyCredentialsTable(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), `
+DROP TABLE user_credentials;
+CREATE TABLE user_credentials (
+    subject TEXT NOT NULL, target TEXT NOT NULL, sealed_headers BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (subject, target));
+INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ('u', 'plane', '\x01');`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// storeWithSearchPath opens a second store on the same database whose
+// connections resolve unqualified names through an empty schema first.
+func storeWithSearchPath(t *testing.T, s *Store, emptySchema string) *Store {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+emptySchema+` CASCADE; CREATE SCHEMA `+emptySchema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+emptySchema+` CASCADE`) })
+
+	cfg := s.pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["search_path"] = emptySchema + ",public"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return &Store{pool: pool, refreshTTL: s.refreshTTL, sessionTTL: s.sessionTTL}
+}
+
+func TestCredentialKeyMigrationFindsTheTableThroughSearchPath(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	legacyCredentialsTable(t, s)
+	other := storeWithSearchPath(t, s, "mop_empty")
+
+	// The block that rewrites the key, on its own: the rest of migrate would
+	// create fresh tables in the empty schema and hide a wrong lookup. The stamp
+	// column is the step migrate takes just before it.
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE user_credentials ADD COLUMN IF NOT EXISTS stamp TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.pool.Exec(ctx, credentialKeyMigration); err != nil {
+		t.Fatal(err)
+	}
+	for _, stamp := range []string{"config:a", "config:b"} {
+		if err := s.PutUserCredential(ctx, "u", "plane", stamp, []byte("x")); err != nil {
+			t.Fatalf("stamp %s: %v", stamp, err)
+		}
+	}
+}
+
+func TestMigrateWithAnEmptySchemaFirstOnTheSearchPath(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	legacyCredentialsTable(t, s)
+	other := storeWithSearchPath(t, s, "mop_empty2")
+
+	for range 2 {
+		if err := other.migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	}
+	if err := other.PutUserCredential(ctx, "u", "plane", "config:a", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.PutUserCredential(ctx, "u", "plane", "config:b", []byte("b")); err != nil {
+		t.Fatalf("a second stamp for the same user and target must coexist: %v", err)
 	}
 }
