@@ -448,7 +448,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	target, ok := s.targetForFlow(flow)
 	if !ok {
-		slog.Warn("callback: the target changed while the user was authorizing", "target", flow.Target)
+		slog.Warn("callback: the flow no longer matches a target definition", "target", flow.Target)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "temporarily_unavailable",
 			"the server's configuration changed during sign-in; start again from your client")
 		return

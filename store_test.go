@@ -736,10 +736,24 @@ func TestSweepRemovesEmptyStampRows(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `INSERT INTO user_credentials (subject,target,stamp,sealed_headers) VALUES ('u','plane','','\x01')`); err != nil {
 		t.Fatal(err)
 	}
+	emptyFlow, keptFlow := newSecret(), newSecret()
+	for _, c := range []struct{ id, stamp string }{{emptyFlow, ""}, {keptFlow, "config:a"}} {
+		if err := s.CreateFlow(ctx, Flow{ID: c.id, ClientID: "c", RedirectURI: "r", CodeChallenge: "x", UpstreamVerifier: "v", Target: "plane", Stamp: c.stamp, BrowserSecret: "b"}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := s.Sweep(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var n int
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM flows WHERE id=$1`, emptyFlow).Scan(&n)
+	if n != 0 {
+		t.Error("empty-stamp flow survived")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM flows WHERE id=$1`, keptFlow).Scan(&n)
+	if n != 1 {
+		t.Error("stamped flow was swept")
+	}
 	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id=$1`, empty).Scan(&n)
 	if n != 0 {
 		t.Error("empty-stamp session survived")
