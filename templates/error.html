@@ -1,0 +1,8 @@
+{{define "title"}}{{.Heading}}{{end}}
+{{define "content"}}
+<main class="card">
+  <h1>{{.Heading}}</h1>
+  <p class="lede">{{.Message}}</p>
+  {{if .BackHref}}<div class="row"><a class="btn btn-primary" href="{{.BackHref}}">{{.BackLabel}}</a></div>{{end}}
+</main>
+{{end}}
