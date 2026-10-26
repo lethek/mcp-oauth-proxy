@@ -261,14 +261,19 @@ func (s *Server) sweep(ctx context.Context) {
 	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
 	for {
+		// Record what this process serves before anything is deleted on the
+		// strength of it. A failure here does not stop the sweeps.
+		served := make([]StampedName, 0, len(s.cfg.Targets))
+		for _, target := range s.cfg.Targets {
+			served = append(served, StampedName{target.Name, target.Stamp()})
+		}
+		if err := s.store.RecordServedStamps(ctx, served); err != nil {
+			slog.Warn("recording served stamps failed", "err", err)
+		}
 		if err := s.store.Sweep(ctx); err != nil {
 			slog.Warn("sweep failed", "err", err)
 		}
-		live := make([]StampedName, 0, len(s.cfg.Targets))
-		for _, t := range s.cfg.Targets {
-			live = append(live, StampedName{t.Name, t.Stamp()})
-		}
-		if err := s.store.SweepStrayCredentials(ctx, live); err != nil {
+		if err := s.store.SweepStrayCredentials(ctx); err != nil {
 			slog.Warn("stray credential sweep failed", "err", err)
 		}
 		select {

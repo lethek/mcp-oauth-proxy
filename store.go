@@ -198,6 +198,15 @@ CREATE TABLE IF NOT EXISTS user_credentials (
 );
 ALTER TABLE user_credentials ADD COLUMN IF NOT EXISTS stamp TEXT NOT NULL DEFAULT '';
 `+credentialKeyMigration+`
+-- When any process last served each (target, stamp). The stray credential sweep
+-- reads it so that a definition a rolling deploy, canary or rollback still
+-- serves elsewhere does not lose its credentials.
+CREATE TABLE IF NOT EXISTS stamp_seen (
+    target  TEXT NOT NULL,
+    stamp   TEXT NOT NULL,
+    seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (target, stamp)
+);
 
 -- An in-flight login for the enrolment page. Separate from flows because there
 -- is no MCP client involved: nobody registered, there is no redirect_uri to
@@ -735,6 +744,9 @@ func (s *Store) Sweep(ctx context.Context) error {
 		{sql: `DELETE FROM sessions WHERE stamp = ''`},
 		{sql: `DELETE FROM user_credentials WHERE stamp = ''`},
 
+		// Long past the week the stray credential sweep looks back over.
+		{sql: `DELETE FROM stamp_seen WHERE seen_at < now() - INTERVAL '30 days'`},
+
 		// A used token is kept for one refresh lifetime beyond its own, so a late
 		// replay is still recognised as reuse rather than mistaken for an unknown
 		// token.
@@ -781,28 +793,45 @@ DELETE FROM clients c
 	return nil
 }
 
-// strayCredentialAge is how long a credential for a config definition nobody here
-// serves is kept. Another pod mid-rollout may still serve it, so the wait must
-// outlast a rolling deploy; a second definition lingering longer than that is
-// not supported (one database, one deployment).
+// strayCredentialAge is how long a config credential must go unsaved, and its
+// definition unserved by any process, before it is deleted. The wait has to
+// outlast a rolling deploy, canary or rollback; a second definition lingering
+// longer than that is not supported (one database, one deployment).
 const strayCredentialAge = 7 * 24 * time.Hour
 
-// SweepStrayCredentials deletes per-user credentials for config definitions that
-// this process does not serve and that have not been touched for a week.
-// Credentials have no lifetime of their own, so without this one outlives its
-// definition indefinitely. live is every (name, stamp) this process serves.
-func (s *Store) SweepStrayCredentials(ctx context.Context, live []StampedName) error {
-	names := make([]string, len(live))
-	stamps := make([]string, len(live))
-	for i, l := range live {
-		names[i], stamps[i] = l.Name, l.Stamp
+// RecordServedStamps notes that this process serves each of these (name, stamp)
+// pairs now. Every process calls it on each sweep pass, so stamp_seen says when
+// any process last served a definition.
+func (s *Store) RecordServedStamps(ctx context.Context, served []StampedName) error {
+	if len(served) == 0 {
+		return nil
 	}
+	names := make([]string, len(served))
+	stamps := make([]string, len(served))
+	for i, v := range served {
+		names[i], stamps[i] = v.Name, v.Stamp
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO stamp_seen (target, stamp, seen_at)
+SELECT DISTINCT n, st, now() FROM unnest($1::text[], $2::text[]) AS v(n, st)
+ON CONFLICT (target, stamp) DO UPDATE SET seen_at = now()`,
+		names, stamps)
+	return err
+}
+
+// SweepStrayCredentials deletes a config credential once it has not been saved
+// for 7 days AND no process has served its definition for 7 days. Credentials
+// have no lifetime of their own, so without this one outlives its definition
+// indefinitely. The first condition protects a fresh save; the second protects
+// a definition that another pod still serves during a rollout or rollback.
+func (s *Store) SweepStrayCredentials(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 DELETE FROM user_credentials c
  WHERE c.stamp LIKE 'config:%'
    AND c.updated_at < now() - $1::interval
-   AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS l(name, stamp)
-                    WHERE l.name = c.target AND l.stamp = c.stamp)`,
-		strayCredentialAge.String(), names, stamps)
+   AND NOT EXISTS (SELECT 1 FROM stamp_seen s
+                    WHERE s.target = c.target AND s.stamp = c.stamp
+                      AND s.seen_at > now() - $1::interval)`,
+		strayCredentialAge.String())
 	return err
 }

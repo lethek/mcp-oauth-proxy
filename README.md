@@ -310,8 +310,9 @@ If a target's stamp changes, they stop working for that target.
   replica cannot save a per-user credential, because the table's key has changed
   and its save fails.
 - **One database belongs to one deployment.** A stored credential for a
-  definition this process does not serve is deleted after 7 days. Two
-  deployments with different targets must not share a database.
+  definition is deleted once it has not been saved for 7 days and no process
+  has served that definition for 7 days. Two deployments with different targets
+  must not share a database.
 
 ## Endpoints
 

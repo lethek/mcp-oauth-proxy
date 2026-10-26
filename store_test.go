@@ -37,7 +37,7 @@ func newTestStore(t *testing.T) *Store {
 	// everything. user_credentials is NOT among the cascades: it deliberately has
 	// no foreign key to sessions, so it survives one and has to be cleared here
 	// or an enrolment leaks into the next test and makes "not enrolled" pass.
-	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "clients"} {
+	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "stamp_seen", "clients"} {
 		if _, err := s.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clearing %s: %v", table, err)
 		}
@@ -773,30 +773,82 @@ func TestSweepRemovesEmptyStampRows(t *testing.T) {
 func TestSweepStrayCredentials(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	old := `now() - INTERVAL '8 days'`
-	for _, c := range []struct{ target, stamp, age string }{
-		{"plane", "config:live", old},       // matches what this process serves: keep
-		{"plane", "config:stray", old},      // matches nothing, old: delete
-		{"plane", "config:recent", "now()"}, // matches nothing, but another pod may still serve it: keep
-		{"plane", "admin:x", old},           // not a config stamp: not this sweep's to delete
-	} {
+	saved14d, saved8d, now := `now() - INTERVAL '14 days'`, `now() - INTERVAL '8 days'`, `now()`
+	cases := []struct {
+		target, stamp, saved string
+		survives             bool
+	}{
+		{"plane", "config:live", saved14d, true},        // this process serves it: seen now
+		{"plane", "config:seen-1d", saved14d, true},     // another pod served it yesterday
+		{"plane", "config:never-seen", saved14d, false}, // old and nobody has served it
+		{"plane", "config:seen-8d", saved14d, false},    // last served more than a week ago
+		{"plane", "config:recent", now, true},           // saved just now, never seen: protected by updated_at
+		{"plane", "admin:x", saved14d, true},            // not a config stamp: not this sweep's to delete
+		{"other", "config:live", saved8d, false},        // only ("plane", "config:live") was served, not this name
+	}
+	for _, c := range cases {
 		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u',$1,$2,'\x01',`+c.age+`)`,
+			`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u',$1,$2,'\x01',`+c.saved+`)`,
 			c.target, c.stamp); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.SweepStrayCredentials(ctx, []StampedName{{"plane", "config:live"}}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := s.EnrolledTargets(ctx, "u")
-	for _, want := range []string{"config:live", "config:recent", "admin:x"} {
-		if _, ok := got[StampedName{"plane", want}]; !ok {
-			t.Errorf("%s was deleted", want)
+	for stamp, ago := range map[string]string{"config:seen-1d": "1 day", "config:seen-8d": "8 days"} {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO stamp_seen (target,stamp,seen_at) VALUES ('plane',$1, now() - $2::interval)`, stamp, ago); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if _, ok := got[StampedName{"plane", "config:stray"}]; ok {
-		t.Error("the stray config credential survived")
+	if err := s.RecordServedStamps(ctx, []StampedName{{"plane", "config:live"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SweepStrayCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := s.EnrolledTargets(ctx, "u")
+	for _, c := range cases {
+		if _, present := got[StampedName{c.target, c.stamp}]; present != c.survives {
+			t.Errorf("%s/%s: present=%v, want %v", c.target, c.stamp, present, c.survives)
+		}
+	}
+}
+
+func TestRecordServedStampsRefreshesAndToleratesEmpty(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.RecordServedStamps(ctx, nil); err != nil {
+		t.Fatalf("empty list: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO stamp_seen (target,stamp,seen_at) VALUES ('plane','config:a', now() - INTERVAL '3 days')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordServedStamps(ctx, []StampedName{{"plane", "config:a"}, {"plane", "config:b"}}); err != nil {
+		t.Fatal(err)
+	}
+	var fresh int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM stamp_seen WHERE seen_at > now() - INTERVAL '1 minute'`).Scan(&fresh); err != nil || fresh != 2 {
+		t.Fatalf("fresh rows = %d, err %v; want both pairs recorded and the old one refreshed", fresh, err)
+	}
+}
+
+func TestSweepRemovesOldStampSeenRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for stamp, ago := range map[string]string{"config:old": "31 days", "config:kept": "29 days"} {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO stamp_seen (target,stamp,seen_at) VALUES ('plane',$1, now() - $2::interval)`, stamp, ago); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var old, kept int
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stamp_seen WHERE stamp='config:old'`).Scan(&old)
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stamp_seen WHERE stamp='config:kept'`).Scan(&kept)
+	if old != 0 || kept != 1 {
+		t.Errorf("old=%d kept=%d; want the 31 day row removed and the 29 day row kept", old, kept)
 	}
 }
 
