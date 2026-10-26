@@ -292,6 +292,27 @@ process refuses to start with a hop count and no networks.
 IPv6 callers are keyed on their /64, since a single host is routinely allocated
 one and keying on the full address would hand out unlimited fresh buckets.
 
+### Upgrading
+
+Each target has a stamp, a fingerprint of the parts of its definition that decide
+where a stored credential is sent. They are the name, the upstream URL, the
+credential mode, and the header names and prefixes of `per_user` fields. Labels,
+the display name, allowed groups and static header values are not part of it.
+Sessions and per-user credentials are tied to the stamp they were created under.
+If a target's stamp changes, they stop working for that target.
+
+- **The first release with stamps signs everyone out once.** Sessions and
+  authorization flows from before it carry no stamp, so they are refused. Per-user
+  credentials stored before it are refused too, so every user must enter theirs
+  again on the settings page.
+- **Do not change a target definition while a replica older than this release is
+  running.** Finish the rollout first. After the first new replica starts, an older
+  replica cannot save a per-user credential, because the table's key has changed
+  and its save fails.
+- **One database belongs to one deployment.** A stored credential for a
+  definition this process does not serve is deleted after 7 days. Two
+  deployments with different targets must not share a database.
+
 ## Endpoints
 
 | Path | Purpose |
