@@ -443,15 +443,26 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RFC 9207. If the provider tells us who answered, make sure it is the one
-	// we asked.
-	if iss := q.Get("iss"); iss != "" {
-		if meta, err := s.upstream.Meta(r.Context()); err == nil && meta.Issuer != "" &&
-			strings.TrimRight(iss, "/") != strings.TrimRight(meta.Issuer, "/") {
+	// RFC 9207 section 2.4. iss is compared exactly, and a provider that says it
+	// sends iss must have sent it: otherwise a mix-up response with the parameter
+	// stripped would pass. Without discovery neither can be checked, so refuse
+	// rather than skip the check.
+	meta, err := s.upstream.Meta(r.Context())
+	if err != nil {
+		slog.Error("callback: provider discovery failed", "err", err)
+		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "temporarily_unavailable", "the identity provider could not be reached")
+		return
+	}
+	if q.Has("iss") {
+		if iss := q.Get("iss"); iss != meta.Issuer {
 			slog.Warn("callback: issuer mismatch", "got", iss, "want", meta.Issuer)
 			s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "invalid_request", "the response came from an unexpected issuer")
 			return
 		}
+	} else if meta.IssParameterSupported {
+		slog.Warn("callback: provider advertises iss but sent none")
+		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "invalid_request", "the response did not identify its issuer")
+		return
 	}
 
 	if e := q.Get("error"); e != "" {

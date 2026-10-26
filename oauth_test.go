@@ -33,6 +33,79 @@ func TestMetadataAdvertisesIssParameter(t *testing.T) {
 	}
 }
 
+// Advertising the flag makes compliant clients reject any authorization response
+// without iss, so every redirect back to the client has to carry it.
+func TestClientRedirectsCarryIss(t *testing.T) {
+	const redirect = "https://client.example/callback"
+
+	t.Run("success", func(t *testing.T) {
+		h := newHarness(t)
+		back := h.callbackRedirect(h.register(redirect), redirect, "")
+		if back.Query().Get("code") == "" {
+			t.Fatalf("no code in %s", back)
+		}
+		if got := back.Query().Get("iss"); got != h.srv.cfg.PublicURL {
+			t.Errorf("iss = %q, want %q", got, h.srv.cfg.PublicURL)
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		h := newHarness(t)
+		flowID := h.consentFlowID(h.get(h.authorizeURL(h.register(redirect), redirect, s256("v"))))
+		resp := h.postForm("/consent", url.Values{"flow_id": {flowID}, "decision": {"deny"}})
+		resp.Body.Close()
+		back, err := url.Parse(resp.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if back.Query().Get("error") == "" {
+			t.Fatalf("no error in %s", back)
+		}
+		if got := back.Query().Get("iss"); got != h.srv.cfg.PublicURL {
+			t.Errorf("iss = %q, want %q", got, h.srv.cfg.PublicURL)
+		}
+	})
+}
+
+// RFC 9207 section 2.4, from the proxy's side as the provider's client: iss must
+// match the provider's issuer exactly, and must be present when the provider
+// says it sends it. Otherwise a mix-up response with iss stripped gets through.
+func TestCallbackValidatesProviderIss(t *testing.T) {
+	const redirect = "https://client.example/callback"
+
+	// iss is what the provider sends, with {provider} standing for its issuer;
+	// empty sends none.
+	cases := []struct {
+		name       string
+		iss        string
+		advertises bool
+		wantCode   bool
+	}{
+		{"matching iss", "{provider}", true, true},
+		{"absent iss, not advertised", "", false, true},
+		{"absent iss, advertised", "", true, false},
+		{"wrong issuer", "https://evil.example", false, false},
+		{"trailing slash is not the same issuer", "{provider}/", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			iss := strings.ReplaceAll(tc.iss, "{provider}", h.provider.URL)
+			h.providerIss.Store(&iss)
+			h.providerAdvertisesIss.Store(tc.advertises)
+
+			back := h.callbackRedirect(h.register(redirect), redirect, "")
+			gotCode := back.Query().Get("code") != ""
+			if gotCode != tc.wantCode {
+				t.Errorf("code issued = %v, want %v (redirect %s)", gotCode, tc.wantCode, back)
+			}
+			if !tc.wantCode && back.Query().Get("error") == "" {
+				t.Errorf("refusal carried no error: %s", back)
+			}
+		})
+	}
+}
+
 // harness wires a proxy against a stub OAuth provider, both on loopback.
 type harness struct {
 	t *testing.T
@@ -81,6 +154,12 @@ type harness struct {
 	// groups, when set, is sent as the userinfo groups claim. Unset sends no
 	// claim at all, the way a provider does when the scope was not requested.
 	groups atomic.Pointer[[]string]
+
+	// providerIss, when set, replaces the iss the provider puts on its callback;
+	// an empty string leaves the parameter off. providerAdvertisesIss adds the
+	// RFC 9207 flag to its discovery document.
+	providerIss           atomic.Pointer[string]
+	providerAdvertisesIss atomic.Bool
 
 	// encodedRefusal makes that 401 carry a Content-Encoding, as a server behind
 	// a compressing layer would. Brotli rather than gzip on purpose: Go's
@@ -142,12 +221,16 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	t.Cleanup(h.provider.Close)
 
 	providerMux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
+		doc := map[string]any{
 			"issuer":                 h.provider.URL,
 			"authorization_endpoint": h.provider.URL + "/login/oauth/authorize",
 			"token_endpoint":         h.provider.URL + "/login/oauth/access_token",
 			"userinfo_endpoint":      h.provider.URL + "/login/oauth/userinfo",
-		})
+		}
+		if h.providerAdvertisesIss.Load() {
+			doc["authorization_response_iss_parameter_supported"] = true
+		}
+		writeJSON(w, http.StatusOK, doc)
 	})
 
 	// The provider behaves as one that has already approved this application:
@@ -159,7 +242,13 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 		q := back.Query()
 		q.Set("code", "upstream-code")
 		q.Set("state", r.URL.Query().Get("state"))
-		q.Set("iss", h.provider.URL)
+		iss := h.provider.URL
+		if p := h.providerIss.Load(); p != nil {
+			iss = *p
+		}
+		if iss != "" {
+			q.Set("iss", iss)
+		}
 		back.RawQuery = q.Encode()
 		http.Redirect(w, r, back.String(), http.StatusFound)
 	})
