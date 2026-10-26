@@ -590,7 +590,7 @@ func TestSweepRunsAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{store: s}
+	srv := &Server{store: s, cfg: &Config{}}
 	swept, cancel := context.WithCancel(ctx)
 	go srv.sweep(swept)
 
@@ -721,5 +721,65 @@ func TestCredentialKeyMigrationOnAFreshDatabase(t *testing.T) {
 		if err := s.PutUserCredential(ctx, "u", "plane", stamp, []byte("x")); err != nil {
 			t.Fatalf("stamp %s: %v", stamp, err)
 		}
+	}
+}
+
+func TestSweepRemovesEmptyStampRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	empty, kept := newSecret(), newSecret()
+	for _, c := range []struct{ id, stamp string }{{empty, ""}, {kept, "config:a"}} {
+		if err := s.CreateSession(ctx, c.id, "u", "r", "plane", c.stamp, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO user_credentials (subject,target,stamp,sealed_headers) VALUES ('u','plane','','\x01')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id=$1`, empty).Scan(&n)
+	if n != 0 {
+		t.Error("empty-stamp session survived")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id=$1`, kept).Scan(&n)
+	if n != 1 {
+		t.Error("stamped session was swept")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM user_credentials WHERE stamp=''`).Scan(&n)
+	if n != 0 {
+		t.Error("empty-stamp credential survived")
+	}
+}
+
+func TestSweepStrayCredentials(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	old := `now() - INTERVAL '8 days'`
+	for _, c := range []struct{ target, stamp, age string }{
+		{"plane", "config:live", old},       // matches what this process serves: keep
+		{"plane", "config:stray", old},      // matches nothing, old: delete
+		{"plane", "config:recent", "now()"}, // matches nothing, but another pod may still serve it: keep
+		{"plane", "admin:x", old},           // not a config stamp: not this sweep's to delete
+	} {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u',$1,$2,'\x01',`+c.age+`)`,
+			c.target, c.stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SweepStrayCredentials(ctx, []StampedName{{"plane", "config:live"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.EnrolledTargets(ctx, "u")
+	for _, want := range []string{"config:live", "config:recent", "admin:x"} {
+		if _, ok := got[StampedName{"plane", want}]; !ok {
+			t.Errorf("%s was deleted", want)
+		}
+	}
+	if _, ok := got[StampedName{"plane", "config:stray"}]; ok {
+		t.Error("the stray config credential survived")
 	}
 }

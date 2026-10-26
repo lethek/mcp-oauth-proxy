@@ -264,6 +264,13 @@ func (s *Server) sweep(ctx context.Context) {
 		if err := s.store.Sweep(ctx); err != nil {
 			slog.Warn("sweep failed", "err", err)
 		}
+		live := make([]StampedName, 0, len(s.cfg.Targets))
+		for _, t := range s.cfg.Targets {
+			live = append(live, StampedName{t.Name, t.Stamp()})
+		}
+		if err := s.store.SweepStrayCredentials(ctx, live); err != nil {
+			slog.Warn("stray credential sweep failed", "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return

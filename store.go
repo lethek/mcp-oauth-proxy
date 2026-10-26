@@ -720,6 +720,13 @@ func (s *Store) Sweep(ctx context.Context) error {
 		{sql: `DELETE FROM auth_codes WHERE created_at < now() - INTERVAL '1 hour'`},
 		{sql: `DELETE FROM access_tokens WHERE expires_at < now() - INTERVAL '1 day'`},
 
+		// Rows written before stamps, or by a replica that predates them. They
+		// match no definition and are refused, so they are only taking space (and,
+		// for sessions, holding a provider token that nothing can reach).
+		{sql: `DELETE FROM flows WHERE stamp = ''`},
+		{sql: `DELETE FROM sessions WHERE stamp = ''`},
+		{sql: `DELETE FROM user_credentials WHERE stamp = ''`},
+
 		// A used token is kept for one refresh lifetime beyond its own, so a late
 		// replay is still recognised as reuse rather than mistaken for an unknown
 		// token.
@@ -764,4 +771,30 @@ DELETE FROM clients c
 		}
 	}
 	return nil
+}
+
+// strayCredentialAge is how long a credential for a config definition nobody here
+// serves is kept. Another pod mid-rollout may still serve it, so the wait must
+// outlast a rolling deploy; a second definition lingering longer than that is
+// not supported (one database, one deployment).
+const strayCredentialAge = 7 * 24 * time.Hour
+
+// SweepStrayCredentials deletes per-user credentials for config definitions that
+// this process does not serve and that have not been touched for a week.
+// Credentials have no lifetime of their own, so without this one outlives its
+// definition indefinitely. live is every (name, stamp) this process serves.
+func (s *Store) SweepStrayCredentials(ctx context.Context, live []StampedName) error {
+	names := make([]string, len(live))
+	stamps := make([]string, len(live))
+	for i, l := range live {
+		names[i], stamps[i] = l.Name, l.Stamp
+	}
+	_, err := s.pool.Exec(ctx, `
+DELETE FROM user_credentials c
+ WHERE c.stamp LIKE 'config:%'
+   AND c.updated_at < now() - $1::interval
+   AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS l(name, stamp)
+                    WHERE l.name = c.target AND l.stamp = c.stamp)`,
+		strayCredentialAge.String(), names, stamps)
+	return err
 }
