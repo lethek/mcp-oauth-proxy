@@ -149,27 +149,21 @@ func newCIMDClient() *cimdClient { return newCIMD(true) }
 func newCIMD(guardAddresses bool) *cimdClient {
 	dialer := &net.Dialer{
 		Timeout: cimdTimeout,
+	}
+	if guardAddresses {
 		// Control runs after DNS resolution with the address actually about to
 		// be dialled, so a name that resolves to a private address is refused
 		// even if it resolved to a public one a moment earlier. Checking the
-		// hostname instead would be defeated by exactly that.
-		Control: func(network, address string, _ syscall.RawConn) error {
-			if !guardAddresses {
-				return nil
-			}
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			ip := net.ParseIP(host)
-			if ip == nil {
-				return fmt.Errorf("cimd: could not parse the address %q", host)
-			}
-			if !isPublicIP(ip) {
-				return fmt.Errorf("cimd: refusing to connect to the non-public address %s", ip)
+		// hostname instead would be defeated by exactly that. There are no
+		// allowed networks: a client_id URL never has a reason to reach a
+		// private address.
+		guard := dialGuard(nil, false)
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			if err := guard(network, address, c); err != nil {
+				return fmt.Errorf("cimd: %w", err)
 			}
 			return nil
-		},
+		}
 	}
 
 	return &cimdClient{
