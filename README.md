@@ -3,10 +3,6 @@
 Puts an OAuth 2.1 authorization surface in front of an MCP server that has none,
 and delegates the actual authentication to an OAuth provider you already run.
 
-Built to connect [forgejo-mcp](https://git.b4mad.industries/agentic-forges/forgejo-mcp)
-to Claude Code on the web, but nothing here is Forgejo-specific beyond the
-defaults.
-
 ## Why it exists
 
 MCP clients discover how to authenticate by fetching protected resource metadata
@@ -60,7 +56,7 @@ where a default is shown.
 | `PUBLIC_URL` | The origin clients dial, e.g. `https://git-mcp.example.com`. Used as the OAuth issuer and as the base of every advertised URL, so it must match reality. Must be `https` unless it is loopback. No trailing slash. A bare origin, so no path, query string, fragment or credentials; anything else is refused at boot. Spelling out a default port is fine; it is normalised before being compared against a browser's `Origin`. |
 | `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set. |
 | `TARGETS` | Comma-separated names, to serve several MCP servers from one proxy. See below. |
-| `UPSTREAM_ISSUER` | The OAuth provider's origin. Discovery is read from `/.well-known/openid-configuration`, falling back to `/.well-known/oauth-authorization-server`. |
+| `UPSTREAM_ISSUER` | The OAuth provider's issuer URL, e.g. `https://auth.example.com/application/o/mcp-proxy/` for an Authentik application with the slug `mcp-proxy`. Discovery is read from `/.well-known/openid-configuration` under it, falling back to `/.well-known/oauth-authorization-server`. |
 | `UPSTREAM_CLIENT_ID` | Client id of the application you registered with the provider. |
 | `UPSTREAM_CLIENT_SECRET` | Its secret. |
 | `UPSTREAM_SCOPES` | Space-separated. Default `openid profile email`. |
@@ -124,8 +120,9 @@ reads `TARGET_GIT_MCP_*`:
 TARGETS=forgejo,plane
 
 TARGET_FORGEJO_UPSTREAM_MCP_URL=http://forgejo-mcp:8080
-TARGET_FORGEJO_CREDENTIAL_MODE=provider_token
+TARGET_FORGEJO_CREDENTIAL_MODE=per_user
 TARGET_FORGEJO_DISPLAY_NAME=Forgejo
+TARGET_FORGEJO_USER_HEADERS=[{"header":"Authorization","label":"Forgejo access token","prefix":"Bearer "}]
 
 TARGET_PLANE_UPSTREAM_MCP_URL=http://plane-mcp-api:8211/http/api-key
 TARGET_PLANE_CREDENTIAL_MODE=static
@@ -138,7 +135,10 @@ shows instead, defaulting to the name with its first letter capitalised.
 
 `CREDENTIAL_MODE` is one of:
 
-- `provider_token`, the default, which forwards the provider's own token.
+- `provider_token`, the default, which forwards the provider's own token. This
+  only works when the MCP server accepts tokens from that provider, which is
+  usually not the case when the provider is a separate identity service such as
+  Authentik.
 - `static`, which sends the fixed `..._STATIC_HEADERS` instead.
 - `per_user`, which sends the credential each user stored for themselves. See
   below.
@@ -157,8 +157,10 @@ wrong service.
 
 `TARGETS` cannot be combined with `UPSTREAM_MCP_URL` or `UPSTREAM_STATIC_HEADERS`;
 setting both is refused at boot rather than resolved by precedence. Leaving
-`TARGETS` unset keeps the single-target behaviour exactly as it was, serving
-`/mcp` with `resource` optional, so an existing deployment needs no change.
+`TARGETS` unset keeps the single-target behaviour, serving `/mcp` with
+`resource` optional, so an existing deployment needs no configuration change.
+Upgrading from a release without stamps still signs everyone out once; see
+"Upgrading".
 
 ### Per-user credentials
 
@@ -187,7 +189,8 @@ own sign-in against the provider, so **its redirect URI,
 `PUBLIC_URL/callback`.**
 
 Credentials are stored encrypted with `ENCRYPTION_KEY`, keyed on the provider's
-`sub` claim and the target, and never logged. The key is the bare `sub`, never a
+`sub` claim, the target and the target's stamp (see "Upgrading"), and never
+logged. The key is the bare `sub`, never a
 username or email: those are mutable, so keying on one would orphan a stored
 credential the moment someone renamed their account. A provider that does not
 return `sub` cannot be used for `per_user` targets, and sign-in fails rather than
@@ -197,7 +200,9 @@ Only an allowlist of headers reaches the MCP server. The credential injected her
 is frequently not the caller's own, so any second authentication header the
 upstream happened to honour would let a caller override or sidestep it.
 
-Users can end a settings session with the Sign out control on the page. It clears this proxy's session only; an active session at the identity provider signs them straight back in.
+Users can end a settings session with the Sign out control on the page. It
+clears this proxy's session only; an active session at the identity provider
+signs them straight back in.
 
 Someone who has not enrolled gets **403** naming the settings page, and their
 request never reaches the MCP server. It is deliberately not a 401 challenge:
@@ -225,14 +230,19 @@ named groups, compared exactly, case included:
 
 ```
 TARGET_QUICKBOOKS_ALLOWED_GROUPS=admins
-UPSTREAM_SCOPES=openid profile email groups
 ```
 
 Groups come from the `groups` claim at the provider's userinfo endpoint, which
-must be an array of strings. Most providers send it only when the `groups`
-scope is requested, so add it to `UPSTREAM_SCOPES` and allow it on the
-provider's client. A caller outside the groups, or one whose groups cannot be
-read, gets `access_denied` at the end of the authorization flow and no token.
+must be an array of strings. Authentik includes it in its default `profile`
+scope, so the default `UPSTREAM_SCOPES` is enough there. Other providers send it
+only when a `groups` scope is requested; for those, add it to `UPSTREAM_SCOPES`
+(`openid profile email groups`) and allow it on the provider's client. A caller
+outside the groups, or one whose groups cannot be read, gets `access_denied` at
+the end of the authorization flow and no token.
+
+Name only groups that ordinary users cannot create. Some providers put names in
+this claim that any user can choose, such as organisations they created
+themselves, and a group named `admins` is then open to anyone who makes one.
 
 The check runs when a client authorizes, not on every request or refresh.
 Removing someone from a group therefore takes effect when their session ends,
@@ -276,8 +286,9 @@ caller-supplied.
 **Set it to the number of proxies actually in front of this process.** Behind an
 ingress every caller otherwise shares one bucket, so a single anonymous client
 exceeding the cap locks out registration and authorization for everyone — a
-remote kill switch rather than a defence. Each proxy appends the address it received from, so with one proxy the header
-holds the client and the peer is the proxy: the caller is the rightmost entry.
+remote kill switch rather than a defence. Each proxy appends the address it
+received from, so with one proxy the header holds the client and the peer is the
+proxy: the caller is the rightmost entry.
 With two, it is the entry before that. Only `len(chain) - hops` is read, so
 anything a caller prepends lands to the left of what your own proxy wrote and can
 never displace it.
@@ -318,13 +329,14 @@ If a target's stamp changes, they stop working for that target.
 
 | Path | Purpose |
 | --- | --- |
-| `/.well-known/oauth-protected-resource` | RFC 9728 metadata. Also served at `/mcp` suffix. |
-| `/.well-known/oauth-authorization-server` | RFC 8414 metadata. |
+| `/.well-known/oauth-protected-resource` | RFC 9728 metadata. Also served at `/mcp` suffix. With `TARGETS`, each target has its own at `/.well-known/oauth-protected-resource/<name>/mcp`. |
+| `/.well-known/oauth-authorization-server` | RFC 8414 metadata. Also served at `/mcp` suffix. |
 | `/register` | RFC 7591 dynamic client registration. |
 | `/authorize`, `/consent` | Authorization request, then the consent screen. Nothing reaches the provider until the user approves. |
 | `/callback`, `/token` | Provider redirect and token issuance. Authorization code flow with PKCE. |
 | `/revoke` | RFC 7009. Presenting either token ends the whole session. |
-| `/mcp` | Authenticated pass-through to the upstream MCP server. |
+| `/mcp` | Authenticated pass-through to the upstream MCP server. With `TARGETS`, each target is at `/<name>/mcp` instead. |
+| `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Served only when some target is `per_user`. |
 | `/healthz` | Liveness. Reports only on this process. |
 
 ## Security notes
@@ -421,18 +433,18 @@ subdomain, could fix the value. The `Origin` check is what covers that case.
   they are capped tightly; `/consent`, `/callback`, `/token` and `/revoke` all
   demand a high-entropy credential first, so they share a much looser backstop.
   A tight cap there would buy little and would break a hosted MCP client whose
-  users all refresh from one egress address. `X-Forwarded-For` is deliberately
-  ignored, because honouring a client-supplied header would let an attacker
-  pick a fresh bucket per request; behind a load balancer these are therefore
-  caps on total rate, not per-caller ones.
+  users all refresh from one egress address. `X-Forwarded-For` is ignored
+  unless `TRUSTED_PROXY_HOPS` and `TRUSTED_PROXY_CIDRS` are set, because
+  honouring a client-supplied header would let an attacker pick a fresh bucket
+  per request. Without them, behind a load balancer these are caps on total
+  rate, not per-caller ones. See "Rate limiting behind a proxy".
 
 ### What this does not fix
 
 **The proxy inherits whatever the provider grants.** If the provider cannot
-issue scoped tokens — Forgejo currently cannot, its OAuth2 scopes are not
-implemented — then the credential this proxy holds carries the authorizing
-user's full rights. The proxy changes who holds the token, not how much it can
-do. This is why the consent screen says the client can do anything the account
+issue tokens scoped to less than the whole account, then the credential this
+proxy holds carries the authorizing user's full rights. The proxy changes who
+holds the token, not how much it can do. This is why the consent screen says the client can do anything the account
 can.
 
 ## Development
