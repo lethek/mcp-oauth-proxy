@@ -738,3 +738,41 @@ func TestStaticTargetKeepsItsValueOnlyForTheSameServer(t *testing.T) {
 		t.Errorf("err = %v, want ErrStaticValueRequired", err)
 	}
 }
+
+// A row that cannot be decoded is left out and still holds its name. It does not
+// stop a boot or hide the other admin targets.
+func TestUndecodableRowIsLeftOutWithoutBlockingTheRest(t *testing.T) {
+	h := newHarnessWith(t, adminTwoTargets)
+	h.createAdmin(h.adminTarget("gamma", "/alpha-upstream"))
+	h.createAdmin(h.adminTarget("alpha", "/beta-upstream"))
+	if _, err := h.srv.store.pool.Exec(t.Context(), `UPDATE targets SET user_fields='"not a list"' WHERE name='alpha'`); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+
+	booted, _ := h.secondReplica()
+	snap := booted.Load()
+	if snap.find("gamma") == nil {
+		t.Error("the intact admin target is not served")
+	}
+	if e := snap.find("alpha"); e != nil {
+		t.Errorf("the undecodable row is served (source %v), or the config target took its name", e.Target.Source)
+	}
+	if !strings.Contains(logs.String(), "admin target left out") {
+		t.Error("the unusable row was not logged")
+	}
+	h.rebuild()
+}
+
+// The ignored notice is logged when a config target becomes ignored, not on
+// every rebuild while the clash lasts.
+func TestIgnoredConfigTargetIsLoggedOnce(t *testing.T) {
+	h := newHarnessWith(t, adminTwoTargets)
+	h.createAdmin(h.adminTarget("alpha", "/beta-upstream"))
+	logs := captureLogs(t)
+	h.rebuild()
+	h.rebuild()
+	if n := strings.Count(logs.String(), "config target ignored"); n != 1 {
+		t.Errorf("logged %d times over two rebuilds, want 1", n)
+	}
+}

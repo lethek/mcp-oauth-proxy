@@ -10,6 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// TakeRefreshToken takes a refresh token outside a grant. Production always
+// takes it inside one, so this lives with the tests.
+func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (sessionID string, err error) {
+	ref, err := s.takeRefreshToken(ctx, s.pool, token, clientID)
+	return ref.ID, err
+}
+
 // newTestStore connects to the database named by TEST_DATABASE_URL and clears
 // it. Without that variable the database-backed tests skip, so `go test ./...`
 // still works on a machine with no Postgres. Under CI they fail instead: a

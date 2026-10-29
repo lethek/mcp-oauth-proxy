@@ -345,7 +345,7 @@ func changedFields(old, t Target, staticSupplied bool) []string {
 	return out
 }
 
-func (s *Server) editView(sess adminSession, key TargetKey, isNew bool, f adminFields, hasStatic bool, msg string) adminEditView {
+func editView(sess adminSession, key TargetKey, isNew bool, f adminFields, hasStatic bool, msg string) adminEditView {
 	v := adminEditView{
 		New: isNew, Name: key.Name, RowID: key.RowID, Revision: key.Revision, Fields: f, HasStatic: hasStatic, Error: msg,
 		Action: "/admin/targets/new",
@@ -365,7 +365,7 @@ func (s *Server) handleAdminNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writePage(w, http.StatusOK, adminEditTemplate, "'self'",
-		s.editView(sess, TargetKey{}, true, adminFields{Mode: string(CredProviderToken)}, false, ""))
+		editView(sess, TargetKey{}, true, adminFields{Mode: string(CredProviderToken)}, false, ""))
 }
 
 func (s *Server) handleAdminCreate(w http.ResponseWriter, r *http.Request) {
@@ -376,13 +376,20 @@ func (s *Server) handleAdminCreate(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PostForm.Get("name"))
 	f := fieldsPosted(r)
 	again := func(status int, msg string) {
-		v := s.editView(sess, key, true, f, false, msg)
+		v := editView(sess, key, true, f, false, msg)
 		v.Name = name
 		writePage(w, status, adminEditTemplate, "'self'", v)
 	}
 	t, supplied, msg := parseTarget(name, f, r.PostForm.Get("static_headers"))
 	if msg != "" {
 		again(http.StatusBadRequest, msg)
+		return
+	}
+	// A name is taken by a config target too. The registry would let the new
+	// target outrank it, which is for a config target added after the fact, not
+	// for displacing one that is serving now.
+	if s.reg.Load().configHolds(name) {
+		again(http.StatusConflict, "A server from the configuration already uses that name.")
 		return
 	}
 	_, err := s.store.CreateTarget(r.Context(), t, sess.Subject)
@@ -439,7 +446,7 @@ func (s *Server) handleAdminEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	key := TargetKey{Name: cur.Target.Name, RowID: cur.RowID, Revision: cur.Revision}
 	writePage(w, http.StatusOK, adminEditTemplate, "'self'",
-		s.editView(sess, key, false, fieldsOf(cur.Target), cur.Target.Mode == CredStatic, ""))
+		editView(sess, key, false, fieldsOf(cur.Target), cur.Target.Mode == CredStatic, ""))
 }
 
 func (s *Server) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
@@ -454,7 +461,7 @@ func (s *Server) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
 	f := fieldsPosted(r)
 	again := func(status int, msg string) {
 		writePage(w, status, adminEditTemplate, "'self'",
-			s.editView(sess, key, false, f, cur.Target.Mode == CredStatic, msg))
+			editView(sess, key, false, f, cur.Target.Mode == CredStatic, msg))
 	}
 	t, supplied, msg := parseTarget(key.Name, f, r.PostForm.Get("static_headers"))
 	if msg != "" {
@@ -520,7 +527,7 @@ func (s *Server) renderConfirm(w http.ResponseWriter, r *http.Request, status in
 	}
 	key := TargetKey{Name: cur.Target.Name, RowID: cur.RowID, Revision: cur.Revision}
 	writePage(w, status, adminConfirmTemplate, "'self'", adminConfirmView{
-		Remove: kind == "remove", Name: key.Name, Display: cur.Target.DisplayName,
+		Remove: kind == "remove", TakeOver: kind == "remove" && s.reg.Load().wasIgnored(key.Name), Name: key.Name, Display: cur.Target.DisplayName,
 		Sessions: sessions, Enrolments: enrolments,
 		Action: "/admin/targets/" + key.Name + "/" + kind, CSRF: sess.token(kind, key),
 		RowID: key.RowID, Revision: key.Revision, Fields: f,
@@ -633,6 +640,8 @@ type adminConfirmView struct {
 	Fields     adminFields
 	NeedStatic bool
 	Error      string
+	// TakeOver is set when a config target of the same name is waiting.
+	TakeOver bool
 }
 
 var (

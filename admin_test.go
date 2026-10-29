@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
 	"log/slog"
@@ -676,6 +677,43 @@ func TestListShowsConfigTargetsReadOnlyAndClashes(t *testing.T) {
 	}
 	if strings.Contains(body, "/admin/targets/beta/edit") {
 		t.Error("a config target offers an edit link")
+	}
+}
+
+// The page refuses a name a config target uses, rather than displacing a target
+// that is serving now.
+func TestCreateRefusesANameAConfigTargetUses(t *testing.T) {
+	h := newHarnessWith(t, adminUser42)
+	h.mustSignInAdmin()
+
+	status, body, _ := h.do("POST", "/admin/targets/new", h.createTargetForm("alpha", "/beta-upstream", "provider_token", ""), nil)
+	if status != http.StatusConflict || !strings.Contains(body, "already uses that name") {
+		t.Fatalf("status %d, want 409 with the reason", status)
+	}
+	if _, err := h.srv.store.GetTarget(t.Context(), "alpha"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a row was stored for a config target's name: err = %v", err)
+	}
+	if e := h.srv.reg.Load().find("alpha"); e == nil || e.Target.Source == SourceAdmin {
+		t.Error("the config target no longer serves its name")
+	}
+}
+
+// Removing an admin target that outranks a config target hands the name over,
+// and the page says so before the person confirms.
+func TestRemovePageSaysAConfigTargetTakesOver(t *testing.T) {
+	h := newHarnessWith(t, adminUser42)
+	h.createAdmin(h.adminTarget("alpha", "/beta-upstream"))
+	h.createAdmin(h.adminTarget("gamma", "/beta-upstream"))
+	h.rebuild()
+	h.mustSignInAdmin()
+
+	_, body, _ := h.do("GET", "/admin/targets/alpha/remove", nil, nil)
+	if !strings.Contains(body, "takes over the name") {
+		t.Error("the remove page does not mention the config target taking over")
+	}
+	_, body, _ = h.do("GET", "/admin/targets/gamma/remove", nil, nil)
+	if strings.Contains(body, "takes over the name") {
+		t.Error("the remove page claims a config target takes over a name no config target has")
 	}
 }
 

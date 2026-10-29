@@ -147,6 +147,9 @@ shows instead, defaulting to the name with its first letter capitalised.
 - `per_user`, which sends the credential each user stored for themselves. See
   below.
 
+Static header names that differ only in case, such as `Authorization` and
+`authorization`, are refused at boot.
+
 Each target is served at `PUBLIC_URL/<name>/mcp` and is a distinct OAuth
 resource, with its own RFC 9728 document at
 `/.well-known/oauth-protected-resource/<name>/mcp`. There is still one issuer and
@@ -269,6 +272,17 @@ Enabling it has these requirements, and the proxy refuses to start without them:
   cannot be combined with it. `TARGETS` may be empty, because admin targets can
   supply them all.
 
+The `targets` and `targets_version` tables and the `settings_flows.kind` column
+are created at boot even when the feature is off. `ADMIN_*` and
+`ALLOWED_UPSTREAM_*` variables are validated whenever they are set, so a bad
+value stops the proxy starting either way.
+
+In `provider_token` mode, whoever administers targets can send any user's
+provider token to any host on `ALLOWED_UPSTREAM_HOSTS`. The user's defence is the
+consent page, which shows the upstream host before they approve. The settings
+page shows it too. Keep the list short and treat admin access as equal to access
+to those tokens.
+
 Where an admin target may connect is decided by address as well as name. The
 address actually dialled must be public, unless it falls in
 `ALLOWED_UPSTREAM_NETWORKS`. A host on `ALLOWED_UPSTREAM_HOSTS` does not open any
@@ -279,10 +293,12 @@ multicast and NAT64 addresses are refused whatever the lists say. Admin targets
 ignore `HTTP_PROXY` and `HTTPS_PROXY`, so an egress proxy has to enforce the same
 rules itself.
 
-A name belongs to one source at a time. If an admin target takes the name of a
-target in the environment, the environment entry is left out and logged, and the
+A name belongs to one source at a time. The admin page refuses to create a target
+whose name an environment target uses. If an environment target is added later
+under the name of an admin target, the environment entry is left out and logged, and the
 proxy still starts. Removing the admin target gives the name back to the
-environment entry, which inherits none of its sessions or credentials.
+environment entry, which inherits none of its sessions or credentials. The
+removal page says when that will happen.
 
 Changes reach every replica within about 5 seconds, and a replica that has not
 yet seen a change answers `503` with `Retry-After` rather than serving the old

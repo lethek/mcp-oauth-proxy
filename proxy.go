@@ -134,8 +134,9 @@ func (b *boundHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// newReverseProxy targets the upstream MCP server. Streamable HTTP keeps a
-// long-lived response open, so buffering has to stay off.
+// newReverseProxyWith targets the upstream MCP server over rt, which is how an
+// admin target gets its dial guard. Streamable HTTP keeps a long-lived response
+// open, so buffering has to stay off.
 //
 // enrolURL, when set, turns an upstream 401 into advice. In per_user mode a 401
 // from the MCP server means the credential this user stored is no longer
@@ -145,12 +146,6 @@ func (b *boundHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // The concurrency bound is applied here rather than by the caller so that no
 // construction site can forget it.
-func newReverseProxy(target *url.URL, enrolURL string) http.Handler {
-	return newReverseProxyWith(upstreamTransport, target, enrolURL)
-}
-
-// newReverseProxyWith is newReverseProxy over a transport of the caller's
-// choosing, which is how an admin target gets its dial guard.
 func newReverseProxyWith(rt http.RoundTripper, target *url.URL, enrolURL string) http.Handler {
 	p := &httputil.ReverseProxy{
 		Transport: rt,
