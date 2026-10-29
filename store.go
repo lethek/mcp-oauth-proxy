@@ -706,21 +706,15 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, client
 	return err
 }
 
-// TakeRefreshToken marks the token used and returns its session, enforcing both
-// the refresh token's own lifetime and the session's absolute one.
+// takeRefreshToken marks the token used and returns its session, enforcing both
+// the refresh token's own lifetime and the session's absolute one. It also
+// returns the session's target, stamp and the stamp the database holds for that
+// target, so the caller can refuse a refresh for a definition that has changed.
+// The caller does so before committing the grant, which leaves the token unused.
 //
 // It returns ErrTokenReused when the token exists but was already rotated.
 // Rotation alone only detects theft; acting on that signal is what contains it,
 // so the caller revokes the session.
-func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (sessionID string, err error) {
-	ref, err := s.takeRefreshToken(ctx, s.pool, token, clientID)
-	return ref.ID, err
-}
-
-// takeRefreshToken also returns the session's target, stamp and the stamp the
-// database holds for that target, so the caller can refuse a refresh for a
-// definition that has changed. The caller does so before committing the grant,
-// which leaves the token unused.
 func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID string) (ref SessionRef, err error) {
 	hash := hashToken(token)
 	column, join := s.freshnessSQL()
@@ -1079,6 +1073,9 @@ type AdminTarget struct {
 	SealedStatic []byte
 	UpdatedAt    time.Time
 	UpdatedBy    string
+	// DecodeErr is set when a stored column could not be decoded. Such a row is
+	// listed but never served.
+	DecodeErr error
 }
 
 // TargetKey is what a change is checked against. Revision alone is not an
@@ -1104,8 +1101,11 @@ func scanAdminTarget(row pgx.Row) (AdminTarget, error) {
 	}
 	t.Mode, t.Source = CredentialMode(mode), SourceAdmin
 	if fields != nil {
+		// Not fatal: one undecodable row must not stop a boot or block every
+		// rebuild. The registry leaves the row out and logs why.
 		if err := json.Unmarshal(fields, &t.UserFields); err != nil {
-			return AdminTarget{}, fmt.Errorf("target %q: user_fields: %w", t.Name, err)
+			a.DecodeErr = fmt.Errorf("user_fields cannot be decoded: %w", err)
+			t.UserFields = nil
 		}
 	}
 	return a, nil

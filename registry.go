@@ -219,6 +219,13 @@ func (r *registry) Rebuild(ctx context.Context) error {
 	}
 	snap.version, snap.ignored = version, ignored
 	prev := r.Load()
+	// Logged when the set changes, not on every rebuild, or the poller would
+	// repeat it for as long as the clash lasts.
+	for _, ig := range ignored {
+		if !prev.wasIgnored(ig.Name) {
+			slog.Warn("config target ignored: name in use by an admin target", "target", ig.Name)
+		}
+	}
 	r.Store(snap)
 	// A replaced or removed admin target's pooled connections would otherwise
 	// idle until their timeout. In-flight requests are unaffected.
@@ -230,6 +237,23 @@ func (r *registry) Rebuild(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// configHolds reports whether a config target has the name, whether it is served
+// or left out behind an admin target.
+func (s *snapshot) configHolds(name string) bool {
+	if e := s.find(name); e != nil && e.Target.Source != SourceAdmin {
+		return true
+	}
+	return s.wasIgnored(name)
+}
+
+// wasIgnored tolerates a nil snapshot, like find.
+func (s *snapshot) wasIgnored(name string) bool {
+	if s == nil {
+		return false
+	}
+	return slices.ContainsFunc(s.ignored, func(i ignoredTarget) bool { return i.Name == name })
 }
 
 // sameProxy reports whether e carries the proxy o does, which is how a rebuild
@@ -252,7 +276,6 @@ func (r *registry) merge(rows []AdminTarget) ([]Target, []ignoredTarget) {
 	var ignored []ignoredTarget
 	for _, t := range r.cfg.Targets {
 		if held[t.Name] {
-			slog.Warn("config target ignored: name in use by an admin target", "target", t.Name)
 			ignored = append(ignored, ignoredTarget{t.Name, "name in use by an admin target"})
 			continue
 		}
@@ -276,6 +299,9 @@ func (r *registry) usable(row AdminTarget) (Target, error) {
 	t := row.Target
 	t.Resource = r.cfg.PublicURL + "/" + t.Name + "/mcp"
 
+	if row.DecodeErr != nil {
+		return Target{}, row.DecodeErr
+	}
 	if t.Name == "" {
 		return Target{}, errors.New("the name is empty")
 	}

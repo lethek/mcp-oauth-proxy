@@ -7,6 +7,7 @@
   {{.Sessions}} session{{if ne .Sessions 1}}s{{end}} and delete {{.Enrolments}} saved credential{{if ne .Enrolments 1}}s{{end}}.
   People will have to sign in again{{if not .Remove}}, and enter their own credentials again{{end}}.</p>
 
+  {{if .TakeOver}}<p class="banner">A server of the same name is set in the configuration. Once this one is removed, that server takes over the name.</p>{{end}}
   {{if .Error}}<p class="banner banner-error" role="alert">{{.Error}}</p>{{end}}
   <form method="post" action="{{.Action}}">
     <input type="hidden" name="csrf" value="{{.CSRF}}">

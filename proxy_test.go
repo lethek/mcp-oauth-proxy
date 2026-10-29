@@ -92,7 +92,7 @@ func TestUpstreamConcurrencyIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	front := httptest.NewServer(newReverseProxy(target, ""))
+	front := httptest.NewServer(newReverseProxyWith(upstreamTransport, target, ""))
 	defer front.Close()
 
 	// Fill every slot. Each of these stays parked in the upstream handler until
@@ -154,7 +154,7 @@ func TestConcurrencySlotsAreReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	front := httptest.NewServer(newReverseProxy(target, ""))
+	front := httptest.NewServer(newReverseProxyWith(upstreamTransport, target, ""))
 	defer front.Close()
 
 	for i := range maxInFlightPerTarget * 3 {
