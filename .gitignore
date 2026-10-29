@@ -7,3 +7,8 @@
 # per-machine and rebuilt on demand.
 .fuse/
 .serena/
+
+# Claude Code local configurations and state
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/agent-memory-local/
