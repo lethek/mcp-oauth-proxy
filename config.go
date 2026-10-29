@@ -590,16 +590,6 @@ func (t Target) Admits(groups []string) bool {
 	return false
 }
 
-// HasPerUserTargets reports whether the enrolment page has anything to offer.
-func (c *Config) HasPerUserTargets() bool {
-	for _, t := range c.Targets {
-		if t.Mode == CredPerUser {
-			return true
-		}
-	}
-	return false
-}
-
 // checkTargetURL holds an MCP server to a weaker rule than a browser-facing URL
 // on purpose. No browser goes there, and the common deployment puts it beside
 // this proxy on a private network, where plain http is normal and demanding TLS
@@ -719,36 +709,6 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-// ResourceURI is the canonical identifier of the MCP endpoint, used as the
-// `resource` value in metadata and as the audience of the tokens we issue.
-// Meaningful only for a single-target deployment.
-func (c *Config) ResourceURI() string { return c.Targets[0].Resource }
-
-// MultiTarget reports whether this deployment serves named targets. It governs
-// two behaviours: whether the `resource` parameter is required at /authorize,
-// and whether a session carrying no resource may be used at all.
-func (c *Config) MultiTarget() bool { return c.Targets[0].Name != "" }
-
-// TargetByResource finds the target a `resource` value names.
-func (c *Config) TargetByResource(resource string) (Target, bool) {
-	resource = strings.TrimRight(resource, "/")
-	for _, t := range c.Targets {
-		if t.Resource == resource {
-			return t, true
-		}
-	}
-	return Target{}, false
-}
-
-// ResourceList is every resource this proxy serves, for error messages.
-func (c *Config) ResourceList() string {
-	out := make([]string, 0, len(c.Targets))
-	for _, t := range c.Targets {
-		out = append(out, t.Resource)
-	}
-	return strings.Join(out, ", ")
 }
 
 // MetadataPath is where RFC 9728 says this target's protected-resource document

@@ -6,14 +6,14 @@
   personal access token. Save yours here and it is used whenever your apps call that server.</p>
 </header>
 
-<div class="account">
+{{if .Subject}}<div class="account">
   <span><span class="muted">Signed in as</span> <strong>{{.Subject}}</strong></span>
   <form method="post" action="/settings/logout">
     <button type="submit" class="btn btn-sm">Sign out</button>
   </form>
 </div>
 <p class="fine">Signing out ends this page's session only. If you are still signed in at
-your identity provider, you will be signed straight back in.</p>
+your identity provider, you will be signed straight back in.</p>{{end}}
 
 {{if .Notice}}<p class="banner" role="status">{{if eq .Notice "saved"}}Credential saved.{{else}}Credential removed.{{end}}</p>{{end}}
 

@@ -96,6 +96,12 @@ func (s *Server) handleSettingsLogout(w http.ResponseWriter, r *http.Request) {
 // handleSettings renders the catalogue, sending the user through the provider
 // first when they are not signed in.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	// With nothing to enrol there is nothing to protect, so an anonymous visitor
+	// is not sent to the provider just to be told so.
+	if !s.reg.Load().HasPerUserTargets() {
+		renderSettings(w, settingsView{})
+		return
+	}
 	identity := s.identityFrom(r)
 	if identity.Subject == "" {
 		s.startSettingsLogin(w, r)
@@ -110,7 +116,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := settingsView{Subject: identity.Label(), Notice: r.URL.Query().Get("notice")}
-	for _, t := range s.cfg.Targets {
+	for _, e := range s.reg.Load().entries {
+		t := e.Target
 		if t.Mode != CredPerUser {
 			continue
 		}
@@ -219,9 +226,9 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	// rather than trusted. Only a per_user target can be written.
 	name := r.PostForm.Get("target")
 	var target Target
-	for _, t := range s.cfg.Targets {
-		if t.Name == name && t.Mode == CredPerUser {
-			target = t
+	for _, e := range s.reg.Load().entries {
+		if e.Target.Name == name && e.Target.Mode == CredPerUser {
+			target = e.Target
 		}
 	}
 	if target.Name == "" {

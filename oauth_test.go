@@ -362,18 +362,12 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	cfg.Targets = build(cfg, h.provider.URL)
 	s.upstream = NewUpstream(cfg)
 
-	s.proxies = map[string]http.Handler{}
-	for _, tgt := range cfg.Targets {
-		u, parseErr := url.Parse(tgt.UpstreamMCP)
-		if parseErr != nil {
-			t.Fatal(parseErr)
-		}
-		enrolURL := ""
-		if tgt.Mode == CredPerUser {
-			enrolURL = cfg.PublicURL + "/settings"
-		}
-		s.proxies[tgt.Name] = newReverseProxy(u, enrolURL)
+	snap, snapErr := newSnapshot(cfg.Targets, cfg.PublicURL, nil)
+	if snapErr != nil {
+		t.Fatal(snapErr)
 	}
+	s.reg = &registry{}
+	s.reg.Store(snap)
 
 	h.proxy.Config.Handler = s.routes()
 	h.proxy.Start()

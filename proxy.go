@@ -84,19 +84,28 @@ const maxInFlightPerTarget = 64
 // in flight. Queueing would convert exhaustion into unbounded latency for
 // everyone, which is not an improvement on refusing the caller who caused it.
 func boundConcurrency(h http.Handler, n int) http.Handler {
-	slots := make(chan struct{}, n)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case slots <- struct{}{}:
-			defer func() { <-slots }()
-			h.ServeHTTP(w, r)
-		default:
-			slog.Warn("mcp: refused a request; the upstream already has the maximum in flight", "limit", n)
-			w.Header().Set("Retry-After", "5")
-			oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
-				"too many requests are already in flight to this server; retry shortly")
-		}
-	})
+	return &boundHandler{next: h, limit: n, slots: make(chan struct{}, n)}
+}
+
+// boundHandler is a named pointer type, rather than a closure, so two proxies
+// can be compared for identity when the registry reuses one.
+type boundHandler struct {
+	next  http.Handler
+	limit int
+	slots chan struct{}
+}
+
+func (b *boundHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case b.slots <- struct{}{}:
+		defer func() { <-b.slots }()
+		b.next.ServeHTTP(w, r)
+	default:
+		slog.Warn("mcp: refused a request; the upstream already has the maximum in flight", "limit", b.limit)
+		w.Header().Set("Retry-After", "5")
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
+			"too many requests are already in flight to this server; retry shortly")
+	}
 }
 
 // newReverseProxy targets the upstream MCP server. Streamable HTTP keeps a
@@ -249,26 +258,22 @@ var upstreamAllowedHeaders = map[string]bool{
 }
 
 // prepareUpstreamHeaders reduces the request to what the upstream should see and
-// then, when static headers are configured, applies those. It reports whether
-// the upstream credential is now settled.
+// then applies the given headers. Which credential applies is the caller's
+// decision, made from the target's mode.
 //
 // Everything the caller sent that is not on the allowlist is dropped before any
 // decision about what replaces it. Relying on the injection to overwrite the
 // caller's Authorization would leak that token upstream whenever the configured
 // headers happen not to include one.
-func prepareUpstreamHeaders(r *http.Request, static map[string]string) bool {
+func prepareUpstreamHeaders(r *http.Request, headers map[string]string) {
 	for name := range r.Header {
 		if !upstreamAllowedHeaders[http.CanonicalHeaderKey(name)] {
 			r.Header.Del(name)
 		}
 	}
-	if len(static) == 0 {
-		return false
-	}
-	for name, value := range static {
+	for name, value := range headers {
 		r.Header.Set(name, value)
 	}
-	return true
 }
 
 // refreshLocks serialises refreshes per session, so a burst of concurrent
@@ -294,100 +299,124 @@ func refreshLock(sessionID string) *sync.Mutex {
 // handleMCP authenticates the caller against a token we issued, checks that the
 // token was issued for THIS target, swaps in the upstream credential, and
 // forwards.
-func (s *Server) handleMCP(t Target) http.HandlerFunc {
-	proxy := s.proxies[t.Name]
-	stamp := t.Stamp()
+//
+// The target is resolved per request from the snapshot, which is loaded once so
+// the audience check, the stamp check and the credential all describe the same
+// definition.
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	// Before authentication, because a traversal is malformed whoever sent it
+	// and there is no reason to spend a database lookup deciding that. It also
+	// precedes the lookup, so a wildcard route cannot be steered by a name
+	// containing dot segments.
+	if hasDotSegments(r.URL.Path) {
+		slog.Warn("mcp: refused a path containing dot segments", "path", r.URL.Path)
+		oauthError(w, http.StatusBadRequest, "invalid_request", "the request path may not contain dot segments")
+		return
+	}
 
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Before authentication, because a traversal is malformed whoever sent it
-		// and there is no reason to spend a database lookup deciding that.
-		if hasDotSegments(r.URL.Path) {
-			slog.Warn("mcp: refused a path containing dot segments", "path", r.URL.Path, "target", t.Name)
-			oauthError(w, http.StatusBadRequest, "invalid_request", "the request path may not contain dot segments")
-			return
+	// Empty in a single-target deployment, whose routes have no {target}.
+	snap := s.reg.Load()
+	e := snap.byName[r.PathValue("target")]
+	if e == nil {
+		http.NotFound(w, r)
+		return
+	}
+	t, stamp, proxy := e.Target, e.Stamp, e.Proxy
+	multi := snap.MultiTarget()
+
+	token := bearerFrom(r)
+	if token == "" {
+		s.challengeFor(w, t, "", "")
+		return
+	}
+
+	ref, err := s.store.LookupAccessToken(r.Context(), token)
+	sessionID := ref.ID
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			slog.Error("mcp: token lookup failed", "err", err)
 		}
+		s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
+		return
+	}
 
-		token := bearerFrom(r)
-		if token == "" {
-			s.challengeFor(w, t, "", "")
-			return
-		}
+	// The audience check. Without it a token minted for one target would work
+	// against every other, which would turn separate upstreams into one
+	// permission. A challenge naming THIS target's metadata is returned rather
+	// than a flat refusal, so a client holding the wrong token can discover the
+	// right resource and fetch a usable one by itself.
+	//
+	// An empty resource means a session from a single-target deployment that
+	// never asked for one. That is only acceptable while there is exactly one
+	// target to mean; with several it fails shut.
+	if ref.Resource != t.Resource && (ref.Resource != "" || multi) {
+		slog.Warn("mcp: token presented at the wrong resource",
+			"session", sessionID, "token_resource", ref.Resource, "target", t.Resource)
+		s.challengeFor(w, t, "invalid_token", "this token was not issued for "+t.Resource)
+		return
+	}
 
-		ref, err := s.store.LookupAccessToken(r.Context(), token)
-		sessionID := ref.ID
-		if err != nil {
-			if !errors.Is(err, ErrNotFound) {
-				slog.Error("mcp: token lookup failed", "err", err)
-			}
-			s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
-			return
-		}
+	// The audience check names the target; the stamp says it is still the
+	// same target. A session issued under another definition of this name
+	// would otherwise reach whatever this one points at now.
+	if ref.Stamp != stamp {
+		slog.Warn("mcp: session was issued under a different definition of this target",
+			"session", sessionID, "target", t.Name)
+		s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
+		return
+	}
 
-		// The audience check. Without it a token minted for one target would work
-		// against every other, which would turn separate upstreams into one
-		// permission. A challenge naming THIS target's metadata is returned rather
-		// than a flat refusal, so a client holding the wrong token can discover the
-		// right resource and fetch a usable one by itself.
-		//
-		// An empty resource means a session from a single-target deployment that
-		// never asked for one. That is only acceptable while there is exactly one
-		// target to mean; with several it fails shut.
-		if ref.Resource != t.Resource && (ref.Resource != "" || s.cfg.MultiTarget()) {
-			slog.Warn("mcp: token presented at the wrong resource",
-				"session", sessionID, "token_resource", ref.Resource, "target", t.Resource)
-			s.challengeFor(w, t, "invalid_token", "this token was not issued for "+t.Resource)
-			return
-		}
-
-		// The audience check names the target; the stamp says it is still the
-		// same target. A session issued under another definition of this name
-		// would otherwise reach whatever this one points at now.
-		if ref.Stamp != stamp {
-			slog.Warn("mcp: session was issued under a different definition of this target",
-				"session", sessionID, "target", t.Name)
-			s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
-			return
-		}
-
+	switch t.Mode {
+	case CredPerUser:
 		// In per_user mode the credential is the caller's own, found through the
 		// subject behind this session. Not being enrolled answers 403 rather than a
 		// 401 challenge: the caller authenticated correctly and re-authenticating
 		// will not help, so a challenge would only put a well-behaved client into a
 		// retry loop. The upstream is never contacted.
-		if t.Mode == CredPerUser {
-			headers, err := s.userHeadersFor(r, sessionID, t)
-			switch {
-			case err == nil:
-			case errors.Is(err, ErrNotFound):
-				s.notEnrolled(w, t)
-				return
-			default:
-				// A database outage, a rotated encryption key or a corrupt row is
-				// not the user's problem to fix. Telling them to go and set a
-				// credential sends them to do something that will not help and
-				// hides a server fault behind a 403.
-				slog.Error("mcp: could not read the stored credential",
-					"err", err, "session", sessionID, "target", t.Name)
-				oauthError(w, http.StatusInternalServerError, "server_error",
-					"your stored credential could not be read")
-				return
-			}
-			stripTargetPrefix(r, t)
-			prepareUpstreamHeaders(r, headers)
-			proxy.ServeHTTP(w, r)
+		headers, err := s.userHeadersFor(r, sessionID, t)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrNotFound):
+			s.notEnrolled(w, t)
+			return
+		default:
+			// A database outage, a rotated encryption key or a corrupt row is
+			// not the user's problem to fix. Telling them to go and set a
+			// credential sends them to do something that will not help and
+			// hides a server fault behind a 403.
+			slog.Error("mcp: could not read the stored credential",
+				"err", err, "session", sessionID, "target", t.Name)
+			oauthError(w, http.StatusInternalServerError, "server_error",
+				"your stored credential could not be read")
 			return
 		}
-
 		stripTargetPrefix(r, t)
+		prepareUpstreamHeaders(r, headers)
+		proxy.ServeHTTP(w, r)
+		return
 
-		// In static mode the upstream authenticates with a fixed credential, so this
-		// session's provider token is irrelevant. It is deliberately not loaded: it
-		// may have expired with no refresh token available, and failing a request
-		// over a credential we were never going to send would be wrong.
-		if prepareUpstreamHeaders(r, t.StaticHeaders) {
-			proxy.ServeHTTP(w, r)
+	case CredStatic:
+		// The upstream authenticates with a fixed credential, so this session's
+		// provider token is irrelevant. It is deliberately not loaded: it may have
+		// expired with no refresh token available, and failing a request over a
+		// credential we were never going to send would be wrong.
+		//
+		// A static target with nothing to send is a configuration fault. Falling
+		// through to the provider token would hand it to a server that was never
+		// meant to receive it, so this fails closed.
+		if len(t.StaticHeaders) == 0 {
+			slog.Error("mcp: static target has no headers to send", "target", t.Name)
+			oauthError(w, http.StatusInternalServerError, "server_error", "this server is misconfigured")
 			return
 		}
+		stripTargetPrefix(r, t)
+		prepareUpstreamHeaders(r, t.StaticHeaders)
+		proxy.ServeHTTP(w, r)
+		return
+
+	case CredProviderToken:
+		stripTargetPrefix(r, t)
+		prepareUpstreamHeaders(r, nil)
 
 		upstreamTok, err := s.currentUpstreamToken(r, sessionID, stamp)
 		if err != nil {
@@ -398,6 +427,12 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 
 		r.Header.Set("Authorization", "Bearer "+upstreamTok.AccessToken)
 		proxy.ServeHTTP(w, r)
+
+	default:
+		// Only provider_token may forward the provider's token, so a mode this
+		// code does not know fails closed rather than receiving it.
+		slog.Error("mcp: target has an unknown credential mode", "target", t.Name, "mode", t.Mode)
+		oauthError(w, http.StatusInternalServerError, "server_error", "this server is misconfigured")
 	}
 }
 
