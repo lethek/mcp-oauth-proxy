@@ -88,6 +88,7 @@ func (s *Store) freshnessSQL() (column, join string) {
 	}
 	return "tg.stamp", "LEFT JOIN targets tg ON tg.name = s.target"
 }
+
 func NewStore(ctx context.Context, url string, refreshTTL, sessionTTL time.Duration) (*Store, error) {
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {

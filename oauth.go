@@ -723,7 +723,9 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 			s.refuseBehind(w)
 			return
 		}
-		if e != nil && ref.Stamp != e.Stamp {
+		// A target this replica does not serve, with no row behind it either, was
+		// removed. The session is dead, not merely stale.
+		if e == nil || ref.Stamp != e.Stamp {
 			oauthError(w, http.StatusBadRequest, "invalid_grant", "the target changed since this session was issued; authorize again")
 			return
 		}

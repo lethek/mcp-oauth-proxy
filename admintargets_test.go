@@ -271,6 +271,47 @@ func TestRebuildRacingAnEditPublishesOneConsistentState(t *testing.T) {
 	}
 }
 
+// Once this replica has caught up, a refresh for a session issued under a
+// replaced definition, or for a target that is gone, is invalid_grant. Neither
+// consumes the refresh token, so the answer does not turn into a reuse alarm.
+func TestRefreshForReplacedOrRemovedTargetIsInvalidGrant(t *testing.T) {
+	h := newHarnessWith(t, adminTwoTargets)
+	created := h.createAdmin(h.adminTarget("gamma", "/alpha-upstream"))
+	h.rebuild()
+	clientID := h.register(testRedirect)
+	_, refresh := h.tokensFor(clientID, testRedirect, h.srv.cfg.PublicURL+"/gamma/mcp")
+
+	unused := func() {
+		t.Helper()
+		var used bool
+		err := h.srv.store.pool.QueryRow(t.Context(),
+			`SELECT used FROM refresh_tokens WHERE token_hash=$1`, hashToken(refresh)).Scan(&used)
+		if err != nil || used {
+			t.Fatalf("used = %v, err = %v; want the refresh token left unused", used, err)
+		}
+	}
+
+	next, err := h.srv.store.UpdateTarget(t.Context(), TargetKey{"gamma", created.RowID, created.Revision},
+		h.adminTarget("gamma", "/beta-upstream"), "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.rebuild()
+	if status, code := h.refresh(clientID, refresh); status != http.StatusBadRequest || code != "invalid_grant" {
+		t.Errorf("replaced: %d %q, want 400 invalid_grant", status, code)
+	}
+	unused()
+
+	if err := h.srv.store.DeleteTarget(t.Context(), TargetKey{"gamma", next.RowID, next.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	h.rebuild()
+	if status, code := h.refresh(clientID, refresh); status != http.StatusBadRequest || code != "invalid_grant" {
+		t.Errorf("removed: %d %q, want 400 invalid_grant", status, code)
+	}
+	unused()
+}
+
 // secondReplica is another registry over the same database with its own store,
 // standing in for another pod.
 func (h *harness) secondReplica() (*registry, *Store) {

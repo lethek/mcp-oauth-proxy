@@ -86,7 +86,7 @@ func run() error {
 	}
 	defer store.Close()
 
-	reg := &registry{}
+	var reg *registry
 	if cfg.AdminEnabled() {
 		store.EnableAdminTargets(seal, cfg.AllowedUpstreamHosts, cfg.AllowedUpstreamNetworks)
 		reg = newAdminRegistry(ctx, cfg, store)
@@ -102,6 +102,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		reg = &registry{}
 		reg.Store(snap)
 	}
 	for _, e := range reg.Load().entries {
@@ -152,15 +153,19 @@ func run() error {
 		MaxHeaderBytes: 64 << 10,
 	}
 
+	served := reg.Load()
 	errCh := make(chan error, 1)
 	go func() {
 		// Targets are logged individually. A single line cannot describe several
 		// of them, and the old one printed an empty upstream and only the first
 		// target's resource, which read as a misconfiguration rather than a
 		// summary.
-		for _, t := range cfg.Targets {
+		// Includes admin targets, as loaded at boot.
+		for _, e := range served.entries {
+			t := e.Target
 			slog.Info("serving target",
 				"target", t.Name,
+				"source", orDefault(t.Source, SourceConfig),
 				"path", t.MCPPath(),
 				"resource", t.Resource,
 				"credential_mode", t.Mode,
@@ -170,7 +175,7 @@ func run() error {
 			"version", version,
 			"addr", cfg.ListenAddr,
 			"public_url", cfg.PublicURL,
-			"targets", len(cfg.Targets),
+			"targets", len(served.entries),
 			"cimd_enabled", cfg.CIMDEnabled)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err

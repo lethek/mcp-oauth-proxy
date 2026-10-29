@@ -61,7 +61,7 @@ where a default is shown.
 | `UPSTREAM_CLIENT_SECRET` | Its secret. |
 | `UPSTREAM_SCOPES` | Space-separated. Default `openid profile email`. |
 | `UPSTREAM_STATIC_HEADERS` | Optional. Newline-separated `Name: Value` pairs, sent to the MCP server in place of the provider's token. See below. |
-| `DATABASE_URL` | PostgreSQL connection string. The schema is created on boot. |
+| `DATABASE_URL` | PostgreSQL connection string, PostgreSQL 13 or later. The schema is created on boot. |
 | `ENCRYPTION_KEY` | Base64 of exactly 32 bytes. Encrypts provider tokens at rest with AES-256-GCM. Changing it invalidates every stored session. |
 | `REFRESH_TOKEN_TTL` | How long a refresh token stays usable. Rotation issues a new one, so this acts as an idle timeout. Go duration, default `720h` (30 days). |
 | `SESSION_TTL` | Absolute cap on one authorization, however actively it is refreshed. Reaching it sends the user back through the provider. Go duration, default `2160h` (90 days). Must not be shorter than `REFRESH_TOKEN_TTL`. |

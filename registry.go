@@ -20,6 +20,10 @@ type entry struct {
 	Target Target
 	Stamp  string
 	Proxy  http.Handler
+	// Transport is an admin target's own transport, kept so a rebuild that
+	// replaces the entry can close its idle connections. Nil for config targets,
+	// which share upstreamTransport.
+	Transport *http.Transport
 }
 
 // ignoredTarget is a config target left out of a snapshot because an admin
@@ -95,7 +99,7 @@ func newSnapshot(targets []Target, cfg *Config, prev *snapshot) (*snapshot, erro
 	for _, t := range targets {
 		e := &entry{Target: t, Stamp: t.Stamp()}
 		if old := prev.find(t.Name); old != nil && old.Stamp == e.Stamp {
-			e.Proxy = old.Proxy
+			e.Proxy, e.Transport = old.Proxy, old.Transport
 		} else {
 			u, err := url.Parse(t.UpstreamMCP)
 			if err != nil {
@@ -110,7 +114,8 @@ func newSnapshot(targets []Target, cfg *Config, prev *snapshot) (*snapshot, erro
 			if t.Source == SourceAdmin {
 				// Plain http must also dial an address in the allowed networks, on
 				// every connection, not only when the target was saved.
-				rt = newAdminTransport(cfg.AllowedUpstreamNetworks, u.Scheme == "http")
+				e.Transport = newAdminTransport(cfg.AllowedUpstreamNetworks, u.Scheme == "http")
+				rt = e.Transport
 			}
 			e.Proxy = newReverseProxyWith(rt, u, enrolURL)
 		}
@@ -213,9 +218,23 @@ func (r *registry) Rebuild(ctx context.Context) error {
 		return err
 	}
 	snap.version, snap.ignored = version, ignored
+	prev := r.Load()
 	r.Store(snap)
+	// A replaced or removed admin target's pooled connections would otherwise
+	// idle until their timeout. In-flight requests are unaffected.
+	if prev != nil {
+		for _, old := range prev.entries {
+			if old.Transport != nil && !snap.find(old.Target.Name).sameProxy(old) {
+				old.Transport.CloseIdleConnections()
+			}
+		}
+	}
 	return nil
 }
+
+// sameProxy reports whether e carries the proxy o does, which is how a rebuild
+// shows an entry was reused.
+func (e *entry) sameProxy(o *entry) bool { return e != nil && e.Proxy == o.Proxy }
 
 // merge lists the config targets and then the usable admin ones. A name belongs
 // to one source at a time and the admin target holds it, so a config target of
@@ -257,6 +276,9 @@ func (r *registry) usable(row AdminTarget) (Target, error) {
 	t := row.Target
 	t.Resource = r.cfg.PublicURL + "/" + t.Name + "/mcp"
 
+	if t.Name == "" {
+		return Target{}, errors.New("the name is empty")
+	}
 	if slices.Contains(reservedTargetNames, t.Name) {
 		return Target{}, fmt.Errorf("%q is a reserved name", t.Name)
 	}
