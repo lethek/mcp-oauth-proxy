@@ -164,6 +164,25 @@ func (s *Server) adminPOST(w http.ResponseWriter, r *http.Request, form, name st
 	return sess, key, true
 }
 
+// handleAdminLogout ends the admin session in this browser. The session is
+// stateless, so a copy of the cookie stays valid until it expires. Without a
+// session there is nothing to check a token against, so the cookie is cleared
+// and the person is sent back to sign in.
+func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.adminFrom(r); !ok && s.sameOrigin(r) {
+		s.setCookie(w, adminCookie, "", -1)
+		http.Redirect(w, r, s.cfg.PublicURL+"/admin", http.StatusFound)
+		return
+	}
+	sess, _, ok := s.adminPOST(w, r, "logout", "")
+	if !ok {
+		return
+	}
+	s.setCookie(w, adminCookie, "", -1)
+	slog.Info("admin: signed out", "subject", sess.Subject, "operation", "logout")
+	http.Redirect(w, r, s.cfg.PublicURL+"/admin", http.StatusFound)
+}
+
 // ---------- list ----------
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +197,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.reg.Load()
-	view := adminListView{Subject: sess.Subject, Ignored: snap.ignored}
+	view := adminListView{Subject: sess.Subject, Logout: sess.token("logout", TargetKey{}), Ignored: snap.ignored}
 	switch r.URL.Query().Get("notice") {
 	case "created":
 		view.Notice = "Server added."
@@ -609,6 +628,7 @@ type adminRow struct {
 
 type adminListView struct {
 	Subject string
+	Logout  string // CSRF token for the sign-out form
 	Notice  string
 	Admin   []adminRow
 	Config  []adminRow

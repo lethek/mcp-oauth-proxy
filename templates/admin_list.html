@@ -9,7 +9,14 @@
 <div class="account">
   <span><span class="muted">Signed in as</span> <strong>{{.Subject}}</strong></span>
   <a class="btn btn-sm btn-primary" href="/admin/targets/new">Add server</a>
+  <form method="post" action="/admin/logout">
+    <input type="hidden" name="csrf" value="{{.Logout}}">
+    <button type="submit" class="btn btn-sm">Sign out</button>
+  </form>
 </div>
+<p class="fine">Signing out removes the session cookie from this browser only. A copy of the
+cookie stays valid until it expires, and if you are still signed in at your identity provider,
+you will be signed straight back in.</p>
 
 {{if .Notice}}<p class="banner" role="status">{{.Notice}}</p>{{end}}
 

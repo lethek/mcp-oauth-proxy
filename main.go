@@ -270,6 +270,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /admin/targets/{name}/confirm", limited(s.credentialLimit, s.cfg, s.handleAdminConfirm))
 		mux.HandleFunc("GET /admin/targets/{name}/remove", limited(s.flowLimit, s.cfg, s.handleAdminRemoveForm))
 		mux.HandleFunc("POST /admin/targets/{name}/remove", limited(s.credentialLimit, s.cfg, s.handleAdminRemove))
+		mux.HandleFunc("POST /admin/logout", limited(s.credentialLimit, s.cfg, s.handleAdminLogout))
 	}
 
 	// Liveness only. It says this process is up, not that the provider or the
