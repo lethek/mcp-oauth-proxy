@@ -592,7 +592,7 @@ func TestSweepRunsAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{store: s, cfg: &Config{}}
+	srv := &Server{store: s, cfg: &Config{}, reg: testRegistry(t)}
 	swept, cancel := context.WithCancel(ctx)
 	go srv.sweep(swept)
 
@@ -858,8 +858,9 @@ func TestSweepRemovesOldStampSeenRows(t *testing.T) {
 func TestSweepOnceSkipsStraySweepWhenRecordingFails(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	srv := &Server{store: s, cfg: &Config{Targets: []Target{{Name: "plane", UpstreamMCP: "https://plane.example/mcp"}}}}
-	stamp := srv.cfg.Targets[0].Stamp()
+	plane := Target{Name: "plane", UpstreamMCP: "https://plane.example/mcp"}
+	srv := &Server{store: s, cfg: &Config{Targets: []Target{plane}}, reg: testRegistry(t, plane)}
+	stamp := plane.Stamp()
 	if _, err := s.pool.Exec(ctx,
 		`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u','plane',$1,'\x01', now() - INTERVAL '14 days')`, stamp); err != nil {
 		t.Fatal(err)

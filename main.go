@@ -11,10 +11,8 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,9 +28,9 @@ type Server struct {
 	upstream *Upstream
 	sealer   *sealer
 
-	// proxies holds one reverse proxy per target, keyed by target name. A
-	// single-target deployment keys it on the empty string.
-	proxies map[string]http.Handler
+	// reg holds the targets being served. A request loads its snapshot once and
+	// uses it throughout.
+	reg *registry
 
 	// cimd resolves https client ids to their metadata documents.
 	cimd *cimdClient
@@ -78,22 +76,16 @@ func run() error {
 		return err
 	}
 
-	proxies := map[string]http.Handler{}
-	for _, t := range cfg.Targets {
-		u, err := url.Parse(t.UpstreamMCP)
-		if err != nil {
-			return fmt.Errorf("target %q: %w", t.Name, err)
-		}
-		// Only a per_user target can produce an upstream 401 the user can act on.
-		enrolURL := ""
-		if t.Mode == CredPerUser {
-			enrolURL = cfg.PublicURL + "/settings"
-		}
-		proxies[t.Name] = newReverseProxy(u, enrolURL)
-
-		if isPlaintextURL(t.UpstreamMCP) {
+	snap, err := newSnapshot(cfg.Targets, cfg.PublicURL, nil)
+	if err != nil {
+		return err
+	}
+	reg := &registry{}
+	reg.Store(snap)
+	for _, e := range snap.entries {
+		if isPlaintextURL(e.Target.UpstreamMCP) {
 			slog.Warn("the MCP server is reached over plain http; the credential crosses that hop in the clear",
-				"target", t.Name, "upstream_mcp", t.UpstreamMCP)
+				"target", e.Target.Name, "upstream_mcp", e.Target.UpstreamMCP)
 		}
 	}
 
@@ -111,7 +103,7 @@ func run() error {
 		store:           store,
 		upstream:        NewUpstream(cfg),
 		sealer:          seal,
-		proxies:         proxies,
+		reg:             reg,
 		cimd:            newCIMDClient(),
 		registerLimit:   newLimiter(20, time.Minute),
 		flowLimit:       newLimiter(120, time.Minute),
@@ -190,13 +182,13 @@ func (s *Server) routes() http.Handler {
 	// so each target gets its own document. The bare path is only meaningful when
 	// there is a single resource to mean; with several it says so rather than
 	// naming one of them arbitrarily.
-	if s.cfg.MultiTarget() {
+	multi := s.reg.Load().MultiTarget()
+	if multi {
 		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleAmbiguousResourceMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource/{target}/mcp", s.handleProtectedResourceMetadata)
 	} else {
-		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata(s.cfg.Targets[0]))
-	}
-	for _, t := range s.cfg.Targets {
-		mux.HandleFunc("GET "+t.MetadataPath(), s.handleProtectedResourceMetadata(t))
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleProtectedResourceMetadata)
 	}
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthorizationServerMetadata)
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server/mcp", s.handleAuthorizationServerMetadata)
@@ -222,22 +214,27 @@ func (s *Server) routes() http.Handler {
 	// and are the busiest route, so a shared cap would let ordinary traffic here
 	// refuse the authorization endpoints; an unauthenticated request still costs
 	// a database round trip, so leaving them uncapped is not right either.
-	for _, t := range s.cfg.Targets {
-		h := limited(s.mcpLimit, s.cfg, s.handleMCP(t))
-		mux.HandleFunc(t.MCPPath(), h)
-		mux.HandleFunc(t.MCPPath()+"/", h)
+	//
+	// Named targets are looked up per request, so the table does not have to be
+	// rebuilt when the set of targets changes. An unknown name answers 404 in the
+	// handler.
+	mcp := limited(s.mcpLimit, s.cfg, s.handleMCP)
+	if multi {
+		mux.HandleFunc("/{target}/mcp", mcp)
+		mux.HandleFunc("/{target}/mcp/{rest...}", mcp)
+	} else {
+		mux.HandleFunc("/mcp", mcp)
+		mux.HandleFunc("/mcp/", mcp)
 	}
 
-	// The enrolment page, registered only when some target actually wants a
-	// credential of the user's own. It runs its own login rather than sharing the
-	// consent flow, which is bound to one MCP client's authorization and cannot
-	// answer "who is this browser" outside it.
-	if s.cfg.HasPerUserTargets() {
-		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg, s.handleSettings))
-		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg, s.handleSettingsLogout))
-		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg, s.handleSettingsCallback))
-		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg, s.handleSettingsSave))
-	}
+	// The enrolment page is always served, because whether any target wants a
+	// credential of the user's own can change while the process runs. It runs its
+	// own login rather than sharing the consent flow, which is bound to one MCP
+	// client's authorization and cannot answer "who is this browser" outside it.
+	mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg, s.handleSettings))
+	mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg, s.handleSettingsLogout))
+	mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg, s.handleSettingsCallback))
+	mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg, s.handleSettingsSave))
 
 	// Liveness only. It says this process is up, not that the provider or the
 	// MCP server behind it are, so it can never take the pod down for their sake.
@@ -275,9 +272,10 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	// strength of it. A failure here skips the stray credential sweep, which
 	// would otherwise judge this process's own definitions unserved, but it
 	// does not stop the expiry sweep.
-	served := make([]StampedName, 0, len(s.cfg.Targets))
-	for _, target := range s.cfg.Targets {
-		served = append(served, StampedName{target.Name, target.Stamp()})
+	snap := s.reg.Load()
+	served := make([]StampedName, 0, len(snap.entries))
+	for _, e := range snap.entries {
+		served = append(served, StampedName{e.Target.Name, e.Stamp})
 	}
 	recorded := true
 	if err := s.store.RecordServedStamps(ctx, served); err != nil {

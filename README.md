@@ -336,7 +336,7 @@ If a target's stamp changes, they stop working for that target.
 | `/callback`, `/token` | Provider redirect and token issuance. Authorization code flow with PKCE. |
 | `/revoke` | RFC 7009. Presenting either token ends the whole session. |
 | `/mcp` | Authenticated pass-through to the upstream MCP server. With `TARGETS`, each target is at `/<name>/mcp` instead. |
-| `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Served only when some target is `per_user`. |
+| `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Always served. When no target is `per_user`, the page says there is nothing to enrol. |
 | `/healthz` | Liveness. Reports only on this process. |
 
 ## Security notes
