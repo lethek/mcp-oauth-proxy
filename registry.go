@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -34,11 +35,15 @@ type registry struct {
 func (r *registry) Load() *snapshot   { return r.cur.Load() }
 func (r *registry) Store(s *snapshot) { r.cur.Store(s) }
 
-// newSnapshot builds a snapshot from targets, which must be non-empty. An entry
+// newSnapshot builds a snapshot from targets, which must be non-empty because
+// the single-target paths read the first entry. An entry
 // whose stamp matches one in prev keeps that entry's proxy, so its in-flight
 // limit and connection pool survive a rebuild that did not change where it
 // sends requests.
 func newSnapshot(targets []Target, publicURL string, prev *snapshot) (*snapshot, error) {
+	if len(targets) == 0 {
+		return nil, errors.New("no targets to serve")
+	}
 	s := &snapshot{
 		byName:     make(map[string]*entry, len(targets)),
 		byResource: make(map[string]*entry, len(targets)),
@@ -83,11 +88,6 @@ func (s *snapshot) HasPerUserTargets() bool {
 	}
 	return false
 }
-
-// ResourceURI is the canonical identifier of the MCP endpoint, used as the
-// `resource` value in metadata and as the audience of the tokens we issue.
-// Meaningful only for a single-target deployment.
-func (s *snapshot) ResourceURI() string { return s.entries[0].Target.Resource }
 
 // MultiTarget reports whether this deployment serves named targets. It governs
 // two behaviours: whether the `resource` parameter is required at /authorize,

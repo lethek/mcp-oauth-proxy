@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -127,10 +128,10 @@ func TestStaticTargetWithNoHeadersFailsClosed(t *testing.T) {
 }
 
 // /settings is always registered, and with nothing to enrol it says so instead
-// of disappearing.
+// of disappearing. An anonymous visitor sees that directly, with no provider
+// redirect first.
 func TestSettingsShowsEmptyStateWithoutPerUserTargets(t *testing.T) {
 	h := newHarness(t)
-	h.signIntoSettings()
 
 	resp := h.get(h.proxy.URL + "/settings")
 	defer resp.Body.Close()
@@ -143,5 +144,59 @@ func TestSettingsShowsEmptyStateWithoutPerUserTargets(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "No server on this proxy asks for a credential") {
 		t.Error("the empty state is not shown")
+	}
+}
+
+// Only provider_token may forward the provider's token. A target whose mode is
+// empty or unknown must refuse rather than receive it.
+func TestUnknownModeFailsClosed(t *testing.T) {
+	for _, mode := range []CredentialMode{"", "bogus"} {
+		h := newHarnessWith(t, func(cfg *Config, upstreamURL string) []Target {
+			ts := twoTargets(cfg, upstreamURL)
+			ts[0].Mode = mode
+			return ts
+		})
+
+		const redirect = "https://client.example/callback"
+		clientID := h.register(redirect)
+		access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+
+		resp := h.mcpRequest("/alpha/mcp", access)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("mode %q: status %d, want 500", mode, resp.StatusCode)
+		}
+		if got := h.alphaHits.Load(); got != 0 {
+			t.Errorf("mode %q: upstream reached %d times", mode, got)
+		}
+	}
+}
+
+// A per_user target sends the caller's own credential and never the provider
+// token the session holds.
+func TestPerUserTargetNeverReceivesProviderToken(t *testing.T) {
+	h := newHarnessWith(t, perUserTargets)
+
+	const redirect = "https://client.example/callback"
+	clientID := h.register(redirect)
+	access, _ := h.tokensFor(clientID, redirect, h.srv.cfg.Targets[0].Resource)
+	h.enrol("user-42", "alpha", map[string]string{"Authorization": "Bearer alices-token"})
+
+	resp := h.mcpRequest("/alpha/mcp", access)
+	defer resp.Body.Close()
+	var body struct {
+		SawAuthorization string `json:"saw_authorization"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.SawAuthorization != "Bearer alices-token" {
+		t.Errorf("upstream saw Authorization %q, want the enrolled credential", body.SawAuthorization)
+	}
+}
+
+func TestNewSnapshotRefusesNoTargets(t *testing.T) {
+	if _, err := newSnapshot(nil, "https://p.example", nil); err == nil {
+		t.Error("an empty target list was accepted")
 	}
 }

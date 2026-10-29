@@ -413,20 +413,27 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		prepareUpstreamHeaders(r, t.StaticHeaders)
 		proxy.ServeHTTP(w, r)
 		return
+
+	case CredProviderToken:
+		stripTargetPrefix(r, t)
+		prepareUpstreamHeaders(r, nil)
+
+		upstreamTok, err := s.currentUpstreamToken(r, sessionID, stamp)
+		if err != nil {
+			slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
+			s.challengeFor(w, t, "invalid_token", "the upstream credential for this session is no longer usable")
+			return
+		}
+
+		r.Header.Set("Authorization", "Bearer "+upstreamTok.AccessToken)
+		proxy.ServeHTTP(w, r)
+
+	default:
+		// Only provider_token may forward the provider's token, so a mode this
+		// code does not know fails closed rather than receiving it.
+		slog.Error("mcp: target has an unknown credential mode", "target", t.Name, "mode", t.Mode)
+		oauthError(w, http.StatusInternalServerError, "server_error", "this server is misconfigured")
 	}
-
-	stripTargetPrefix(r, t)
-	prepareUpstreamHeaders(r, nil)
-
-	upstreamTok, err := s.currentUpstreamToken(r, sessionID, stamp)
-	if err != nil {
-		slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
-		s.challengeFor(w, t, "invalid_token", "the upstream credential for this session is no longer usable")
-		return
-	}
-
-	r.Header.Set("Authorization", "Bearer "+upstreamTok.AccessToken)
-	proxy.ServeHTTP(w, r)
 }
 
 // currentUpstreamToken returns a usable upstream token, refreshing it first if

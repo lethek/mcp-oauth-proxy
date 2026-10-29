@@ -96,6 +96,12 @@ func (s *Server) handleSettingsLogout(w http.ResponseWriter, r *http.Request) {
 // handleSettings renders the catalogue, sending the user through the provider
 // first when they are not signed in.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	// With nothing to enrol there is nothing to protect, so an anonymous visitor
+	// is not sent to the provider just to be told so.
+	if !s.reg.Load().HasPerUserTargets() {
+		renderSettings(w, settingsView{})
+		return
+	}
 	identity := s.identityFrom(r)
 	if identity.Subject == "" {
 		s.startSettingsLogin(w, r)

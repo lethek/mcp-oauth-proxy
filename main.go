@@ -182,6 +182,9 @@ func (s *Server) routes() http.Handler {
 	// so each target gets its own document. The bare path is only meaningful when
 	// there is a single resource to mean; with several it says so rather than
 	// naming one of them arbitrarily.
+	//
+	// Read once: the single or multi route shape is fixed at boot. Admin targets
+	// will require named mode, so it cannot change while the process runs.
 	multi := s.reg.Load().MultiTarget()
 	if multi {
 		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleAmbiguousResourceMetadata)
