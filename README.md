@@ -298,7 +298,8 @@ change commits. A sign-in or a settings save that was already in progress when
 the target changed is refused, and the settings page asks the person to reload.
 A sign-in is checked against the target's current allowed groups, even on a
 replica that has not yet seen a change. Editing the display name or allowed
-groups keeps existing sessions. If the delete is interrupted, the next sweep
+groups keeps existing sessions, as does any edit that leaves the stamp unchanged,
+such as a static header value or a user-field label. If the delete is interrupted, the next sweep
 repeats it.
 
 ### Static upstream credentials

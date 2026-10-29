@@ -103,14 +103,19 @@ func (h *harness) approvedCallbackURL(clientID, redirect, resource string) strin
 
 // callbackOutcome follows the callback and returns the error the client is sent
 // back with, or "" when it was sent a code.
-func callbackOutcome(h *harness, callbackURL string) (errCode string) {
-	resp := h.get(callbackURL)
+// It returns errors rather than failing the test, so it is safe off the test
+// goroutine.
+func callbackOutcome(h *harness, callbackURL string) (errCode string, err error) {
+	resp, err := h.client.Get(callbackURL)
+	if err != nil {
+		return "", err
+	}
 	resp.Body.Close()
 	back, err := url.Parse(resp.Header.Get("Location"))
 	if err != nil {
-		h.t.Fatal(err)
+		return "", err
 	}
-	return back.Query().Get("error")
+	return back.Query().Get("error"), nil
 }
 
 // A callback that took its approved flow before an admin edit cannot create a
@@ -128,11 +133,16 @@ func TestCallbackThatTookItsFlowBeforeAnEditCannotCreateASession(t *testing.T) {
 	tx, release := holdEdit(t, h.srv.store, "gamma")
 	defer release()
 
-	result := make(chan string, 1)
+	type outcome struct {
+		code string
+		err  error
+	}
+	result := make(chan outcome, 1)
 	finished := make(chan struct{})
 	go func() {
-		result <- callbackOutcome(h, callbackURL)
-		close(finished)
+		defer close(finished)
+		code, err := callbackOutcome(h, callbackURL)
+		result <- outcome{code, err}
 	}()
 	if !commitAfterBlocked(t, h.srv.store, tx, "%FOR SHARE%", finished) {
 		t.Error("the insert did not wait for the edit's row lock")
@@ -140,8 +150,11 @@ func TestCallbackThatTookItsFlowBeforeAnEditCannotCreateASession(t *testing.T) {
 
 	select {
 	case got := <-result:
-		if got != "temporarily_unavailable" {
-			t.Errorf("callback error = %q, want temporarily_unavailable", got)
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.code != "temporarily_unavailable" {
+			t.Errorf("callback error = %q, want temporarily_unavailable", got.code)
 		}
 	case <-time.After(raceWait):
 		t.Fatal("the callback never finished")
@@ -179,8 +192,8 @@ func TestCallbackOnALaggingReplicaRefusesAUserTheNewGroupsExclude(t *testing.T) 
 		t.Fatalf("the replica's snapshot has %v; it should still lag", got)
 	}
 
-	if got := callbackOutcome(h, callbackURL); got != "access_denied" {
-		t.Errorf("callback error = %q, want access_denied", got)
+	if got, err := callbackOutcome(h, callbackURL); err != nil || got != "access_denied" {
+		t.Errorf("callback error = %q (err %v), want access_denied", got, err)
 	}
 	if n := h.count(`SELECT count(*) FROM sessions`); n != 0 {
 		t.Errorf("%d session(s) exist, want none", n)
@@ -206,17 +219,22 @@ func TestSettingsSaveStraddlingAnEditStoresNothing(t *testing.T) {
 	type reply struct {
 		status int
 		body   string
+		err    error
 	}
 	result := make(chan reply, 1)
 	finished := make(chan struct{})
 	go func() {
-		resp := h.postForm("/settings", url.Values{
+		defer close(finished)
+		resp, err := h.client.PostForm(h.proxy.URL+"/settings", url.Values{
 			"target": {"gamma"}, "stamp": {stamp}, "action": {"save"}, "field_Authorization": {"typed-for-the-old-definition"},
 		})
+		if err != nil {
+			result <- reply{err: err}
+			return
+		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(resp.Body)
-		result <- reply{resp.StatusCode, string(b)}
-		close(finished)
+		result <- reply{status: resp.StatusCode, body: string(b)}
 	}()
 	if !commitAfterBlocked(t, h.srv.store, tx, "%FOR SHARE%", finished) {
 		t.Error("the write did not wait for the edit's row lock")
@@ -224,6 +242,9 @@ func TestSettingsSaveStraddlingAnEditStoresNothing(t *testing.T) {
 
 	select {
 	case got := <-result:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
 		if got.status != http.StatusConflict || !strings.Contains(got.body, "Settings changed") {
 			t.Errorf("status %d, body %q; want 409 and a reload prompt", got.status, got.body)
 		}
@@ -260,11 +281,11 @@ func TestProviderRefreshStraddlingAReplacementWritesNothing(t *testing.T) {
 	result := make(chan error, 1)
 	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		ctx, cancel := context.WithTimeout(context.Background(), raceWait)
 		defer cancel()
 		result <- h.srv.persistRefreshed(ctx, sessionID, gamma.Stamp(),
 			UpstreamToken{AccessToken: "new-access", RefreshToken: "new-refresh", ExpiresAt: time.Now().Add(time.Hour)})
-		close(finished)
 	}()
 	if !commitAfterBlocked(t, h.srv.store, tx, "%FOR SHARE%", finished) {
 		t.Error("the write-back did not wait for the edit's row lock")

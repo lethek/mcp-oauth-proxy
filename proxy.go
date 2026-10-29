@@ -477,7 +477,12 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 		upstreamTok, err := s.currentUpstreamToken(r, sessionID, stamp)
 		if err != nil {
-			slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
+			// A session that is gone or whose target was replaced is expected, not a fault.
+			level := slog.LevelError
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrStaleTarget) {
+				level = slog.LevelWarn
+			}
+			slog.Log(r.Context(), level, "mcp: could not resolve the upstream token", "err", err, "session", sessionID)
 			s.challengeFor(w, t, "invalid_token", "the upstream credential for this session is no longer usable")
 			return
 		}

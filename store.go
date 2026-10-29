@@ -977,15 +977,18 @@ func (s *Store) purgeStaleAdminRows(ctx context.Context, name string) error {
 	if s.admin == nil || s.skipCleanup {
 		return nil
 	}
+	// Every table is tried even if one fails, so a deadlock on sessions does not
+	// leave flows and credentials for the next sweep as well.
+	var errs []error
 	for _, table := range []string{"flows", "sessions", "user_credentials"} {
 		_, err := s.pool.Exec(ctx, `DELETE FROM `+table+` x
  WHERE x.stamp LIKE 'admin:%' AND ($1::text = '' OR x.target = $1)
    AND NOT EXISTS (SELECT 1 FROM targets t WHERE t.name = x.target AND t.stamp = x.stamp)`, name)
 		if err != nil {
-			return fmt.Errorf("purging stale %s: %w", table, err)
+			errs = append(errs, fmt.Errorf("purging stale %s: %w", table, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // purgeAfterChange runs the purge for one target once its edit or removal has
