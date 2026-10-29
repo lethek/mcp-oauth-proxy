@@ -556,7 +556,9 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID, stamp string) 
 // briefly rather than taken as final.
 //
 // A revoked session is the exception. There is no row to write back to and
-// nothing of the session may be served, so ErrNotFound returns immediately.
+// nothing of the session may be served, so ErrNotFound returns immediately. So
+// does ErrStaleTarget: the target was replaced mid-refresh, the session is no
+// longer valid, and the write was refused.
 func (s *Server) persistRefreshed(ctx context.Context, sessionID, stamp string, tok UpstreamToken) error {
 	const attempts = 3
 	var err error
@@ -569,7 +571,7 @@ func (s *Server) persistRefreshed(ctx context.Context, sessionID, stamp string, 
 			}
 		}
 		err = s.updateSessionToken(ctx, sessionID, stamp, tok)
-		if err == nil || errors.Is(err, ErrNotFound) {
+		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrStaleTarget) {
 			return err
 		}
 		slog.Warn("could not persist the refreshed upstream token; retrying",

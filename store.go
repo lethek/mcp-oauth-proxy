@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"slices"
 	"strings"
@@ -29,7 +30,47 @@ var (
 	// presented again. That is the signature of a stolen token, so the caller is
 	// expected to tear the session down rather than simply refuse.
 	ErrTokenReused = errors.New("refresh token was already used")
+
+	// ErrStaleTarget means a write was made under a stamp that is no longer the
+	// target's: it was replaced or removed after the caller read its definition.
+	// Nothing was stored.
+	ErrStaleTarget = errors.New("the target's settings changed")
+
+	// ErrNotAdmitted means the user is not in a group the target allows, judged
+	// against the allowed_groups read under the fence.
+	ErrNotAdmitted = errors.New("the user is not in a group the target allows")
 )
+
+func isAdminStamp(stamp string) bool { return strings.HasPrefix(stamp, "admin:") }
+
+// fenced runs fn in a short transaction that holds FOR SHARE on the admin
+// target's row, and only if the row still carries stamp. An edit takes the row
+// lock FOR SHARE conflicts with, so either fn commits first and cleanup removes
+// what it wrote, or the edit commits first and the lock query finds a different
+// stamp and fn never runs. A plain EXISTS would not do: under READ COMMITTED it
+// reads the stamp as of the statement start, so an edit that commits after that
+// still lets the insert land. The lock is never held across a provider call.
+func (s *Store) fenced(ctx context.Context, name, stamp string, fn func(tx pgx.Tx, allowed []string) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var allowed []string
+	err = tx.QueryRow(ctx,
+		`SELECT allowed_groups FROM targets WHERE name=$1 AND stamp=$2 FOR SHARE`, name, stamp).Scan(&allowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrStaleTarget
+	}
+	if err != nil {
+		return err
+	}
+	if err := fn(tx, allowed); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
 const (
 	flowTTL = 10 * time.Minute
@@ -64,6 +105,11 @@ type Store struct {
 	// the version and reading the rows. Tests use it to force an edit into that
 	// gap.
 	afterVersionRead func()
+
+	// skipCleanup turns off the purge that follows an edit or removal and the
+	// admin statements of the sweep. Tests set it to show that the stamp check
+	// and the fences refuse stale rows without cleanup's help.
+	skipCleanup bool
 }
 
 // adminPolicy is what the store needs to accept and read admin targets.
@@ -414,11 +460,27 @@ func (s *Store) TakeApprovedFlow(ctx context.Context, id string) (Flow, error) {
 
 // ---------- sessions ----------
 
-func (s *Store) CreateSession(ctx context.Context, id, subject, resource, target, stamp string, sealedToken []byte) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO sessions (id, subject, resource, target, stamp, upstream_token) VALUES ($1,$2,$3,$4,$5,$6)`,
-		id, subject, resource, target, stamp, sealedToken)
-	return err
+// CreateSession stores the session. For an admin target the insert is fenced
+// (see fenced), and admits, when set, is asked about the allowed_groups the
+// fence read, so a replica with an old snapshot cannot admit someone the target
+// no longer admits. A refusal returns ErrNotAdmitted before anything is stored.
+// admits is not consulted for a config target; the caller checks its snapshot.
+func (s *Store) CreateSession(ctx context.Context, id, subject, resource, target, stamp string, sealedToken []byte, admits func(allowed []string) bool) error {
+	insert := func(q querier) error {
+		_, err := q.Exec(ctx,
+			`INSERT INTO sessions (id, subject, resource, target, stamp, upstream_token) VALUES ($1,$2,$3,$4,$5,$6)`,
+			id, subject, resource, target, stamp, sealedToken)
+		return err
+	}
+	if !isAdminStamp(stamp) {
+		return insert(s.pool)
+	}
+	return s.fenced(ctx, target, stamp, func(tx pgx.Tx, allowed []string) error {
+		if admits != nil && !admits(allowed) {
+			return ErrNotAdmitted
+		}
+		return insert(tx)
+	})
 }
 
 // SessionToken returns the sealed provider token only to a caller that names the
@@ -438,17 +500,37 @@ func (s *Store) SessionToken(ctx context.Context, id, stamp string) ([]byte, err
 // UpdateSessionToken reports ErrNotFound when the session has gone. An UPDATE
 // that matches no rows is not an error to Postgres, so without this a write
 // against a revoked session looks like success and the caller carries on.
+//
+// Matching the session's own stamp is not enough for an admin target: the
+// session keeps its old stamp after a replacement, so the write would still
+// land. It takes the same fence as creation, and a refresh that straddles a
+// replacement returns ErrStaleTarget having written nothing.
 func (s *Store) UpdateSessionToken(ctx context.Context, id, stamp string, sealedToken []byte) error {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE sessions SET upstream_token=$3, updated_at=now() WHERE id=$1 AND stamp=$2 AND stamp <> ''`,
-		id, stamp, sealedToken)
+	update := func(q querier) error {
+		tag, err := q.Exec(ctx,
+			`UPDATE sessions SET upstream_token=$3, updated_at=now() WHERE id=$1 AND stamp=$2 AND stamp <> ''`,
+			id, stamp, sealedToken)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	}
+	if !isAdminStamp(stamp) {
+		return update(s.pool)
+	}
+	// The fence needs the target's name, which the session row holds.
+	var target string
+	err := s.pool.QueryRow(ctx, `SELECT target FROM sessions WHERE id=$1 AND stamp=$2`, id, stamp).Scan(&target)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.fenced(ctx, target, stamp, func(tx pgx.Tx, _ []string) error { return update(tx) })
 }
 
 // RevokeSession drops the session and, by cascade, every code and token issued
@@ -713,17 +795,25 @@ type StampedName struct{ Name, Stamp string }
 
 // PutUserCredential replaces whatever the subject had for this target under this
 // stamp. Replacing rather than erroring on a duplicate is the point: rotating a
-// leaked token is the same action as setting one for the first time.
+// leaked token is the same action as setting one for the first time. For an
+// admin target the write is fenced and returns ErrStaleTarget if the stamp is no
+// longer the target's.
 func (s *Store) PutUserCredential(ctx context.Context, subject, target, stamp string, sealed []byte) error {
 	if stamp == "" {
 		return errors.New("a credential needs the stamp of the target it is for")
 	}
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO user_credentials (subject, target, stamp, sealed_headers) VALUES ($1,$2,$3,$4)
-		 ON CONFLICT (subject, target, stamp)
-		 DO UPDATE SET sealed_headers = EXCLUDED.sealed_headers, updated_at = now()`,
-		subject, target, stamp, sealed)
-	return err
+	put := func(q querier) error {
+		_, err := q.Exec(ctx,
+			`INSERT INTO user_credentials (subject, target, stamp, sealed_headers) VALUES ($1,$2,$3,$4)
+			 ON CONFLICT (subject, target, stamp)
+			 DO UPDATE SET sealed_headers = EXCLUDED.sealed_headers, updated_at = now()`,
+			subject, target, stamp, sealed)
+		return err
+	}
+	if !isAdminStamp(stamp) {
+		return put(s.pool)
+	}
+	return s.fenced(ctx, target, stamp, func(tx pgx.Tx, _ []string) error { return put(tx) })
 }
 
 // UserCredentialForSession resolves a session straight to its owner's credential
@@ -873,7 +963,37 @@ DELETE FROM clients c
 			return err
 		}
 	}
+	return s.purgeStaleAdminRows(ctx, "")
+}
+
+// purgeStaleAdminRows deletes flows, sessions and credentials stamped for an
+// admin target definition that no row in targets carries any more, for one
+// target or, with an empty name, all of them. It is hygiene, not the control:
+// the stamp check already refuses these rows. So it takes no locks beyond its
+// own deletes and is not atomic with the edit. If it loses a deadlock against a
+// refresh or /revoke it fails, the edit stays committed, and the next sweep
+// repeats it.
+func (s *Store) purgeStaleAdminRows(ctx context.Context, name string) error {
+	if s.admin == nil || s.skipCleanup {
+		return nil
+	}
+	for _, table := range []string{"flows", "sessions", "user_credentials"} {
+		_, err := s.pool.Exec(ctx, `DELETE FROM `+table+` x
+ WHERE x.stamp LIKE 'admin:%' AND ($1::text = '' OR x.target = $1)
+   AND NOT EXISTS (SELECT 1 FROM targets t WHERE t.name = x.target AND t.stamp = x.stamp)`, name)
+		if err != nil {
+			return fmt.Errorf("purging stale %s: %w", table, err)
+		}
+	}
 	return nil
+}
+
+// purgeAfterChange runs the purge for one target once its edit or removal has
+// committed, in its own transaction. A failure is logged and left to the sweep.
+func (s *Store) purgeAfterChange(ctx context.Context, name string) {
+	if err := s.purgeStaleAdminRows(ctx, name); err != nil {
+		slog.Warn("could not purge rows left by a target change; the next sweep will", "target", name, "err", err)
+	}
 }
 
 // strayCredentialAge is how long a config credential must go unsaved, and its
@@ -1215,7 +1335,15 @@ func (s *Store) UpdateTarget(ctx context.Context, key TargetKey, t Target, by st
 	if err := bumpTargetsVersion(ctx, tx); err != nil {
 		return AdminTarget{}, err
 	}
-	return a, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return AdminTarget{}, err
+	}
+	// Only a replacement leaves rows behind, and they are deleted after the
+	// commit so the purge sees the new stamp.
+	if a.StoredStamp != cur.StoredStamp {
+		s.purgeAfterChange(ctx, key.Name)
+	}
+	return a, nil
 }
 
 // DeleteTarget removes a target, checked against key in its own transaction. The
@@ -1241,5 +1369,9 @@ func (s *Store) DeleteTarget(ctx context.Context, key TargetKey) error {
 	if err := bumpTargetsVersion(ctx, tx); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.purgeAfterChange(ctx, key.Name)
+	return nil
 }

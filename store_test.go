@@ -48,7 +48,7 @@ func newTestStore(t *testing.T) *Store {
 func mustSession(t *testing.T, s *Store) string {
 	t.Helper()
 	id := newSecret()
-	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", "test", "config:test", []byte("sealed")); err != nil {
+	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", "test", "config:test", []byte("sealed"), nil); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	return id
@@ -337,7 +337,7 @@ func TestEmptyStampSessionsAreRefused(t *testing.T) {
 	ctx := context.Background()
 
 	id := newSecret()
-	if err := s.CreateSession(ctx, id, "sub", "https://p/mcp", "", "", []byte("sealed")); err != nil {
+	if err := s.CreateSession(ctx, id, "sub", "https://p/mcp", "", "", []byte("sealed"), nil); err != nil {
 		t.Fatal(err)
 	}
 	access := newSecret()
@@ -356,7 +356,7 @@ func TestSessionTokenRequiresTheSessionsStamp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	id := newSecret()
-	if err := s.CreateSession(ctx, id, "sub", "r", "plane", "config:a", []byte("sealed")); err != nil {
+	if err := s.CreateSession(ctx, id, "sub", "r", "plane", "config:a", []byte("sealed"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.SessionToken(ctx, id, "config:a"); err != nil {
@@ -684,7 +684,7 @@ func TestCredentialIsReadOnlyThroughASessionWithTheSameStamp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	id := newSecret()
-	if err := s.CreateSession(ctx, id, "u", "r", "plane", "config:a", []byte("tok")); err != nil {
+	if err := s.CreateSession(ctx, id, "u", "r", "plane", "config:a", []byte("tok"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
@@ -731,7 +731,7 @@ func TestSweepRemovesEmptyStampRows(t *testing.T) {
 	ctx := context.Background()
 	empty, kept := newSecret(), newSecret()
 	for _, c := range []struct{ id, stamp string }{{empty, ""}, {kept, "config:a"}} {
-		if err := s.CreateSession(ctx, c.id, "u", "r", "plane", c.stamp, []byte("x")); err != nil {
+		if err := s.CreateSession(ctx, c.id, "u", "r", "plane", c.stamp, []byte("x"), nil); err != nil {
 			t.Fatal(err)
 		}
 	}

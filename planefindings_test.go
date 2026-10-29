@@ -275,7 +275,7 @@ func expiredSession(t *testing.T, h *harness) string {
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
 	if err := h.srv.createSession(context.Background(), sessionID, "subject",
-		h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired); err != nil {
+		h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired, nil); err != nil {
 		t.Fatal(err)
 	}
 	return sessionID
