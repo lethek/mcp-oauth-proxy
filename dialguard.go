@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -149,19 +150,11 @@ func validateAdminUpstream(raw string, hosts []hostPattern, nets []netip.Prefix)
 }
 
 func matchesHost(hosts []hostPattern, host, port string) bool {
-	for _, h := range hosts {
-		if strings.EqualFold(h.Host, host) && h.Port == port {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(hosts, func(h hostPattern) bool {
+		return strings.EqualFold(h.Host, host) && h.Port == port
+	})
 }
 
 func inNets(nets []netip.Prefix, a netip.Addr) bool {
-	for _, p := range nets {
-		if p.Contains(a) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(nets, func(p netip.Prefix) bool { return p.Contains(a) })
 }

@@ -434,16 +434,23 @@ func (c *Config) loadAdmin() error {
 // "feature off" or "no restriction".
 func commaList(name string) ([]string, error) {
 	raw := os.Getenv(name)
+	out := splitList(raw)
+	if strings.TrimSpace(raw) != "" && len(out) == 0 {
+		return nil, fmt.Errorf("%s is set but names nothing", name)
+	}
+	return out, nil
+}
+
+// splitList splits a comma-separated value, trimming each entry and dropping
+// empty ones. It returns nil when nothing is left.
+func splitList(raw string) []string {
 	var out []string
 	for _, part := range strings.Split(raw, ",") {
 		if p := strings.TrimSpace(part); p != "" {
 			out = append(out, p)
 		}
 	}
-	if strings.TrimSpace(raw) != "" && len(out) == 0 {
-		return nil, fmt.Errorf("%s is set but names nothing", name)
-	}
-	return out, nil
+	return out
 }
 
 // parseHostPattern reads one host:port entry. The port is required because a
@@ -557,11 +564,7 @@ func parseTargets(publicURL string) ([]Target, error) {
 		t.UserFields = fields
 
 		rawGroups := os.Getenv(p + "ALLOWED_GROUPS")
-		for _, g := range strings.Split(rawGroups, ",") {
-			if g = strings.TrimSpace(g); g != "" {
-				t.AllowedGroups = append(t.AllowedGroups, g)
-			}
-		}
+		t.AllowedGroups = splitList(rawGroups)
 		// A value that names no group would otherwise read as "no restriction",
 		// opening the target to everyone while the config says it is limited.
 		if strings.TrimSpace(rawGroups) != "" && len(t.AllowedGroups) == 0 {

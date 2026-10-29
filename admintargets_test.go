@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -425,6 +426,38 @@ func TestConfigEntryClashingWithAdminTargetIsLeftOut(t *testing.T) {
 
 // Rows the registry cannot vouch for are left out and never served with
 // whatever is left over.
+// A row the registry cannot vouch for stays behind the database for good, so
+// requests for it must not each repeat the full read once the snapshot already
+// carries the current version.
+func TestRequestRebuildSkipsWhenSnapshotIsCurrent(t *testing.T) {
+	h := newHarnessWith(t, adminTwoTargets)
+	h.createAdmin(h.adminTarget("moved", "/alpha-upstream"))
+	if _, err := h.srv.store.pool.Exec(t.Context(), `UPDATE targets SET upstream_mcp = upstream_mcp || '/elsewhere' WHERE name = 'moved'`); err != nil {
+		t.Fatal(err)
+	}
+	h.rebuild()
+	if h.srv.reg.Load().byName["moved"] != nil {
+		t.Fatal("the unusable row is served")
+	}
+
+	var loads atomic.Int32
+	h.srv.store.afterVersionRead = func() { loads.Add(1) }
+	for range 3 {
+		h.srv.reg.lastRequest.Store(0)
+		h.srv.reg.RequestRebuild()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n := loads.Load(); n != 0 {
+		t.Fatalf("LoadAdminTargets ran %d times with an up-to-date snapshot", n)
+	}
+
+	// Control: a change that moves the version does start a rebuild.
+	h.createAdmin(h.adminTarget("fresh", "/alpha-upstream"))
+	h.srv.reg.lastRequest.Store(0)
+	h.srv.reg.RequestRebuild()
+	eventually(t, "a rebuild after the version moved", func() bool { return loads.Load() == 1 })
+}
+
 func TestRegistryLeavesOutRowsItCannotVouchFor(t *testing.T) {
 	h := newHarnessWith(t, adminTwoTargets)
 	h.createAdmin(h.adminTarget("good", "/alpha-upstream"))

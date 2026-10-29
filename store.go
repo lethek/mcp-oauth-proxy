@@ -41,7 +41,7 @@ var (
 	ErrNotAdmitted = errors.New("the user is not in a group the target allows")
 )
 
-func isAdminStamp(stamp string) bool { return strings.HasPrefix(stamp, "admin:") }
+func isAdminStamp(stamp string) bool { return strings.HasPrefix(stamp, stampPrefix(SourceAdmin)) }
 
 // fenced runs fn in a short transaction that holds FOR SHARE on the admin
 // target's row, and only if the row still carries stamp. An edit takes the row
@@ -991,8 +991,8 @@ func (s *Store) purgeStaleAdminRows(ctx context.Context, name string) error {
 	var errs []error
 	for _, table := range []string{"flows", "sessions", "user_credentials"} {
 		_, err := s.pool.Exec(ctx, `DELETE FROM `+table+` x
- WHERE x.stamp LIKE 'admin:%' AND ($1::text = '' OR x.target = $1)
-   AND NOT EXISTS (SELECT 1 FROM targets t WHERE t.name = x.target AND t.stamp = x.stamp)`, name)
+ WHERE x.stamp LIKE $2 AND ($1::text = '' OR x.target = $1)
+   AND NOT EXISTS (SELECT 1 FROM targets t WHERE t.name = x.target AND t.stamp = x.stamp)`, name, stampPrefix(SourceAdmin)+"%")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("purging stale %s: %w", table, err))
 		}
@@ -1042,12 +1042,12 @@ ON CONFLICT (target, stamp) DO UPDATE SET seen_at = now()`,
 func (s *Store) SweepStrayCredentials(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 DELETE FROM user_credentials c
- WHERE c.stamp LIKE 'config:%'
+ WHERE c.stamp LIKE $2
    AND c.updated_at < now() - $1::interval
    AND NOT EXISTS (SELECT 1 FROM stamp_seen s
                     WHERE s.target = c.target AND s.stamp = c.stamp
                       AND s.seen_at > now() - $1::interval)`,
-		strayCredentialAge.String())
+		strayCredentialAge.String(), stampPrefix(SourceConfig)+"%")
 	return err
 }
 
@@ -1176,6 +1176,12 @@ func (s *Store) openStatic(a AdminTarget) (map[string]string, error) {
 // checkAdminTarget applies the rules an admin-supplied definition must meet. It
 // runs here so no caller can forget it, and again when a snapshot is built.
 func (s *Store) checkAdminTarget(t Target) error {
+	return checkAdminTarget(t, s.admin.hosts, s.admin.nets)
+}
+
+// checkAdminTarget is the rule set itself, with the policy lists passed in so a
+// registry can apply its own.
+func checkAdminTarget(t Target, hosts []hostPattern, nets []netip.Prefix) error {
 	if t.Name == "" {
 		return errors.New("a target needs a name")
 	}
@@ -1185,7 +1191,7 @@ func (s *Store) checkAdminTarget(t Target) error {
 	if err := validateTarget(t); err != nil {
 		return err
 	}
-	if err := validateAdminUpstream(t.UpstreamMCP, s.admin.hosts, s.admin.nets); err != nil {
+	if err := validateAdminUpstream(t.UpstreamMCP, hosts, nets); err != nil {
 		return fmt.Errorf("Upstream MCP URL: %w", err)
 	}
 	return nil

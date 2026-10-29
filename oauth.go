@@ -171,12 +171,13 @@ const noTargetsMessage = "no MCP servers are available yet; ask the administrato
 // them arbitrarily would send a client to the wrong upstream with a token that
 // will not work there. Better to say so.
 func (s *Server) handleAmbiguousResourceMetadata(w http.ResponseWriter, r *http.Request) {
-	if len(s.reg.Load().entries) == 0 {
+	snap := s.reg.Load()
+	if len(snap.entries) == 0 {
 		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", noTargetsMessage)
 		return
 	}
 	oauthError(w, http.StatusNotFound, "invalid_request",
-		"this proxy serves several resources; request the metadata for one of them: "+s.reg.Load().ResourceList())
+		"this proxy serves several resources; request the metadata for one of them: "+snap.ResourceList())
 }
 
 // handleAuthorizationServerMetadata implements RFC 8414. We advertise only what
@@ -561,7 +562,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "access_denied",
 			"your account is not allowed to use "+target.DisplayName)
 	}
-	if target.Source != SourceAdmin && !target.Admits(identity.Groups) {
+	if !target.FromAdmin() && !target.Admits(identity.Groups) {
 		deny(target.AllowedGroups)
 		return
 	}

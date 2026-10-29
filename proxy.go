@@ -44,7 +44,8 @@ func orDefault(v, fallback string) string {
 	return v
 }
 
-// upstreamTransport is used for every target.
+// upstreamTransport is used for config targets. Admin targets use a clone with
+// the dial guard (see newAdminTransport).
 //
 // It bounds connection establishment — dial, TLS handshake, idle pooling —
 // which http.DefaultTransport leaves partly open, without bounding the exchange
@@ -79,19 +80,14 @@ var upstreamTransport = &http.Transport{
 // even if it is public, so a name that later resolves elsewhere cannot carry
 // the credential across the internet in cleartext.
 func newAdminTransport(nets []netip.Prefix, requireListed bool) *http.Transport {
-	return &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control:   dialGuard(nets, requireListed),
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
+	t := upstreamTransport.Clone()
+	t.Proxy = nil
+	t.DialContext = (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   dialGuard(nets, requireListed),
+	}).DialContext
+	return t
 }
 
 // maxInFlightPerTarget bounds how many requests may be forwarded to one

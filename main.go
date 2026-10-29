@@ -105,7 +105,8 @@ func run() error {
 		reg = &registry{}
 		reg.Store(snap)
 	}
-	for _, e := range reg.Load().entries {
+	served := reg.Load()
+	for _, e := range served.entries {
 		if isPlaintextURL(e.Target.UpstreamMCP) {
 			slog.Warn("the MCP server is reached over plain http; the credential crosses that hop in the clear",
 				"target", e.Target.Name, "upstream_mcp", e.Target.UpstreamMCP)
@@ -153,14 +154,12 @@ func run() error {
 		MaxHeaderBytes: 64 << 10,
 	}
 
-	served := reg.Load()
 	errCh := make(chan error, 1)
 	go func() {
 		// Targets are logged individually. A single line cannot describe several
 		// of them, and the old one printed an empty upstream and only the first
 		// target's resource, which read as a misconfiguration rather than a
 		// summary.
-		// Includes admin targets, as loaded at boot.
 		for _, e := range served.entries {
 			t := e.Target
 			slog.Info("serving target",

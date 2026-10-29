@@ -96,9 +96,7 @@ func renderAdminError(w http.ResponseWriter, status int, heading, message string
 // ---------- login ----------
 
 func (s *Server) handleAdminCallback(w http.ResponseWriter, r *http.Request) {
-	identity, ok := s.finishLogin(r, flowKindAdmin, s.adminRedirectURI(), func(status int, heading, message string) {
-		renderAdminError(w, status, heading, message)
-	})
+	identity, ok := s.finishLogin(w, r, flowKindAdmin, s.adminRedirectURI(), renderAdminError)
 	if !ok {
 		return
 	}
@@ -132,29 +130,30 @@ func (s *Server) adminGET(w http.ResponseWriter, r *http.Request) (adminSession,
 // adminPOST gates every state-changing request: same origin, a live admin
 // session, and the CSRF token for this form and row. The key comes from the form,
 // and the token covers it.
-func (s *Server) adminPOST(w http.ResponseWriter, r *http.Request, form, name string) (adminSession, TargetKey, bool) {
+func (s *Server) adminPOST(w http.ResponseWriter, r *http.Request, form, name string) (sess adminSession, key TargetKey, ok bool) {
 	if !s.sameOrigin(r) {
 		slog.Warn("admin: cross-origin submission refused", "origin", r.Header.Get("Origin"))
 		renderAdminError(w, http.StatusForbidden, "Request blocked", "This request did not come from the admin page.")
 		return adminSession{}, TargetKey{}, false
 	}
-	sess, ok := s.adminFrom(r)
+	sess, ok = s.adminFrom(r)
 	if !ok {
 		http.Redirect(w, r, s.cfg.PublicURL+"/admin", http.StatusFound)
 		return adminSession{}, TargetKey{}, false
 	}
-	if err := r.ParseForm(); err != nil {
+	malformed := r.ParseForm() != nil
+	key = TargetKey{Name: name}
+	if !malformed {
+		key.RowID = r.PostForm.Get("row_id")
+		if rev := r.PostForm.Get("revision"); rev != "" {
+			n, err := strconv.ParseInt(rev, 10, 64)
+			malformed = err != nil
+			key.Revision = n
+		}
+	}
+	if malformed {
 		renderAdminError(w, http.StatusBadRequest, "Could not read the form", "The form submission was malformed. Go back and try again.")
 		return adminSession{}, TargetKey{}, false
-	}
-	key := TargetKey{Name: name, RowID: r.PostForm.Get("row_id")}
-	if rev := r.PostForm.Get("revision"); rev != "" {
-		n, err := strconv.ParseInt(rev, 10, 64)
-		if err != nil {
-			renderAdminError(w, http.StatusBadRequest, "Could not read the form", "The form submission was malformed. Go back and try again.")
-			return adminSession{}, TargetKey{}, false
-		}
-		key.Revision = n
 	}
 	if !hmac.Equal([]byte(r.PostForm.Get("csrf")), []byte(sess.token(form, key))) {
 		slog.Warn("admin: submission with a missing or wrong token refused", "subject", sess.Subject)
@@ -207,7 +206,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		view.Notice = "Server removed."
 	}
 	for _, e := range snap.entries {
-		if e.Target.Source != SourceAdmin {
+		if !e.Target.FromAdmin() {
 			view.Config = append(view.Config, adminRow{Name: e.Target.Name, Display: e.Target.DisplayName, Host: upstreamHost(e.Target), Mode: string(e.Target.Mode)})
 		}
 	}
@@ -265,12 +264,7 @@ func fieldsPosted(r *http.Request) adminFields {
 // failing validation. supplied reports whether a static value was entered. The
 // message, when not empty, is for the person and never repeats a static value.
 func parseTarget(name string, f adminFields, staticRaw string) (t Target, supplied bool, msg string) {
-	t = Target{Name: name, DisplayName: f.Display, UpstreamMCP: f.Upstream, Mode: CredentialMode(f.Mode), Source: SourceAdmin}
-	for _, g := range strings.Split(f.Groups, ",") {
-		if g = strings.TrimSpace(g); g != "" {
-			t.AllowedGroups = append(t.AllowedGroups, g)
-		}
-	}
+	t = Target{Name: name, DisplayName: f.Display, UpstreamMCP: f.Upstream, Mode: CredentialMode(f.Mode), Source: SourceAdmin, AllowedGroups: splitList(f.Groups)}
 	switch t.Mode {
 	case CredStatic:
 		if strings.TrimSpace(staticRaw) != "" {
@@ -355,7 +349,7 @@ func changedFields(old, t Target, staticSupplied bool) []string {
 	if !slices.Equal(old.UserFields, t.UserFields) {
 		out = append(out, "user_fields")
 	}
-	if !slices.Equal(old.AllowedGroups, t.AllowedGroups) && (len(old.AllowedGroups)+len(t.AllowedGroups)) > 0 {
+	if !slices.Equal(old.AllowedGroups, t.AllowedGroups) {
 		out = append(out, "allowed_groups")
 	}
 	if staticSupplied {

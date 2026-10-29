@@ -111,7 +111,7 @@ func newSnapshot(targets []Target, cfg *Config, prev *snapshot) (*snapshot, erro
 				enrolURL = cfg.PublicURL + "/settings"
 			}
 			rt := http.RoundTripper(upstreamTransport)
-			if t.Source == SourceAdmin {
+			if t.FromAdmin() {
 				// Plain http must also dial an address in the allowed networks, on
 				// every connection, not only when the target was saved.
 				e.Transport = newAdminTransport(cfg.AllowedUpstreamNetworks, u.Scheme == "http")
@@ -140,7 +140,7 @@ func (s *snapshot) find(name string) *entry {
 // target must have no row, because an admin target outranks it. A nil entry is a
 // name this replica does not serve, which is behind only if a row exists.
 func (e *entry) behind(current *string) bool {
-	if e != nil && e.Target.Source == SourceAdmin {
+	if e != nil && e.Target.FromAdmin() {
 		return current == nil || *current != e.Stamp
 	}
 	return current != nil
@@ -242,7 +242,7 @@ func (r *registry) Rebuild(ctx context.Context) error {
 // configHolds reports whether a config target has the name, whether it is served
 // or left out behind an admin target.
 func (s *snapshot) configHolds(name string) bool {
-	if e := s.find(name); e != nil && e.Target.Source != SourceAdmin {
+	if e := s.find(name); e != nil && !e.Target.FromAdmin() {
 		return true
 	}
 	return s.wasIgnored(name)
@@ -302,17 +302,8 @@ func (r *registry) usable(row AdminTarget) (Target, error) {
 	if row.DecodeErr != nil {
 		return Target{}, row.DecodeErr
 	}
-	if t.Name == "" {
-		return Target{}, errors.New("the name is empty")
-	}
-	if slices.Contains(reservedTargetNames, t.Name) {
-		return Target{}, fmt.Errorf("%q is a reserved name", t.Name)
-	}
 	if t.Stamp() != row.StoredStamp {
 		return Target{}, errors.New("the stored stamp does not match the definition")
-	}
-	if err := validateAdminUpstream(t.UpstreamMCP, r.cfg.AllowedUpstreamHosts, r.cfg.AllowedUpstreamNetworks); err != nil {
-		return Target{}, err
 	}
 	if t.Mode == CredStatic {
 		// A value that will not unseal, after a key rotation or with mixed keys
@@ -323,7 +314,7 @@ func (r *registry) usable(row AdminTarget) (Target, error) {
 		}
 		t.StaticHeaders = headers
 	}
-	if err := validateTarget(t); err != nil {
+	if err := checkAdminTarget(t, r.cfg.AllowedUpstreamHosts, r.cfg.AllowedUpstreamNetworks); err != nil {
 		return Target{}, err
 	}
 	return t, nil
@@ -358,7 +349,9 @@ func (r *registry) pollOnce(ctx context.Context) {
 
 // RequestRebuild starts a rebuild in the background for a request that found
 // this replica behind. Requests arrive in bursts, so it runs at most once a
-// second.
+// second. A row that usable() rejects stays behind the database for good, so
+// the version is checked first, as pollOnce does, to keep requests for it from
+// repeating the full read.
 func (r *registry) RequestRebuild() {
 	now := time.Now().UnixNano()
 	last := r.lastRequest.Load()
@@ -368,7 +361,14 @@ func (r *registry) RequestRebuild() {
 	go func() {
 		ctx, cancel := context.WithTimeout(r.bg, rebuildTimeout)
 		defer cancel()
-		if err := r.Rebuild(ctx); err != nil {
+		v, err := r.store.TargetsVersion(ctx)
+		if err == nil && v == r.Load().version {
+			return
+		}
+		if err == nil {
+			err = r.Rebuild(ctx)
+		}
+		if err != nil {
 			slog.Warn("rebuilding the targets failed; keeping the current ones", "err", err)
 		}
 	}()

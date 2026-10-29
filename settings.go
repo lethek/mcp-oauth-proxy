@@ -170,25 +170,25 @@ func (s *Server) startLogin(w http.ResponseWriter, r *http.Request, kind, redire
 }
 
 // finishLogin redeems the callback of a login started by startLogin and says who
-// signed in. On any failure it has already answered through fail and returns
+// signed in. On any failure it has already answered through render and returns
 // false.
-func (s *Server) finishLogin(r *http.Request, kind, redirectURI string, fail func(status int, heading, message string)) (UserIdentity, bool) {
+func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, kind, redirectURI string, render func(w http.ResponseWriter, status int, heading, message string)) (UserIdentity, bool) {
 	q := r.URL.Query()
 
 	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r), kind)
 	if err != nil {
-		fail(http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the "+kind+" page again to sign in.")
+		render(w, http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the "+kind+" page again to sign in.")
 		return UserIdentity{}, false
 	}
 	if e := q.Get("error"); e != "" {
-		fail(http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
+		render(w, http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
 		return UserIdentity{}, false
 	}
 
 	tok, err := s.upstream.ExchangeWithRedirect(r.Context(), q.Get("code"), verifier, redirectURI)
 	if err != nil {
 		slog.Error(kind+": upstream exchange failed", "err", err)
-		fail(http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
+		render(w, http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
 		return UserIdentity{}, false
 	}
 
@@ -200,16 +200,14 @@ func (s *Server) finishLogin(r *http.Request, kind, redirectURI string, fail fun
 		if kind == flowKindSettings {
 			msg = "The identity provider would not say who you are, so credentials cannot be stored."
 		}
-		fail(http.StatusBadGateway, "Sign-in failed", msg)
+		render(w, http.StatusBadGateway, "Sign-in failed", msg)
 		return UserIdentity{}, false
 	}
 	return identity, true
 }
 
 func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) {
-	identity, ok := s.finishLogin(r, flowKindSettings, s.settingsRedirectURI(), func(status int, heading, message string) {
-		renderSettingsError(w, status, heading, message)
-	})
+	identity, ok := s.finishLogin(w, r, flowKindSettings, s.settingsRedirectURI(), renderSettingsError)
 	if !ok {
 		return
 	}
