@@ -17,23 +17,29 @@ import (
 var (
 	metadataAddr = netip.MustParseAddr("100.100.100.200")
 	thisNetwork  = netip.MustParsePrefix("0.0.0.0/8")
-	// NAT64 is an IPv4 destination in disguise, so allowing a private range
-	// must not allow the same range through a gateway. See isPublicIP.
-	nat64Prefixes = []netip.Prefix{
-		netip.MustParsePrefix("64:ff9b::/96"),
-		netip.MustParsePrefix("64:ff9b:1::/48"),
-	}
 )
 
 // neverDialable reports whether an address is refused unconditionally.
 func neverDialable(a netip.Addr) bool {
-	if a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsInterfaceLocalMulticast() ||
-		a.IsMulticast() || a.IsUnspecified() || a == metadataAddr || thisNetwork.Contains(a) {
+	if a.IsLinkLocalUnicast() || a.IsMulticast() || a.IsUnspecified() ||
+		a == metadataAddr || thisNetwork.Contains(a) {
 		return true
 	}
-	for _, p := range nat64Prefixes {
-		if p.Contains(a) {
-			return true
+	ip := net.IP(a.AsSlice())
+	// NAT64 is an IPv4 destination in disguise, so allowing a private range
+	// must not allow the same range through a gateway. See isPublicIP.
+	if nat64WellKnown.Contains(ip) || nat64Local.Contains(ip) {
+		return true
+	}
+	// 6to4, IPv4-compatible and Teredo carry an IPv4 destination too, so one
+	// wrapping a refused address is refused. ::1 is excluded because the
+	// IPv4-compatible range would read it as 0.0.0.1, and loopback is
+	// something an operator may list.
+	if !a.IsLoopback() {
+		if v4 := embeddedIPv4(ip); v4 != nil {
+			if e, ok := netip.AddrFromSlice(v4.To4()); ok && neverDialable(e) {
+				return true
+			}
 		}
 	}
 	return false
@@ -58,8 +64,9 @@ func dialGuard(nets []netip.Prefix, requireListed bool) func(network, address st
 			return fmt.Errorf("could not parse the address %q", host)
 		}
 		// ::ffff:10.0.0.1 is the IPv4 address 10.0.0.1, and must be judged as
-		// that or it would dodge every IPv4 rule below.
-		addr = addr.Unmap()
+		// that or it would dodge every IPv4 rule below. A zone is dropped
+		// because prefixes never match a zoned address.
+		addr = addr.Unmap().WithZone("")
 
 		if neverDialable(addr) {
 			return fmt.Errorf("refusing to connect to the reserved address %s", addr)
@@ -118,12 +125,20 @@ func validateAdminUpstream(raw string, hosts []hostPattern, nets []netip.Prefix)
 		return fmt.Errorf("%s:%s is not in the allowed upstream hosts", host, port)
 	}
 
+	// A literal address can be judged now. A name cannot, so for http it is
+	// accepted only when some network could admit it, and dialGuard
+	// (requireListed) checks the address it actually resolves to on every
+	// connection.
+	addr, err := netip.ParseAddr(host)
+	if err == nil {
+		addr = addr.Unmap().WithZone("")
+		if neverDialable(addr) {
+			return fmt.Errorf("%s is a reserved address", addr)
+		}
+	}
 	if u.Scheme == "http" {
-		// A literal address can be judged now. A name cannot, so it is accepted
-		// only when some network could admit it, and dialGuard (requireListed)
-		// checks the address it actually resolves to on every connection.
-		if addr, err := netip.ParseAddr(host); err == nil {
-			if !inNets(nets, addr.Unmap()) {
+		if err == nil {
+			if !inNets(nets, addr) {
 				return fmt.Errorf("http is only allowed to an address in the allowed upstream networks, and %s is not in one", addr)
 			}
 		} else if len(nets) == 0 {

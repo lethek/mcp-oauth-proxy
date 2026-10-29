@@ -534,10 +534,18 @@ func validateTarget(t Target) error {
 
 	// A name or value the transport rejects would otherwise surface as a 502 on
 	// every proxied call, with nothing to point at. RFC 9110 section 5.
+	// Names that differ only in case are one header, and a map would send
+	// whichever came first in iteration order.
+	canonical := map[string]bool{}
 	for name, value := range t.StaticHeaders {
 		if !httpguts.ValidHeaderFieldName(name) {
 			return fmt.Errorf("%sSTATIC_HEADERS: %q is not a valid header name", p, name)
 		}
+		key := http.CanonicalHeaderKey(name)
+		if canonical[key] {
+			return fmt.Errorf("%sSTATIC_HEADERS: %s is listed twice", p, key)
+		}
+		canonical[key] = true
 		if !httpguts.ValidHeaderFieldValue(value) {
 			return fmt.Errorf("%sSTATIC_HEADERS: the value of %s is not a valid header value", p, name)
 		}

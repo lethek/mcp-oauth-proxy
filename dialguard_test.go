@@ -14,6 +14,12 @@ func TestDialGuard(t *testing.T) {
 		netip.MustParsePrefix("169.254.0.0/16"),
 		netip.MustParsePrefix("64:ff9b::/96"),
 		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("64:ff9b:1::/48"),
+		// Each wraps 169.254.169.254, so listing the wrapper must not open it.
+		netip.MustParsePrefix("2002::/16"),
+		netip.MustParsePrefix("::/96"),
+		netip.MustParsePrefix("2001::/32"),
+		netip.MustParsePrefix("::1/128"),
 	}
 
 	for _, tc := range []struct {
@@ -42,6 +48,17 @@ func TestDialGuard(t *testing.T) {
 		{name: "unspecified v6", addr: "::", wantErr: "reserved"},
 		{name: "NAT64", addr: "64:ff9b::a00:1", nets: nets, wantErr: "reserved"},
 		{name: "NAT64 local-use prefix", addr: "64:ff9b:1::a00:1", wantErr: "reserved"},
+		{name: "6to4 wrapping link-local", addr: "2002:a9fe:a9fe::", nets: nets, wantErr: "reserved"},
+		{name: "IPv4-compatible wrapping link-local", addr: "::169.254.169.254", nets: nets, wantErr: "reserved"},
+		// Teredo stores the v4 address with every bit flipped.
+		{name: "Teredo wrapping link-local", addr: "2001::5601:5601", nets: nets, wantErr: "reserved"},
+		{name: "IPv6 loopback can still be listed", addr: "::1", nets: nets, wantErr: ""},
+		{name: "zoned NAT64", addr: "64:ff9b::a00:1%eth0", nets: nets, wantErr: "reserved"},
+		{name: "zoned listed private", addr: "fd00::1%eth0", nets: []netip.Prefix{netip.MustParsePrefix("fd00::/8")}, wantErr: ""},
+		{name: "0.0.0.0", addr: "0.0.0.0", nets: nets, wantErr: "reserved"},
+		{name: "link-local multicast v6", addr: "ff02::1", nets: nets, wantErr: "reserved"},
+		{name: "mapped this-network", addr: "::ffff:0.0.0.1", nets: nets, wantErr: "reserved"},
+		{name: "NAT64 local-use prefix listed in nets", addr: "64:ff9b:1::a00:1", nets: nets, wantErr: "reserved"},
 		{name: "mapped private without an entry", addr: "::ffff:10.1.2.3", wantErr: "non-public"},
 		{name: "mapped private with an entry", addr: "::ffff:10.1.2.3", nets: nets, wantErr: ""},
 		{name: "mapped link-local", addr: "::ffff:169.254.169.254", nets: nets, wantErr: "reserved"},
@@ -77,6 +94,11 @@ func TestValidateAdminUpstream(t *testing.T) {
 		{Host: "internal.example", Port: "8080"},
 		{Host: "10.0.0.5", Port: "8080"},
 		{Host: "192.168.1.9", Port: "80"},
+		{Host: "169.254.169.254", Port: "8080"},
+		{Host: "2606:2800:220::", Port: "443"},
+		{Host: "fd00::5", Port: "8080"},
+		{Host: "fe80::1", Port: "8080"},
+		{Host: "::ffff:10.0.0.5", Port: "8080"},
 	}
 	nets := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
 
@@ -97,6 +119,13 @@ func TestValidateAdminUpstream(t *testing.T) {
 		{name: "default port is checked", raw: "http://internal.example/mcp", nets: nets, wantErr: "not in the allowed upstream hosts"},
 		{name: "http on a literal outside nets", raw: "http://192.168.1.9/mcp", nets: nets, wantErr: "not in one"},
 		{name: "http on a name with no networks", raw: "http://internal.example:8080/mcp", wantErr: "none are configured"},
+		{name: "https on a reserved literal", raw: "https://169.254.169.254:8080/mcp", wantErr: "reserved"},
+		{name: "http on a reserved literal even in nets", raw: "http://169.254.169.254:8080/mcp", nets: []netip.Prefix{netip.MustParsePrefix("169.254.0.0/16")}, wantErr: "reserved"},
+		{name: "https on a bracketed v6 literal", raw: "https://[2606:2800:220::]:443/mcp"},
+		{name: "http on a bracketed v6 literal in nets", raw: "http://[fd00::5]:8080/mcp", nets: []netip.Prefix{netip.MustParsePrefix("fd00::/8")}},
+		{name: "bracketed link-local literal", raw: "https://[fe80::1]:8080/mcp", wantErr: "reserved"},
+		{name: "mapped literal with nets", raw: "http://[::ffff:10.0.0.5]:8080/mcp", nets: nets},
+		{name: "mapped literal without nets", raw: "http://[::ffff:10.0.0.5]:8080/mcp", wantErr: "not in one"},
 		{name: "other scheme", raw: "ftp://mcp.example.com/mcp", wantErr: "http or https"},
 		{name: "no host", raw: "https:///mcp", wantErr: "no host"},
 	} {

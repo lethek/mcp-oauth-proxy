@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -156,7 +157,13 @@ func newCIMD(guardAddresses bool) *cimdClient {
 		// hostname instead would be defeated by exactly that. There are no
 		// allowed networks: a client_id URL never has a reason to reach a
 		// private address.
-		dialer.Control = dialGuard(nil, false)
+		guard := dialGuard(nil, false)
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			if err := guard(network, address, c); err != nil {
+				return fmt.Errorf("cimd: %w", err)
+			}
+			return nil
+		}
 	}
 
 	return &cimdClient{

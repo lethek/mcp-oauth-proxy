@@ -385,10 +385,11 @@ func TestValidateTargetStaticHeaders(t *testing.T) {
 	}
 
 	for name, h := range map[string]map[string]string{
-		"name with a space":     {"Bad Header": "v"},
-		"name with a separator": {"X(Y)": "v"},
-		"value with a newline":  {"X-Test": "a\nb"},
-		"value with a NUL":      {"X-Test": "a\x00b"},
+		"name with a space":       {"Bad Header": "v"},
+		"name with a separator":   {"X(Y)": "v"},
+		"value with a newline":    {"X-Test": "a\nb"},
+		"value with a NUL":        {"X-Test": "a\x00b"},
+		"names differing in case": {"Authorization": "a", "authorization": "b"},
 	} {
 		t.Run("rejects "+name, func(t *testing.T) {
 			if err := validateTarget(static(h)); err == nil {
