@@ -162,11 +162,19 @@ func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.
 	})
 }
 
+// noTargetsMessage is what a client is told while admin targets are enabled and
+// none exist yet.
+const noTargetsMessage = "no MCP servers are available yet; ask the administrator to add one"
+
 // handleAmbiguousResourceMetadata answers the bare RFC 9728 path when several
 // targets are served. There is no single resource to name, and returning one of
 // them arbitrarily would send a client to the wrong upstream with a token that
 // will not work there. Better to say so.
 func (s *Server) handleAmbiguousResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	if len(s.reg.Load().entries) == 0 {
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", noTargetsMessage)
+		return
+	}
 	oauthError(w, http.StatusNotFound, "invalid_request",
 		"this proxy serves several resources; request the metadata for one of them: "+s.reg.Load().ResourceList())
 }
@@ -331,6 +339,14 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// one target it stays optional, for clients predating the requirement.
 	res := strings.TrimRight(q.Get("resource"), "/")
 	snap := s.reg.Load()
+	// Admin targets may leave the snapshot empty. No resource is wrong then, so
+	// naming an empty list would only confuse. It is temporary: an administrator
+	// adding a target fixes it, which is what temporarily_unavailable (the
+	// redirect form of 503) tells the client.
+	if len(snap.entries) == 0 {
+		s.redirectErr(w, r, redirectURI, q.Get("state"), "temporarily_unavailable", noTargetsMessage)
+		return
+	}
 	if res == "" && snap.MultiTarget() {
 		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target",
 			"the resource parameter is required; this proxy serves "+snap.ResourceList())

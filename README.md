@@ -270,7 +270,8 @@ Enabling it has these requirements, and the proxy refuses to start without them:
   It does not apply to targets defined in the environment.
 - The deployment must be named. `UPSTREAM_MCP_URL` and `UPSTREAM_STATIC_HEADERS`
   cannot be combined with it. `TARGETS` may be empty, because admin targets can
-  supply them all.
+  supply them all. While none exist, `/authorize` answers `temporarily_unavailable`
+  and says no MCP servers are available yet.
 
 The `targets` and `targets_version` tables and the `settings_flows.kind` column
 are created at boot even when the feature is off. `ADMIN_*` and
@@ -315,7 +316,8 @@ A sign-in is checked against the target's current allowed groups, even on a
 replica that has not yet seen a change. Editing the display name or allowed
 groups keeps existing sessions, as does any edit that leaves the stamp unchanged,
 such as a static header value or a user-field label. If the delete is interrupted, the next sweep
-repeats it. Removal does not close streams that are already open. They keep
+repeats it, even if the feature has since been switched off. Rows for a target that
+still exists are kept. Removal does not close streams that are already open. They keep
 running until the client or the server ends them, although no new request is
 accepted.
 

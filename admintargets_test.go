@@ -501,8 +501,10 @@ func TestUnsealableStaticTargetIsNotServed(t *testing.T) {
 	}
 }
 
-// With the feature off the targets table is neither read nor written. The table
-// is renamed away for the test, so any statement that mentions it fails.
+// With the feature off no request path reads or writes the targets table. The
+// table is renamed away for the test, so any statement that mentions it fails.
+// The sweep's purge of orphaned admin rows is the one deliberate reader; see
+// TestDisabledFeatureSweepPurgesOrphanedAdminRows.
 func TestDisabledFeatureNeverTouchesTargets(t *testing.T) {
 	h := newHarnessWith(t, perUserTargets)
 	pool := h.srv.store.pool

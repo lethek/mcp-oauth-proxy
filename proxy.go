@@ -389,6 +389,16 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The session's stamp comes second, as the spec orders it: a session issued
+	// under another definition of this name is unknown, whatever resource it
+	// names, and would otherwise reach whatever this one points at now.
+	if ref.Stamp != stamp {
+		slog.Warn("mcp: session was issued under a different definition of this target",
+			"session", sessionID, "target", t.Name)
+		s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
+		return
+	}
+
 	// The audience check. Without it a token minted for one target would work
 	// against every other, which would turn separate upstreams into one
 	// permission. A challenge naming THIS target's metadata is returned rather
@@ -402,16 +412,6 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("mcp: token presented at the wrong resource",
 			"session", sessionID, "token_resource", ref.Resource, "target", t.Resource)
 		s.challengeFor(w, t, "invalid_token", "this token was not issued for "+t.Resource)
-		return
-	}
-
-	// The audience check names the target; the stamp says it is still the
-	// same target. A session issued under another definition of this name
-	// would otherwise reach whatever this one points at now.
-	if ref.Stamp != stamp {
-		slog.Warn("mcp: session was issued under a different definition of this target",
-			"session", sessionID, "target", t.Name)
-		s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
 		return
 	}
 
