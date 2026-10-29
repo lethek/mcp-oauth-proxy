@@ -301,9 +301,11 @@ proxy still starts. Removing the admin target gives the name back to the
 environment entry, which inherits none of its sessions or credentials. The
 removal page says when that will happen.
 
-Changes reach every replica within about 5 seconds, and a replica that has not
-yet seen a change answers `503` with `Retry-After` rather than serving the old
-definition. Static values are encrypted with `ENCRYPTION_KEY`, so rotating the
+Changes reach every replica within about 5 seconds. A replica that has not yet
+polled catches up on the first request for an unknown target name, rather than
+answering `404`, and rate limits that check to about one a second. A replica that
+has not yet seen a change to a target it serves answers `503` with `Retry-After`
+rather than serving the old definition. Static values are encrypted with `ENCRYPTION_KEY`, so rotating the
 key makes them unreadable and those targets are not served until a new value is
 entered. Anyone with write access to the database can redirect an admin target,
 so treat that access as equal to admin.

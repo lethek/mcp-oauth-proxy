@@ -207,7 +207,25 @@ var reservedTargetNames = []string{"admin", "settings"}
 func (r *registry) Rebuild(ctx context.Context) error {
 	r.buildMu.Lock()
 	defer r.buildMu.Unlock()
+	return r.rebuildLocked(ctx)
+}
 
+// rebuildIfBehind is Rebuild for callers that only want the snapshot current.
+// The version is read after taking the lock, so a caller that queued behind a
+// rebuild which already caught up returns after one cheap read instead of
+// repeating the full one. It reports whether it rebuilt.
+func (r *registry) rebuildIfBehind(ctx context.Context) (bool, error) {
+	r.buildMu.Lock()
+	defer r.buildMu.Unlock()
+	v, err := r.store.TargetsVersion(ctx)
+	if err != nil || v == r.Load().version {
+		return false, err
+	}
+	return true, r.rebuildLocked(ctx)
+}
+
+// rebuildLocked is the body of Rebuild; buildMu must be held.
+func (r *registry) rebuildLocked(ctx context.Context) error {
 	rows, version, err := r.store.LoadAdminTargets(ctx)
 	if err != nil {
 		return err
@@ -338,13 +356,40 @@ func (r *registry) Poll(ctx context.Context, every time.Duration) {
 func (r *registry) pollOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, rebuildTimeout)
 	defer cancel()
-	v, err := r.store.TargetsVersion(ctx)
-	if err == nil && v != r.Load().version {
-		err = r.Rebuild(ctx)
-	}
-	if err != nil {
+	if _, err := r.rebuildIfBehind(ctx); err != nil {
 		slog.Warn("polling for target changes failed; keeping the current targets", "err", err)
 	}
+}
+
+// catchUpTimeout bounds the check a request waits on. It is much shorter than
+// rebuildTimeout because a client is blocked on it.
+const catchUpTimeout = 2 * time.Second
+
+// allowCheck admits at most one database check a second per replica, shared by
+// RequestRebuild and CatchUp so unauthenticated traffic cannot multiply them.
+func (r *registry) allowCheck() bool {
+	now := time.Now().UnixNano()
+	last := r.lastRequest.Load()
+	return now-last >= int64(time.Second) && r.lastRequest.CompareAndSwap(last, now)
+}
+
+// CatchUp is for a request that names a target this snapshot lacks, which on a
+// replica that has not polled yet may be one created seconds ago. It rebuilds if
+// the database is ahead and reports whether the snapshot changed. When the
+// throttle suppresses the check it returns false and no error, so the caller
+// answers as it would have. An error means the replica cannot tell whether the
+// name exists.
+func (r *registry) CatchUp(ctx context.Context) (bool, error) {
+	if !r.allowCheck() {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, catchUpTimeout)
+	defer cancel()
+	changed, err := r.rebuildIfBehind(ctx)
+	if err != nil {
+		slog.Warn("catching up on an unknown target name failed", "err", err)
+	}
+	return changed, err
 }
 
 // RequestRebuild starts a rebuild in the background for a request that found
@@ -353,22 +398,13 @@ func (r *registry) pollOnce(ctx context.Context) {
 // the version is checked first, as pollOnce does, to keep requests for it from
 // repeating the full read.
 func (r *registry) RequestRebuild() {
-	now := time.Now().UnixNano()
-	last := r.lastRequest.Load()
-	if now-last < int64(time.Second) || !r.lastRequest.CompareAndSwap(last, now) {
+	if !r.allowCheck() {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(r.bg, rebuildTimeout)
 		defer cancel()
-		v, err := r.store.TargetsVersion(ctx)
-		if err == nil && v == r.Load().version {
-			return
-		}
-		if err == nil {
-			err = r.Rebuild(ctx)
-		}
-		if err != nil {
+		if _, err := r.rebuildIfBehind(ctx); err != nil {
 			slog.Warn("rebuilding the targets failed; keeping the current ones", "err", err)
 		}
 	}()

@@ -150,6 +150,14 @@ func oauthError(w http.ResponseWriter, status int, code, desc string) {
 func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
 	// Empty in a single-target deployment, whose routes have no {target}.
 	e := s.reg.Load().byName[r.PathValue("target")]
+	if e == nil && s.reg.enabled() {
+		snap, err := s.catchUp(r)
+		if err != nil {
+			retryShortly(w)
+			return
+		}
+		e = snap.byName[r.PathValue("target")]
+	}
 	if e == nil {
 		http.NotFound(w, r)
 		return
@@ -340,6 +348,20 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// one target it stays optional, for clients predating the requirement.
 	res := strings.TrimRight(q.Get("resource"), "/")
 	snap := s.reg.Load()
+	// A replica that has not polled yet may not know a target created moments
+	// ago, so an unknown resource, or an empty snapshot, is checked against the
+	// database once before it is refused.
+	if s.reg.enabled() {
+		if _, known := snap.TargetByResource(res); !known && (res != "" || len(snap.entries) == 0) {
+			var err error
+			if snap, err = s.catchUp(r); err != nil {
+				w.Header().Set("Retry-After", "2")
+				s.redirectErr(w, r, redirectURI, q.Get("state"), "temporarily_unavailable",
+					"this server's targets are being updated; retry shortly")
+				return
+			}
+		}
+	}
 	// Admin targets may leave the snapshot empty. No resource is wrong then, so
 	// naming an empty list would only confuse. It is temporary: an administrator
 	// adding a target fixes it, which is what temporarily_unavailable (the

@@ -214,9 +214,22 @@ var errBehind = errors.New("this replica has not seen the latest change to the t
 // rebuild that will let it. The client keeps whatever it holds and retries.
 func (s *Server) refuseBehind(w http.ResponseWriter) {
 	s.reg.RequestRebuild()
+	retryShortly(w)
+}
+
+func retryShortly(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", "2")
 	oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
 		"this server's targets are being updated; retry shortly")
+}
+
+// catchUp is for a request naming a target the snapshot lacks while admin
+// targets are enabled. It returns the snapshot to look the name up in again. An
+// error means the replica cannot tell whether the name exists, so the caller
+// must not answer "not found".
+func (s *Server) catchUp(r *http.Request) (*snapshot, error) {
+	_, err := s.reg.CatchUp(r.Context())
+	return s.reg.Load(), err
 }
 
 // notEnrolled tells the caller what to do about it. An MCP client surfaces
@@ -353,6 +366,14 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// Empty in a single-target deployment, whose routes have no {target}.
 	snap := s.reg.Load()
 	e := snap.byName[r.PathValue("target")]
+	if e == nil && s.reg.enabled() {
+		var err error
+		if snap, err = s.catchUp(r); err != nil {
+			retryShortly(w)
+			return
+		}
+		e = snap.byName[r.PathValue("target")]
+	}
 	if e == nil {
 		http.NotFound(w, r)
 		return
