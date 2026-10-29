@@ -334,6 +334,11 @@ signed straight back in, and the 30 minutes is the only limit on how long a
 stolen or unattended browser can administer. Removing someone from an admin
 group takes effect within that time.
 
+The page has a Sign out button, which posts to `/admin/logout`. It removes the
+cookie from that browser only. The session is stateless, so a copied cookie stays
+valid until its 30 minutes are up. Signing out writes one log line,
+`admin: signed out`.
+
 Group names are only safe where users cannot create groups. If your provider
 lets any user create a group or organisation whose name appears in the `groups`
 claim, `ADMIN_GROUPS=admins` is satisfied by anyone who creates one. Use
@@ -449,7 +454,7 @@ If a target's stamp changes, they stop working for that target.
 | `/revoke` | RFC 7009. Presenting either token ends the whole session. |
 | `/mcp` | Authenticated pass-through to the upstream MCP server. With `TARGETS`, each target is at `/<name>/mcp` instead. |
 | `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Always served. When no target is `per_user`, the page says there is nothing to enrol. |
-| `/admin`, `/admin/callback`, `/admin/targets/...` | The admin page: sign-in, list, and the add, edit, confirm and remove forms. Served only when `ADMIN_SUBJECTS` or `ADMIN_GROUPS` is set. |
+| `/admin`, `/admin/callback`, `/admin/targets/...`, `/admin/logout` | The admin page: sign-in, list, the add, edit, confirm and remove forms, and sign-out. Served only when `ADMIN_SUBJECTS` or `ADMIN_GROUPS` is set. |
 | `/healthz` | Liveness. Reports only on this process. |
 
 ## Security notes
