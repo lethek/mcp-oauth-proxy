@@ -257,9 +257,8 @@ tokens issued from them.
 ### Admin-managed targets
 
 Setting `ADMIN_SUBJECTS` or `ADMIN_GROUPS` lets targets live in the database as
-well as in the environment. This release adds the storage and the serving side.
-There is no admin page yet, so nothing can create an admin target through the
-proxy itself.
+well as in the environment, and adds the page at **`PUBLIC_URL/admin`** for
+managing them.
 
 Enabling it has these requirements, and the proxy refuses to start without them:
 
@@ -300,7 +299,49 @@ A sign-in is checked against the target's current allowed groups, even on a
 replica that has not yet seen a change. Editing the display name or allowed
 groups keeps existing sessions, as does any edit that leaves the stamp unchanged,
 such as a static header value or a user-field label. If the delete is interrupted, the next sweep
-repeats it.
+repeats it. Removal does not close streams that are already open. They keep
+running until the client or the server ends them, although no new request is
+accepted.
+
+#### The admin page
+
+`/admin` runs its own sign-in with the provider, separate from `/settings`. Its
+callback address, `PUBLIC_URL/admin/callback`, must be registered with the
+provider alongside the others before the feature is switched on. An admin is
+anyone whose subject is in `ADMIN_SUBJECTS` or whose `groups` claim contains a
+name in `ADMIN_GROUPS`. Both are read from the environment at sign-in, so nobody
+can grant themselves access from the page. Anyone else is shown a 403 page.
+
+The admin session lasts 30 minutes and then asks the provider again. The proxy
+sends no `prompt=login` or `max_age`, so a person with a live provider session is
+signed straight back in, and the 30 minutes is the only limit on how long a
+stolen or unattended browser can administer. Removing someone from an admin
+group takes effect within that time.
+
+Group names are only safe where users cannot create groups. If your provider
+lets any user create a group or organisation whose name appears in the `groups`
+claim, `ADMIN_GROUPS=admins` is satisfied by anyone who creates one. Use
+`ADMIN_SUBJECTS` there. The same applies to `..._ALLOWED_GROUPS`.
+
+The page lists each target with its host and mode. Targets from the
+environment are shown read only, and an environment target left out because an
+admin target holds its name is shown with that reason. A form can change the
+display name, URL, mode, per-user fields, static headers and allowed groups. A
+change to the URL, mode or per-user fields is a replacement, and the form marks
+those fields. A replacement and a removal each show how many sessions and saved
+credentials they will end and need the target's name typed to go ahead.
+Per-user fields are entered as the same JSON list as `..._USER_HEADERS`.
+
+Static header values are write-only. They are never shown again and never
+logged. Leave the field empty on an edit to keep the stored value, which is
+possible only while the URL and mode stay the same. A replacement asks for the
+value again on its confirmation page.
+
+Every change writes one log line, `admin: target changed`, with the admin's
+subject, the operation and the names of the fields that changed. It never
+includes values. A removal is not recoverable, so that line is the only record
+of it. Forms carry a token tied to the admin session. A submission with a
+missing or wrong token, or from another origin, is refused.
 
 ### Static upstream credentials
 
@@ -392,6 +433,7 @@ If a target's stamp changes, they stop working for that target.
 | `/revoke` | RFC 7009. Presenting either token ends the whole session. |
 | `/mcp` | Authenticated pass-through to the upstream MCP server. With `TARGETS`, each target is at `/<name>/mcp` instead. |
 | `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Always served. When no target is `per_user`, the page says there is nothing to enrol. |
+| `/admin`, `/admin/callback`, `/admin/targets/...` | The admin page: sign-in, list, and the add, edit, confirm and remove forms. Served only when `ADMIN_SUBJECTS` or `ADMIN_GROUPS` is set. |
 | `/healthz` | Liveness. Reports only on this process. |
 
 ## Security notes

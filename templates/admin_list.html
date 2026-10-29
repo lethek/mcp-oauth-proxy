@@ -1,0 +1,51 @@
+{{define "title"}}Servers{{end}}
+{{define "content"}}
+<header class="page-head">
+  <h1>Servers</h1>
+  <p class="lede">The MCP servers this proxy fronts. Changes reach every replica within about
+  five seconds. Streams that are already open keep running after a server is removed.</p>
+</header>
+
+<div class="account">
+  <span><span class="muted">Signed in as</span> <strong>{{.Subject}}</strong></span>
+  <a class="btn btn-sm btn-primary" href="/admin/targets/new">Add server</a>
+</div>
+
+{{if .Notice}}<p class="banner" role="status">{{.Notice}}</p>{{end}}
+
+{{if not .Admin}}<div class="card empty"><p>No servers are managed here yet.</p></div>{{end}}
+{{range .Admin}}
+<section class="card">
+  <div class="card-head">
+    <h2>{{.Display}}</h2>
+    {{if .Served}}<span class="pill pill-ok">Serving</span>{{else}}<span class="pill pill-warn">Not serving</span>{{end}}
+  </div>
+  <p class="mono muted">{{.Name}} &middot; {{.Host}}</p>
+  <p class="muted">Credential: {{.Mode}}{{if eq .Mode "per_user"}}. {{.Enrolments}} saved credential{{if ne .Enrolments 1}}s{{end}}{{end}}.
+  Last changed {{.UpdatedAt}} by {{.UpdatedBy}}.</p>
+  <div class="row">
+    <a class="btn btn-sm" href="/admin/targets/{{.Name}}/edit">Edit</a>
+    <a class="btn btn-sm btn-danger" href="/admin/targets/{{.Name}}/remove">Remove</a>
+  </div>
+</section>
+{{end}}
+
+{{range .Ignored}}
+<div class="callout" role="note">
+  <p><strong>{{.Name}}</strong> from the environment is not being served: {{.Reason}}.</p>
+</div>
+{{end}}
+
+{{if .Config}}<h2 class="section">Set in the environment</h2>
+<p class="fine">These cannot be changed here.</p>{{end}}
+{{range .Config}}
+<section class="card">
+  <div class="card-head">
+    <h2>{{.Display}}</h2>
+    <span class="pill">Read only</span>
+  </div>
+  <p class="mono muted">{{.Name}} &middot; {{.Host}}</p>
+  <p class="muted">Credential: {{.Mode}}.</p>
+</section>
+{{end}}
+{{end}}
