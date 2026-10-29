@@ -2,7 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/netip"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -50,6 +55,38 @@ type Store struct {
 
 	refreshTTL time.Duration
 	sessionTTL time.Duration
+
+	// admin is set when admin targets are enabled. Until then the targets table
+	// is neither read nor written, and the freshness join is not issued.
+	admin *adminPolicy
+
+	// afterVersionRead, when set, runs inside LoadAdminTargets between reading
+	// the version and reading the rows. Tests use it to force an edit into that
+	// gap.
+	afterVersionRead func()
+}
+
+// adminPolicy is what the store needs to accept and read admin targets.
+type adminPolicy struct {
+	sealer *sealer
+	hosts  []hostPattern
+	nets   []netip.Prefix
+}
+
+// EnableAdminTargets turns on the targets table for this store. It must run
+// before the store is shared.
+func (s *Store) EnableAdminTargets(seal *sealer, hosts []hostPattern, nets []netip.Prefix) {
+	s.admin = &adminPolicy{sealer: seal, hosts: hosts, nets: nets}
+}
+
+// freshnessSQL returns the pieces a session reader adds so it can compare the
+// stamp the database holds for the session's target with its own snapshot. With
+// admin targets off there is nothing to compare and the join is not issued.
+func (s *Store) freshnessSQL() (column, join string) {
+	if s.admin == nil {
+		return "NULL::text", ""
+	}
+	return "tg.stamp", "LEFT JOIN targets tg ON tg.name = s.target"
 }
 
 func NewStore(ctx context.Context, url string, refreshTTL, sessionTTL time.Duration) (*Store, error) {
@@ -217,6 +254,35 @@ CREATE TABLE IF NOT EXISTS settings_flows (
     browser_hash      BYTEA NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Targets an admin manages from the web page, beside the ones in the
+-- environment. stamp is maintained by the application on every save, and
+-- generation is re-rolled on every replacement, so a re-added name never
+-- shares a stamp with its predecessor. revision counts edits to one row and
+-- is not an identity: re-adding a name restarts it, so every mutation is
+-- checked against (name, row_id, revision) together.
+CREATE TABLE IF NOT EXISTS targets (
+    name           TEXT PRIMARY KEY,
+    display_name   TEXT NOT NULL,
+    upstream_mcp   TEXT NOT NULL,
+    mode           TEXT NOT NULL,
+    row_id         UUID NOT NULL DEFAULT gen_random_uuid(),
+    generation     UUID NOT NULL DEFAULT gen_random_uuid(),
+    stamp          TEXT NOT NULL,
+    sealed_static  BYTEA,
+    user_fields    JSONB,
+    allowed_groups TEXT[] NOT NULL DEFAULT '{}',
+    revision       BIGINT NOT NULL DEFAULT 1,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by     TEXT NOT NULL
+);
+
+-- One row, bumped in the transaction of every change. Replicas poll it.
+CREATE TABLE IF NOT EXISTS targets_version (
+    id      BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+    version BIGINT NOT NULL
+);
+INSERT INTO targets_version (id, version) VALUES (true, 0) ON CONFLICT DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS access_tokens_session_idx  ON access_tokens (session_id);
 CREATE INDEX IF NOT EXISTS refresh_tokens_session_idx ON refresh_tokens (session_id);
@@ -449,6 +515,11 @@ type SessionRef struct {
 	Resource string
 	Target   string
 	Stamp    string
+
+	// CurrentStamp is the stamp the targets table holds under the session's target
+	// name, or nil when it holds none. Set only when admin targets are enabled; the
+	// caller compares it with its snapshot to learn whether it is behind.
+	CurrentStamp *string
 }
 
 // LookupAccessToken also enforces the session's absolute lifetime, so an access
@@ -460,12 +531,13 @@ type SessionRef struct {
 // stamp, one that predates stamps, is never returned.
 func (s *Store) LookupAccessToken(ctx context.Context, token string) (SessionRef, error) {
 	var ref SessionRef
+	column, join := s.freshnessSQL()
 	err := s.pool.QueryRow(ctx,
-		`SELECT t.session_id, s.resource, s.target, s.stamp FROM access_tokens t
-		 JOIN sessions s ON s.id = t.session_id
+		`SELECT t.session_id, s.resource, s.target, s.stamp, `+column+` FROM access_tokens t
+		 JOIN sessions s ON s.id = t.session_id `+join+`
 		 WHERE t.token_hash=$1 AND t.expires_at > now() AND s.stamp <> ''
 		   AND s.created_at > now() - $2::interval`,
-		hashToken(token), s.sessionTTL.String()).Scan(&ref.ID, &ref.Resource, &ref.Target, &ref.Stamp)
+		hashToken(token), s.sessionTTL.String()).Scan(&ref.ID, &ref.Resource, &ref.Target, &ref.Stamp, &ref.CurrentStamp)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SessionRef{}, ErrNotFound
 	}
@@ -527,7 +599,7 @@ func (g *Grant) TakeAuthCode(ctx context.Context, code string) (AuthCode, error)
 	return takeAuthCode(ctx, g.tx, code)
 }
 
-func (g *Grant) TakeRefreshToken(ctx context.Context, token, clientID string) (string, error) {
+func (g *Grant) TakeRefreshToken(ctx context.Context, token, clientID string) (SessionRef, error) {
 	return g.s.takeRefreshToken(ctx, g.tx, token, clientID)
 }
 
@@ -556,11 +628,17 @@ func (s *Store) CreateRefreshToken(ctx context.Context, token, sessionID, client
 // Rotation alone only detects theft; acting on that signal is what contains it,
 // so the caller revokes the session.
 func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (sessionID string, err error) {
-	return s.takeRefreshToken(ctx, s.pool, token, clientID)
+	ref, err := s.takeRefreshToken(ctx, s.pool, token, clientID)
+	return ref.ID, err
 }
 
-func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID string) (sessionID string, err error) {
+// takeRefreshToken also returns the session's target, stamp and the stamp the
+// database holds for that target, so the caller can refuse a refresh for a
+// definition that has changed. The caller does so before committing the grant,
+// which leaves the token unused.
+func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID string) (ref SessionRef, err error) {
 	hash := hashToken(token)
+	column, join := s.freshnessSQL()
 
 	// The client binding is part of the same statement, so a request naming the
 	// wrong client matches nothing and the token stays unused.
@@ -571,20 +649,21 @@ func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID
 	// is an ordinary mistake and must not be able to destroy a session.
 	err = q.QueryRow(ctx,
 		`UPDATE refresh_tokens r SET used=true, used_at=now()
-		 FROM sessions s
+		 FROM sessions s `+join+`
 		 WHERE r.token_hash=$1
 		   AND NOT r.used
 		   AND r.client_id=$2
 		   AND r.created_at > now() - $3::interval
 		   AND s.id = r.session_id
 		   AND s.created_at > now() - $4::interval
-		 RETURNING r.session_id`,
-		hash, clientID, s.refreshTTL.String(), s.sessionTTL.String()).Scan(&sessionID)
+		 RETURNING r.session_id, s.target, s.stamp, `+column,
+		hash, clientID, s.refreshTTL.String(), s.sessionTTL.String()).
+		Scan(&ref.ID, &ref.Target, &ref.Stamp, &ref.CurrentStamp)
 	if err == nil {
-		return sessionID, nil
+		return ref, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", err
+		return SessionRef{}, err
 	}
 
 	// The token did not qualify. Only a token already marked used is a replay;
@@ -604,9 +683,9 @@ func (s *Store) takeRefreshToken(ctx context.Context, q querier, token, clientID
 	if e := q.QueryRow(ctx,
 		`SELECT session_id FROM refresh_tokens WHERE token_hash=$1 AND used`, hash).
 		Scan(&reusedSession); e == nil {
-		return reusedSession, ErrTokenReused
+		return SessionRef{ID: reusedSession}, ErrTokenReused
 	}
-	return "", ErrNotFound
+	return SessionRef{}, ErrNotFound
 }
 
 // SessionForToken resolves either kind of bearer token to its session without
@@ -652,17 +731,21 @@ func (s *Store) PutUserCredential(ctx context.Context, subject, target, stamp st
 // fetching the subject and then the credential would cost a second round trip on
 // that path. The credential must have been saved under the stamp the session was
 // issued under.
-func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target string) ([]byte, error) {
-	var sealed []byte
-	err := s.pool.QueryRow(ctx,
-		`SELECT c.sealed_headers FROM sessions s
-		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2 AND c.stamp = s.stamp
+//
+// It also returns the stamp the targets table holds for the name (nil if none),
+// read in the same statement, so the caller can tell that its snapshot is behind
+// before it sends the credential anywhere.
+func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target string) (sealed []byte, current *string, err error) {
+	column, join := s.freshnessSQL()
+	err = s.pool.QueryRow(ctx,
+		`SELECT c.sealed_headers, `+column+` FROM sessions s
+		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2 AND c.stamp = s.stamp `+join+`
 		 WHERE s.id = $1 AND s.subject <> '' AND s.stamp <> ''`,
-		sessionID, target).Scan(&sealed)
+		sessionID, target).Scan(&sealed, &current)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
-	return sealed, err
+	return sealed, current, err
 }
 
 // EnrolledTargets is the set a subject has already configured, for the catalogue.
@@ -834,4 +917,329 @@ DELETE FROM user_credentials c
                       AND s.seen_at > now() - $1::interval)`,
 		strayCredentialAge.String())
 	return err
+}
+
+// ---------- admin targets ----------
+
+var (
+	// ErrTargetChanged means the (name, row_id, revision) a change was made against
+	// is not the row's now: it was edited, removed, or removed and re-added. The
+	// person works from a stale page and has to reload.
+	ErrTargetChanged = errors.New("the target changed or was removed")
+
+	// ErrTargetExists means the name is already taken by an admin target.
+	ErrTargetExists = errors.New("an admin target already has that name")
+
+	// ErrStaticValueRequired refuses a change that would send a stored static
+	// credential somewhere it was not entered for.
+	ErrStaticValueRequired = errors.New("a static target needs a new static value when its URL or mode changes")
+)
+
+// AdminTarget is a row of the targets table. Target carries the stored
+// definition, without the static headers, which stay sealed in SealedStatic
+// until a snapshot is built.
+type AdminTarget struct {
+	Target       Target
+	RowID        string
+	Revision     int64
+	StoredStamp  string
+	SealedStatic []byte
+	UpdatedAt    time.Time
+	UpdatedBy    string
+}
+
+// TargetKey is what a change is checked against. Revision alone is not an
+// identity, because re-adding a name restarts it at 1.
+type TargetKey struct {
+	Name     string
+	RowID    string
+	Revision int64
+}
+
+const adminColumns = `name, display_name, upstream_mcp, mode, row_id::text, generation::text, stamp,
+	sealed_static, user_fields, allowed_groups, revision, updated_at, updated_by`
+
+func scanAdminTarget(row pgx.Row) (AdminTarget, error) {
+	var a AdminTarget
+	var mode string
+	var fields []byte
+	t := &a.Target
+	err := row.Scan(&t.Name, &t.DisplayName, &t.UpstreamMCP, &mode, &a.RowID, &t.Generation, &a.StoredStamp,
+		&a.SealedStatic, &fields, &t.AllowedGroups, &a.Revision, &a.UpdatedAt, &a.UpdatedBy)
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	t.Mode, t.Source = CredentialMode(mode), SourceAdmin
+	if fields != nil {
+		if err := json.Unmarshal(fields, &t.UserFields); err != nil {
+			return AdminTarget{}, fmt.Errorf("target %q: user_fields: %w", t.Name, err)
+		}
+	}
+	return a, nil
+}
+
+// LoadAdminTargets reads every row and the version in one REPEATABLE READ
+// transaction, so an edit committing between the two reads cannot produce a
+// mixed result: the rows are exactly those the version describes.
+func (s *Store) LoadAdminTargets(ctx context.Context) ([]AdminTarget, int64, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var version int64
+	if err := tx.QueryRow(ctx, `SELECT version FROM targets_version`).Scan(&version); err != nil {
+		return nil, 0, err
+	}
+	if s.afterVersionRead != nil {
+		s.afterVersionRead()
+	}
+	rows, err := tx.Query(ctx, `SELECT `+adminColumns+` FROM targets ORDER BY name`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []AdminTarget
+	for rows.Next() {
+		a, err := scanAdminTarget(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, a)
+	}
+	return out, version, rows.Err()
+}
+
+// TargetsVersion is the cheap read each replica polls.
+func (s *Store) TargetsVersion(ctx context.Context) (int64, error) {
+	var v int64
+	err := s.pool.QueryRow(ctx, `SELECT version FROM targets_version`).Scan(&v)
+	return v, err
+}
+
+// staticPurpose binds a sealed static value to its row.
+func staticPurpose(name, rowID string) string {
+	return boundPurpose(purposeAdminStatic, name+"/"+rowID)
+}
+
+func (s *Store) openStatic(a AdminTarget) (map[string]string, error) {
+	raw, err := s.admin.sealer.open(staticPurpose(a.Target.Name, a.RowID), a.SealedStatic)
+	if err != nil {
+		return nil, err
+	}
+	var headers map[string]string
+	if err := json.Unmarshal(raw, &headers); err != nil {
+		return nil, err
+	}
+	return headers, nil
+}
+
+// checkAdminTarget applies the rules an admin-supplied definition must meet. It
+// runs here so no caller can forget it, and again when a snapshot is built.
+func (s *Store) checkAdminTarget(t Target) error {
+	if t.Name == "" {
+		return errors.New("a target needs a name")
+	}
+	if slices.Contains(reservedTargetNames, t.Name) {
+		return fmt.Errorf("%q is a reserved name", t.Name)
+	}
+	if err := validateTarget(t); err != nil {
+		return err
+	}
+	return validateAdminUpstream(t.UpstreamMCP, s.admin.hosts, s.admin.nets)
+}
+
+// sealedFor returns the columns that depend on the mode. A static value is only
+// kept for a static target, and fields only for a per_user one.
+func (s *Store) sealedFor(t Target, rowID string) (sealedStatic, userFields []byte, err error) {
+	if t.Mode == CredStatic {
+		raw, err := json.Marshal(t.StaticHeaders)
+		if err != nil {
+			return nil, nil, err
+		}
+		if sealedStatic, err = s.admin.sealer.seal(staticPurpose(t.Name, rowID), raw); err != nil {
+			return nil, nil, err
+		}
+	}
+	if t.Mode == CredPerUser {
+		if userFields, err = json.Marshal(t.UserFields); err != nil {
+			return nil, nil, err
+		}
+	}
+	return sealedStatic, userFields, nil
+}
+
+func normaliseAdminTarget(t Target) Target {
+	t.UpstreamMCP = strings.TrimRight(strings.TrimSpace(t.UpstreamMCP), "/")
+	t.DisplayName = strings.TrimSpace(t.DisplayName)
+	t.Source = SourceAdmin
+	return t
+}
+
+// bumpTargetsVersion runs in the transaction of every change, so a replica that
+// sees the new version also sees the change.
+func bumpTargetsVersion(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `UPDATE targets_version SET version = version + 1`)
+	return err
+}
+
+// CreateTarget adds a target under a new row id and generation, so no stamp
+// from an earlier holder of the name can match it.
+func (s *Store) CreateTarget(ctx context.Context, t Target, by string) (AdminTarget, error) {
+	if s.admin == nil {
+		return AdminTarget{}, errors.New("admin targets are not enabled")
+	}
+	if by == "" {
+		return AdminTarget{}, errors.New("a change needs the subject that made it")
+	}
+	t = normaliseAdminTarget(t)
+	if err := s.checkAdminTarget(t); err != nil {
+		return AdminTarget{}, err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var rowID string
+	if err := tx.QueryRow(ctx, `SELECT gen_random_uuid()::text, gen_random_uuid()::text`).Scan(&rowID, &t.Generation); err != nil {
+		return AdminTarget{}, err
+	}
+	sealedStatic, userFields, err := s.sealedFor(t, rowID)
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	a, err := scanAdminTarget(tx.QueryRow(ctx,
+		`INSERT INTO targets (name, display_name, upstream_mcp, mode, row_id, generation, stamp,
+		                      sealed_static, user_fields, allowed_groups, updated_by)
+		 VALUES ($1,$2,$3,$4,$5::uuid,$6::uuid,$7,$8,$9,$10,$11)
+		 RETURNING `+adminColumns,
+		t.Name, t.DisplayName, t.UpstreamMCP, string(t.Mode), rowID, t.Generation, t.Stamp(),
+		sealedStatic, userFields, nonNil(t.AllowedGroups), by))
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return AdminTarget{}, ErrTargetExists
+	}
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	if err := bumpTargetsVersion(ctx, tx); err != nil {
+		return AdminTarget{}, err
+	}
+	return a, tx.Commit(ctx)
+}
+
+// nonNil keeps a nil slice from being sent as NULL to a NOT NULL column.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// UpdateTarget replaces a target's definition, checked against key in the same
+// transaction that applies it. Display name and allowed groups keep the stamp.
+// A change to the URL, mode or per-user fields is a replacement: the generation
+// is re-rolled so the stamp changes even if an earlier definition is put back.
+//
+// A static target keeps its sealed value when t carries none and the URL and
+// mode are unchanged. Otherwise it must supply one, so a credential entered for
+// one server is never silently sent to another.
+func (s *Store) UpdateTarget(ctx context.Context, key TargetKey, t Target, by string) (AdminTarget, error) {
+	if s.admin == nil {
+		return AdminTarget{}, errors.New("admin targets are not enabled")
+	}
+	if by == "" {
+		return AdminTarget{}, errors.New("a change needs the subject that made it")
+	}
+	if t.Name != key.Name {
+		return AdminTarget{}, errors.New("a target cannot be renamed")
+	}
+	t = normaliseAdminTarget(t)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	cur, err := scanAdminTarget(tx.QueryRow(ctx,
+		`SELECT `+adminColumns+` FROM targets WHERE name=$1 AND row_id=$2::uuid AND revision=$3 FOR UPDATE`,
+		key.Name, key.RowID, key.Revision))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AdminTarget{}, ErrTargetChanged
+	}
+	if err != nil {
+		return AdminTarget{}, err
+	}
+
+	if t.Mode == CredStatic && len(t.StaticHeaders) == 0 {
+		if cur.Target.Mode != CredStatic || cur.Target.UpstreamMCP != t.UpstreamMCP {
+			return AdminTarget{}, ErrStaticValueRequired
+		}
+		if t.StaticHeaders, err = s.openStatic(cur); err != nil {
+			return AdminTarget{}, fmt.Errorf("the stored static value cannot be read, so supply a new one: %w", err)
+		}
+	}
+	if err := s.checkAdminTarget(t); err != nil {
+		return AdminTarget{}, err
+	}
+
+	t.Generation = cur.Target.Generation
+	if t.Stamp() != cur.StoredStamp {
+		if err := tx.QueryRow(ctx, `SELECT gen_random_uuid()::text`).Scan(&t.Generation); err != nil {
+			return AdminTarget{}, err
+		}
+	}
+	sealedStatic, userFields, err := s.sealedFor(t, cur.RowID)
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	a, err := scanAdminTarget(tx.QueryRow(ctx,
+		`UPDATE targets SET display_name=$4, upstream_mcp=$5, mode=$6, generation=$7::uuid, stamp=$8,
+		        sealed_static=$9, user_fields=$10, allowed_groups=$11,
+		        revision=revision+1, updated_at=now(), updated_by=$12
+		 WHERE name=$1 AND row_id=$2::uuid AND revision=$3
+		 RETURNING `+adminColumns,
+		key.Name, key.RowID, key.Revision, t.DisplayName, t.UpstreamMCP, string(t.Mode), t.Generation, t.Stamp(),
+		sealedStatic, userFields, nonNil(t.AllowedGroups), by))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AdminTarget{}, ErrTargetChanged
+	}
+	if err != nil {
+		return AdminTarget{}, err
+	}
+	if err := bumpTargetsVersion(ctx, tx); err != nil {
+		return AdminTarget{}, err
+	}
+	return a, tx.Commit(ctx)
+}
+
+// DeleteTarget removes a target, checked against key in its own transaction. The
+// row's stamp then matches nothing, so everything issued under it is refused.
+func (s *Store) DeleteTarget(ctx context.Context, key TargetKey) error {
+	if s.admin == nil {
+		return errors.New("admin targets are not enabled")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `DELETE FROM targets WHERE name=$1 AND row_id=$2::uuid AND revision=$3`,
+		key.Name, key.RowID, key.Revision)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrTargetChanged
+	}
+	if err := bumpTargetsVersion(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

@@ -37,7 +37,7 @@ func newTestStore(t *testing.T) *Store {
 	// everything. user_credentials is NOT among the cascades: it deliberately has
 	// no foreign key to sessions, so it survives one and has to be cleared here
 	// or an enrolment leaks into the next test and makes "not enrolled" pass.
-	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "stamp_seen", "clients"} {
+	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "stamp_seen", "targets", "clients"} {
 		if _, err := s.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clearing %s: %v", table, err)
 		}
@@ -690,13 +690,13 @@ func TestCredentialIsReadOnlyThroughASessionWithTheSameStamp(t *testing.T) {
 	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.UserCredentialForSession(ctx, id, "plane"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.UserCredentialForSession(ctx, id, "plane"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("a credential for another stamp was returned: %v", err)
 	}
 	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A")); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := s.UserCredentialForSession(ctx, id, "plane"); err != nil || string(b) != "A" {
+	if b, _, err := s.UserCredentialForSession(ctx, id, "plane"); err != nil || string(b) != "A" {
 		t.Errorf("got %q, %v; want the credential for the session's own stamp", b, err)
 	}
 }

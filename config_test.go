@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -448,5 +450,123 @@ func TestValidateTarget(t *testing.T) {
 				t.Fatal("want an error")
 			}
 		})
+	}
+}
+
+func adminEnv(t *testing.T) {
+	t.Helper()
+	minimalEnv(t)
+	t.Setenv("UPSTREAM_MCP_URL", "")
+	t.Setenv("ADMIN_SUBJECTS", "root")
+	t.Setenv("ALLOWED_UPSTREAM_HOSTS", "mcp.example:443, Other.Example:8443")
+	t.Setenv("ALLOWED_UPSTREAM_NETWORKS", "10.1.2.3/8")
+}
+
+func TestAdminConfig(t *testing.T) {
+	t.Run("parses the four variables", func(t *testing.T) {
+		adminEnv(t)
+		t.Setenv("ADMIN_GROUPS", "ops, admins")
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.AdminEnabled() || !cfg.NamedMode() {
+			t.Error("the feature is not enabled in named mode")
+		}
+		if len(cfg.Targets) != 0 {
+			t.Errorf("targets = %d, want none", len(cfg.Targets))
+		}
+		if got := strings.Join(cfg.AdminGroups, "|"); got != "ops|admins" {
+			t.Errorf("groups = %q", got)
+		}
+		if len(cfg.AllowedUpstreamHosts) != 2 || cfg.AllowedUpstreamHosts[1] != (hostPattern{"other.example", "8443"}) {
+			t.Errorf("hosts = %+v", cfg.AllowedUpstreamHosts)
+		}
+		// A host bit in the prefix is dropped, so it matches the whole network.
+		if len(cfg.AllowedUpstreamNetworks) != 1 || cfg.AllowedUpstreamNetworks[0].String() != "10.0.0.0/8" {
+			t.Errorf("networks = %v", cfg.AllowedUpstreamNetworks)
+		}
+	})
+
+	t.Run("groups alone enable it", func(t *testing.T) {
+		adminEnv(t)
+		t.Setenv("ADMIN_SUBJECTS", "")
+		t.Setenv("ADMIN_GROUPS", "ops")
+		if cfg, err := LoadConfig(); err != nil || !cfg.AdminEnabled() {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("without the feature nothing changes", func(t *testing.T) {
+		minimalEnv(t)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AdminEnabled() || len(cfg.Targets) != 1 {
+			t.Error("the feature is on, or the legacy target is missing")
+		}
+	})
+
+	t.Run("without the feature a target is still required", func(t *testing.T) {
+		minimalEnv(t)
+		t.Setenv("UPSTREAM_MCP_URL", "")
+		if _, err := LoadConfig(); err == nil {
+			t.Fatal("a deployment with no target was accepted")
+		}
+	})
+
+	for name, tc := range map[string]struct {
+		set  map[string]string
+		want string
+	}{
+		"hosts are mandatory":   {map[string]string{"ALLOWED_UPSTREAM_HOSTS": ""}, "ALLOWED_UPSTREAM_HOSTS"},
+		"unnamed mode":          {map[string]string{"UPSTREAM_MCP_URL": "http://mcp.internal:8080"}, "named targets"},
+		"a host without a port": {map[string]string{"ALLOWED_UPSTREAM_HOSTS": "mcp.example"}, "host:port"},
+		"a wildcard host":       {map[string]string{"ALLOWED_UPSTREAM_HOSTS": "*.example:443"}, "invalid host"},
+		"a bad network":         {map[string]string{"ALLOWED_UPSTREAM_NETWORKS": "10.0.0.1"}, "CIDR"},
+		"empty admin list":      {map[string]string{"ADMIN_GROUPS": " , "}, "names nothing"},
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			adminEnv(t)
+			for k, v := range tc.set {
+				t.Setenv(k, v)
+			}
+			_, err := LoadConfig()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("named config targets alongside", func(t *testing.T) {
+		adminEnv(t)
+		t.Setenv("TARGETS", "docs")
+		t.Setenv("TARGET_DOCS_UPSTREAM_MCP_URL", "https://docs.example/mcp")
+		cfg, err := LoadConfig()
+		if err != nil || len(cfg.Targets) != 1 {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestAdminGroupsWarnsWithoutGroupsScope(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for scopes, want := range map[string]bool{"openid profile": true, "openid groups": false} {
+		buf.Reset()
+		adminEnv(t)
+		t.Setenv("ADMIN_GROUPS", "ops")
+		t.Setenv("UPSTREAM_SCOPES", scopes)
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("scopes %q: %v", scopes, err)
+		}
+		if got := strings.Contains(buf.String(), "groups scope"); got != want {
+			t.Errorf("scopes %q: warned = %v, want %v", scopes, got, want)
+		}
 	}
 }

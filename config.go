@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -49,9 +51,23 @@ type Config struct {
 	UpstreamClientSecret string
 	UpstreamScopes       string
 
-	// Targets is every upstream MCP server this proxy serves, always at least
-	// one. A deployment configured the original way has a single unnamed target.
+	// Targets is every upstream MCP server the environment defines. A deployment
+	// configured the original way has a single unnamed target. It is empty only
+	// when admin targets are enabled, which is what supplies the rest.
 	Targets []Target
+
+	// AdminSubjects and AdminGroups say who may manage targets from the web page.
+	// Setting either enables the feature. Both live in the environment so nobody
+	// can grant themselves admin through the page.
+	AdminSubjects []string
+	AdminGroups   []string
+
+	// AllowedUpstreamHosts and AllowedUpstreamNetworks bound where an admin target
+	// may point. They are independent: a listed host does not open any address
+	// range, and a listed network does not authorise any host. Neither applies to
+	// config targets, which the operator controls.
+	AllowedUpstreamHosts    []hostPattern
+	AllowedUpstreamNetworks []netip.Prefix
 
 	// CIMDEnabled accepts an https client_id and fetches the client's metadata
 	// from it, per draft-ietf-oauth-client-id-metadata-document.
@@ -147,6 +163,12 @@ type Target struct {
 	// token issued for it. Computed once, because comparing it is on the path of
 	// every proxied request.
 	Resource string
+
+	// Source is SourceAdmin for a target stored in the database and empty (config)
+	// otherwise. Generation is the random id of an admin target's row, re-rolled
+	// on every replacement, and is empty for config. Both feed Stamp.
+	Source     string
+	Generation string
 }
 
 // envPrefix maps a target name onto its variable prefix: "git-mcp" reads
@@ -245,9 +267,15 @@ func LoadConfig() (*Config, error) {
 		"UPSTREAM_CLIENT_SECRET": c.UpstreamClientSecret,
 		"DATABASE_URL":           c.DatabaseURL,
 	}
+	if err := c.loadAdmin(); err != nil {
+		return nil, err
+	}
+
 	// UPSTREAM_MCP_URL describes the single legacy target and is required only
-	// when TARGETS is absent.
-	if strings.TrimSpace(os.Getenv("TARGETS")) == "" {
+	// when TARGETS is absent, and not even then when admin targets will supply
+	// the targets.
+	unnamed := strings.TrimSpace(os.Getenv("TARGETS")) == ""
+	if unnamed && !c.AdminEnabled() {
 		required["UPSTREAM_MCP_URL"] = c.UpstreamMCP
 	}
 
@@ -299,11 +327,18 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	targets, err := parseTargets(c.PublicURL)
-	if err != nil {
-		return nil, err
+	switch {
+	case !unnamed || !c.AdminEnabled():
+		targets, err := parseTargets(c.PublicURL)
+		if err != nil {
+			return nil, err
+		}
+		c.Targets = targets
+	case c.UpstreamMCP != "" || os.Getenv("UPSTREAM_STATIC_HEADERS") != "":
+		// The unnamed target serves /mcp, and adding a second target flips the
+		// meaning of the resource parameter and of resource-less sessions.
+		return nil, fmt.Errorf("ADMIN_SUBJECTS and ADMIN_GROUPS need named targets, so they cannot be combined with UPSTREAM_MCP_URL or UPSTREAM_STATIC_HEADERS; move those into TARGETS and TARGET_<NAME>_* variables")
 	}
-	c.Targets = targets
 
 	rawKey := os.Getenv("ENCRYPTION_KEY")
 	if rawKey == "" {
@@ -329,6 +364,103 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return c, nil
+}
+
+// AdminEnabled reports whether targets can be managed from the web page.
+func (c *Config) AdminEnabled() bool {
+	return len(c.AdminSubjects) > 0 || len(c.AdminGroups) > 0
+}
+
+// NamedMode reports whether this deployment serves named targets at
+// /<name>/mcp, as opposed to one unnamed target at /mcp. It is fixed by the
+// configuration, not by what happens to be in the registry, so a deployment
+// whose admin targets are all removed is still named.
+func (c *Config) NamedMode() bool {
+	return c.AdminEnabled() || (len(c.Targets) > 0 && c.Targets[0].Name != "")
+}
+
+// loadAdmin reads the variables that switch on admin-managed targets. The
+// feature has no safe default for where targets may point, so enabling it
+// without ALLOWED_UPSTREAM_HOSTS is refused rather than left open.
+func (c *Config) loadAdmin() error {
+	var err error
+	if c.AdminSubjects, err = commaList("ADMIN_SUBJECTS"); err != nil {
+		return err
+	}
+	if c.AdminGroups, err = commaList("ADMIN_GROUPS"); err != nil {
+		return err
+	}
+
+	hosts, err := commaList("ALLOWED_UPSTREAM_HOSTS")
+	if err != nil {
+		return err
+	}
+	for _, h := range hosts {
+		p, err := parseHostPattern(h)
+		if err != nil {
+			return fmt.Errorf("ALLOWED_UPSTREAM_HOSTS: %w", err)
+		}
+		c.AllowedUpstreamHosts = append(c.AllowedUpstreamHosts, p)
+	}
+
+	nets, err := commaList("ALLOWED_UPSTREAM_NETWORKS")
+	if err != nil {
+		return err
+	}
+	for _, n := range nets {
+		p, err := netip.ParsePrefix(n)
+		if err != nil {
+			return fmt.Errorf("ALLOWED_UPSTREAM_NETWORKS must be a comma-separated list of networks in CIDR notation, got %q", n)
+		}
+		c.AllowedUpstreamNetworks = append(c.AllowedUpstreamNetworks, p.Masked())
+	}
+
+	if !c.AdminEnabled() {
+		return nil
+	}
+	if len(c.AllowedUpstreamHosts) == 0 {
+		return fmt.Errorf("ADMIN_SUBJECTS or ADMIN_GROUPS is set, so ALLOWED_UPSTREAM_HOSTS must list the host:port pairs admin targets may use")
+	}
+	// Some providers send groups only when the scope is requested, so this is a
+	// warning: the first admin sign-in finds out if the claim never arrives.
+	if len(c.AdminGroups) > 0 && !slices.Contains(strings.Fields(c.UpstreamScopes), "groups") {
+		slog.Warn("ADMIN_GROUPS is set but UPSTREAM_SCOPES has no groups scope; the provider may not send the groups claim")
+	}
+	return nil
+}
+
+// commaList reads a comma-separated variable. A value that is set but names
+// nothing is an error, because for an access list "empty" would silently mean
+// "feature off" or "no restriction".
+func commaList(name string) ([]string, error) {
+	raw := os.Getenv(name)
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	if strings.TrimSpace(raw) != "" && len(out) == 0 {
+		return nil, fmt.Errorf("%s is set but names nothing", name)
+	}
+	return out, nil
+}
+
+// parseHostPattern reads one host:port entry. The port is required because a
+// name alone would also admit every other service on that machine.
+func parseHostPattern(raw string) (hostPattern, error) {
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil {
+		return hostPattern{}, fmt.Errorf("%q is not host:port", raw)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return hostPattern{}, fmt.Errorf("%q has an invalid port", raw)
+	}
+	if host == "" || strings.ContainsAny(host, "/@*? \t") {
+		return hostPattern{}, fmt.Errorf("%q has an invalid host", raw)
+	}
+	return hostPattern{Host: strings.ToLower(host), Port: port}, nil
 }
 
 // parseTargets builds the target list from either the multi-target variables or

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -81,5 +83,39 @@ func TestStampDistinguishesInvalidUTF8(t *testing.T) {
 	b := Target{Name: "a", UpstreamMCP: "https://x.example/p\xfe"}
 	if a.Stamp() == b.Stamp() {
 		t.Error("URLs differing only in invalid bytes share a stamp")
+	}
+}
+
+// An admin stamp is the documented formula, written out here by hand so a change
+// to Stamp() cannot move both sides at once.
+func TestAdminStampFollowsTheSpecFormula(t *testing.T) {
+	x := baseTarget()
+	x.Source, x.Generation = SourceAdmin, "6f1c2d3e-0000-4000-8000-000000000001"
+
+	want := `1 "plane" "https://plane.example/mcp" "per_user" 2 "Authorization" "Bearer " "x-workspace-slug" "" "6f1c2d3e-0000-4000-8000-000000000001"`
+	sum := sha256.Sum256([]byte(want))
+	if got, exp := x.Stamp(), "admin:"+hex.EncodeToString(sum[:]); got != exp {
+		t.Errorf("stamp = %q, want %q", got, exp)
+	}
+}
+
+// Every replacement re-rolls the generation, so a definition put back after an
+// edit still gets a stamp nothing earlier can match, and a config target ignores
+// a generation it was never meant to carry.
+func TestAdminStampDependsOnSourceAndGeneration(t *testing.T) {
+	config := baseTarget()
+	a, b := baseTarget(), baseTarget()
+	a.Source, a.Generation = SourceAdmin, "g1"
+	b.Source, b.Generation = SourceAdmin, "g2"
+
+	if a.Stamp() == b.Stamp() {
+		t.Error("two generations share a stamp")
+	}
+	if a.Stamp() == config.Stamp() {
+		t.Error("an admin target shares a stamp with the same definition in config")
+	}
+	config.Generation = "g1"
+	if config.Stamp() != baseTarget().Stamp() {
+		t.Error("a generation moved a config stamp")
 	}
 }

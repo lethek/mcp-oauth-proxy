@@ -339,7 +339,9 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Resolved here so the consent screen can name the target. Which upstream a
 	// token will be spent against is chosen entirely by the client, so the user
 	// has to be told which one they are approving.
-	target := snap.entries[0].Target
+	// With no resource the deployment is unnamed, and so has exactly one target.
+	// A named one with none yet returned above.
+	var target Target
 	if res != "" {
 		found, ok := snap.TargetByResource(res)
 		if !ok {
@@ -348,6 +350,8 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		target = found
+	} else {
+		target = snap.entries[0].Target
 	}
 
 	flow := Flow{
@@ -688,7 +692,8 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 	// The client id is passed in and matched inside the same statement that
 	// consumes the token, so a wrong or missing one leaves the token unused.
 	clientID := r.PostForm.Get("client_id")
-	sessionID, err := g.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
+	ref, err := g.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
+	sessionID := ref.ID
 	if errors.Is(err, ErrTokenReused) {
 		// Either the client replayed a token it should have discarded, or someone
 		// else is holding a copy. We cannot tell which, and only one of those is
@@ -706,6 +711,24 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		// caller whether a token exists and which client holds it.
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the refresh token is unknown, expired, or was issued to a different client")
 		return
+	}
+
+	// Both refusals return before the grant commits, so the deferred rollback
+	// leaves the refresh token unused.
+	if s.reg.enabled() {
+		e := s.reg.Load().byName[ref.Target]
+		if e.behind(ref.CurrentStamp) {
+			// temporarily_unavailable, so the client keeps its refresh token and
+			// retries once this replica has caught up.
+			s.refuseBehind(w)
+			return
+		}
+		// A target this replica does not serve, with no row behind it either, was
+		// removed. The session is dead, not merely stale.
+		if e == nil || ref.Stamp != e.Stamp {
+			oauthError(w, http.StatusBadRequest, "invalid_grant", "the target changed since this session was issued; authorize again")
+			return
+		}
 	}
 	s.issue(w, r, g, sessionID, clientID)
 }

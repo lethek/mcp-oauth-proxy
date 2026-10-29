@@ -11,6 +11,14 @@ import (
 // is a migration that signs everyone out, so it is always deliberate.
 const stampFormat = 1
 
+// Where a target's definition came from. The zero value of Target.Source is a
+// config target, so every target built from the environment keeps the stamp it
+// has always had.
+const (
+	SourceConfig = "config"
+	SourceAdmin  = "admin"
+)
+
 // Stamp names what decides where a credential held for this target goes: the
 // name, the upstream URL, the credential mode and the header names and prefixes
 // a stored per-user credential was built from. A row stamped X was made for
@@ -35,8 +43,14 @@ func (t Target) Stamp() string {
 	for _, f := range t.UserFields {
 		parts = append(parts, strconv.Quote(f.Header), strconv.Quote(f.Prefix))
 	}
-	// The final element is the admin target's generation, empty for config.
-	parts = append(parts, strconv.Quote(""))
+	// The final element is the admin target's generation, empty for config. A
+	// config target ignores any generation it carries, so its stamp cannot be
+	// moved by a field that only means something for a stored row.
+	source, generation := SourceConfig, ""
+	if t.Source == SourceAdmin {
+		source, generation = SourceAdmin, t.Generation
+	}
+	parts = append(parts, strconv.Quote(generation))
 	sum := sha256.Sum256([]byte(strings.Join(parts, " ")))
-	return "config:" + hex.EncodeToString(sum[:])
+	return source + ":" + hex.EncodeToString(sum[:])
 }

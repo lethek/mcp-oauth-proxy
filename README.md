@@ -54,20 +54,24 @@ where a default is shown.
 | Variable | Meaning |
 | --- | --- |
 | `PUBLIC_URL` | The origin clients dial, e.g. `https://git-mcp.example.com`. Used as the OAuth issuer and as the base of every advertised URL, so it must match reality. Must be `https` unless it is loopback. No trailing slash. A bare origin, so no path, query string, fragment or credentials; anything else is refused at boot. Spelling out a default port is fine; it is normalised before being compared against a browser's `Origin`. |
-| `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set. |
+| `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set or admin targets are enabled. |
 | `TARGETS` | Comma-separated names, to serve several MCP servers from one proxy. See below. |
 | `UPSTREAM_ISSUER` | The OAuth provider's issuer URL, e.g. `https://auth.example.com/application/o/mcp-proxy/` for an Authentik application with the slug `mcp-proxy`. Discovery is read from `/.well-known/openid-configuration` under it, falling back to `/.well-known/oauth-authorization-server`. |
 | `UPSTREAM_CLIENT_ID` | Client id of the application you registered with the provider. |
 | `UPSTREAM_CLIENT_SECRET` | Its secret. |
 | `UPSTREAM_SCOPES` | Space-separated. Default `openid profile email`. |
 | `UPSTREAM_STATIC_HEADERS` | Optional. Newline-separated `Name: Value` pairs, sent to the MCP server in place of the provider's token. See below. |
-| `DATABASE_URL` | PostgreSQL connection string. The schema is created on boot. |
+| `DATABASE_URL` | PostgreSQL connection string, PostgreSQL 13 or later. The schema is created on boot. |
 | `ENCRYPTION_KEY` | Base64 of exactly 32 bytes. Encrypts provider tokens at rest with AES-256-GCM. Changing it invalidates every stored session. |
 | `REFRESH_TOKEN_TTL` | How long a refresh token stays usable. Rotation issues a new one, so this acts as an idle timeout. Go duration, default `720h` (30 days). |
 | `SESSION_TTL` | Absolute cap on one authorization, however actively it is refreshed. Reaching it sends the user back through the provider. Go duration, default `2160h` (90 days). Must not be shorter than `REFRESH_TOKEN_TTL`. |
 | `CIMD_ENABLED` | Accept an https `client_id` as a Client ID Metadata Document. Default `false`. See below. |
 | `TRUSTED_PROXY_HOPS` | How many reverse proxies sit in front. Default `0`, meaning `X-Forwarded-For` is ignored. See below. |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated networks in CIDR notation that those proxies connect from, such as `10.0.0.0/8`. Required whenever `TRUSTED_PROXY_HOPS` is set. |
+| `ADMIN_SUBJECTS` | Optional. Comma-separated provider subjects who may manage targets. Setting this or `ADMIN_GROUPS` enables admin-managed targets. See below. |
+| `ADMIN_GROUPS` | Optional. Comma-separated provider groups whose members may manage targets. Needs the provider to send a `groups` claim, so boot warns when `UPSTREAM_SCOPES` has no `groups`. |
+| `ALLOWED_UPSTREAM_HOSTS` | Comma-separated `host:port` pairs an admin target may use, such as `mcp.example.com:443`. The port is required and matching is exact. Required when admin targets are enabled. |
+| `ALLOWED_UPSTREAM_NETWORKS` | Optional. Comma-separated CIDR ranges an admin target may reach even though they are private, such as `10.0.0.0/8`. Plain `http` is allowed only to an address inside one. |
 | `LISTEN_ADDR` | Default `:8080`. |
 
 Generate a key with:
@@ -249,6 +253,44 @@ Removing someone from a group therefore takes effect when their session ends,
 at most `SESSION_TTL` later. To make it immediate, delete their rows from the
 `sessions` table (matched on `subject` and `resource`), which cascades to the
 tokens issued from them.
+
+### Admin-managed targets
+
+Setting `ADMIN_SUBJECTS` or `ADMIN_GROUPS` lets targets live in the database as
+well as in the environment. This release adds the storage and the serving side.
+There is no admin page yet, so nothing can create an admin target through the
+proxy itself.
+
+Enabling it has these requirements, and the proxy refuses to start without them:
+
+- `ALLOWED_UPSTREAM_HOSTS` must be set. An admin target can only point at a
+  listed `host:port`, and the list is checked again each time targets are loaded.
+  It does not apply to targets defined in the environment.
+- The deployment must be named. `UPSTREAM_MCP_URL` and `UPSTREAM_STATIC_HEADERS`
+  cannot be combined with it. `TARGETS` may be empty, because admin targets can
+  supply them all.
+
+Where an admin target may connect is decided by address as well as name. The
+address actually dialled must be public, unless it falls in
+`ALLOWED_UPSTREAM_NETWORKS`. A host on `ALLOWED_UPSTREAM_HOSTS` does not open any
+range, so a DNS answer pointing at an internal address is refused. Plain `http`
+is allowed only when the address dialled is in `ALLOWED_UPSTREAM_NETWORKS`, and
+that is checked on every connection. Link-local, `100.100.100.200`, `0.0.0.0/8`,
+multicast and NAT64 addresses are refused whatever the lists say. Admin targets
+ignore `HTTP_PROXY` and `HTTPS_PROXY`, so an egress proxy has to enforce the same
+rules itself.
+
+A name belongs to one source at a time. If an admin target takes the name of a
+target in the environment, the environment entry is left out and logged, and the
+proxy still starts. Removing the admin target gives the name back to the
+environment entry, which inherits none of its sessions or credentials.
+
+Changes reach every replica within about 5 seconds, and a replica that has not
+yet seen a change answers `503` with `Retry-After` rather than serving the old
+definition. Static values are encrypted with `ENCRYPTION_KEY`, so rotating the
+key makes them unreadable and those targets are not served until a new value is
+entered. Anyone with write access to the database can redirect an admin target,
+so treat that access as equal to admin.
 
 ### Static upstream credentials
 

@@ -25,7 +25,7 @@ func (h *harness) replica(mutate func([]Target)) *httptest.Server {
 		mcpLimit:        newLimiter(1000, time.Minute),
 		reg:             &registry{},
 	}
-	snap, err := newSnapshot(cfg.Targets, cfg.PublicURL, nil)
+	snap, err := newSnapshot(cfg.Targets, &cfg, nil)
 	if err != nil {
 		h.t.Fatal(err)
 	}

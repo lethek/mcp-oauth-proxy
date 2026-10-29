@@ -302,13 +302,18 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, s.cfg.PublicURL+"/settings?notice=saved", http.StatusFound)
 }
 
-// userHeadersFor unseals the caller's credential for a target.
-func (s *Server) userHeadersFor(r *http.Request, sessionID string, t Target) (map[string]string, error) {
-	sealed, err := s.store.UserCredentialForSession(r.Context(), sessionID, t.Name)
+// userHeadersFor unseals the caller's credential for a target. It returns
+// errBehind, with nothing unsealed, when the database holds a different
+// definition of the target than the entry this replica is serving.
+func (s *Server) userHeadersFor(r *http.Request, sessionID string, e *entry) (map[string]string, error) {
+	sealed, current, err := s.store.UserCredentialForSession(r.Context(), sessionID, e.Target.Name)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.sealer.open(boundPurpose(purposeUserCredential, t.Stamp()), sealed)
+	if s.reg.enabled() && e.behind(current) {
+		return nil, errBehind
+	}
+	raw, err := s.sealer.open(boundPurpose(purposeUserCredential, e.Stamp), sealed)
 	if err != nil {
 		return nil, err
 	}
