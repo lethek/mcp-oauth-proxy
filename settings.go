@@ -196,7 +196,11 @@ func (s *Server) finishLogin(r *http.Request, kind, redirectURI string, fail fun
 	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
 		slog.Error(kind+": could not resolve the user", "err", err)
-		fail(http.StatusBadGateway, "Sign-in failed", "The identity provider would not say who you are.")
+		msg := "The identity provider would not say who you are."
+		if kind == flowKindSettings {
+			msg = "The identity provider would not say who you are, so credentials cannot be stored."
+		}
+		fail(http.StatusBadGateway, "Sign-in failed", msg)
 		return UserIdentity{}, false
 	}
 	return identity, true

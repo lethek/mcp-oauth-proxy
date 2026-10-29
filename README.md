@@ -340,8 +340,8 @@ value again on its confirmation page.
 Every change writes one log line, `admin: target changed`, with the admin's
 subject, the operation and the names of the fields that changed. It never
 includes values. A removal is not recoverable, so that line is the only record
-of it. Forms carry a token tied to the admin session, and a submission from
-another origin is refused.
+of it. Forms carry a token tied to the admin session. A submission with a
+missing or wrong token, or from another origin, is refused.
 
 ### Static upstream credentials
 

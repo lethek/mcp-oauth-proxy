@@ -467,6 +467,17 @@ func (s *Server) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
 	probe := normaliseAdminTarget(t)
 	probe.Generation = cur.Target.Generation
 	if probe.Stamp() != cur.StoredStamp {
+		// Refuse what the store would refuse before asking for a typed name. The
+		// static value is re-entered on the confirm page, so a stand-in keeps its
+		// absence from failing this check.
+		check := probe
+		if check.Mode == CredStatic && len(check.StaticHeaders) == 0 {
+			check.StaticHeaders = map[string]string{"X-Check": "x"}
+		}
+		if err := s.store.checkAdminTarget(check); err != nil {
+			again(http.StatusBadRequest, formMessage(err, key.Name))
+			return
+		}
 		s.renderConfirm(w, r, http.StatusOK, sess, "confirm", cur, f, "")
 		return
 	}

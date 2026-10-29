@@ -526,6 +526,23 @@ func TestFormErrorsNameFieldsNotVariables(t *testing.T) {
 	}
 }
 
+// A replacement to a host that would be refused goes back to the edit form
+// with the reason, not on to a confirmation page that cannot succeed.
+func TestReplacementToADisallowedHostRedrawsTheEditForm(t *testing.T) {
+	h := newHarnessWith(t, adminUser42)
+	h.createAdmin(h.adminTarget("gamma", "/alpha-upstream"))
+	h.rebuild()
+	h.mustSignInAdmin()
+
+	status, body, _ := h.do("POST", "/admin/targets/gamma/edit", merge(h.formFor("/admin/targets/gamma/edit"), url.Values{
+		"display_name": {"Gamma"}, "upstream_mcp": {"http://example.org/mcp"}, "mode": {"provider_token"},
+	}), nil)
+	if status != http.StatusBadRequest || strings.Contains(body, "confirm_name") ||
+		!strings.Contains(body, "Upstream MCP URL: ") || !strings.Contains(body, `name="upstream_mcp"`) {
+		t.Errorf("status %d: want the edit form with the upstream error", status)
+	}
+}
+
 // A saved target is served by this replica at once, without waiting for the
 // poller, and carries the credential the admin entered.
 func TestSaveMakesTheTargetServableImmediately(t *testing.T) {

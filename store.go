@@ -1344,7 +1344,8 @@ func (s *Store) UpdateTarget(ctx context.Context, key TargetKey, t Target, by st
 			return AdminTarget{}, ErrStaticValueRequired
 		}
 		if t.StaticHeaders, err = s.openStatic(cur); err != nil {
-			return AdminTarget{}, &InvalidTargetError{fmt.Errorf("the stored static value cannot be read, so supply a new one: %w", err)}
+			slog.Warn("the stored static value cannot be read", "target", key.Name, "err", err)
+			return AdminTarget{}, &InvalidTargetError{errors.New("Static headers: the stored value cannot be read, so enter a new one.")}
 		}
 	}
 	if err := s.checkAdminTarget(t); err != nil {
