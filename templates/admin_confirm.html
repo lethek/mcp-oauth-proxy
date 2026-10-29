@@ -1,0 +1,38 @@
+{{define "title"}}Confirm{{end}}
+{{define "content"}}
+<main class="card">
+  <p class="eyebrow">Confirm</p>
+  <h1>{{if .Remove}}Remove {{.Display}}?{{else}}Replace the definition of {{.Display}}?{{end}}</h1>
+  <p class="lede">{{if .Remove}}Removing{{else}}Replacing{{end}} this server cannot be undone. It will end
+  {{.Sessions}} session{{if ne .Sessions 1}}s{{end}} and delete {{.Enrolments}} saved credential{{if ne .Enrolments 1}}s{{end}}.
+  People will have to sign in again{{if not .Remove}}, and enter their own credentials again{{end}}.</p>
+
+  {{if .TakeOver}}<p class="banner">A server of the same name is set in the configuration. Once this one is removed, that server takes over the name.</p>{{end}}
+  {{if .Error}}<p class="banner banner-error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="{{.Action}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="row_id" value="{{.RowID}}">
+    <input type="hidden" name="revision" value="{{.Revision}}">
+    {{if not .Remove}}
+    <input type="hidden" name="display_name" value="{{.Fields.Display}}">
+    <input type="hidden" name="upstream_mcp" value="{{.Fields.Upstream}}">
+    <input type="hidden" name="mode" value="{{.Fields.Mode}}">
+    <input type="hidden" name="user_fields" value="{{.Fields.UserFields}}">
+    <input type="hidden" name="allowed_groups" value="{{.Fields.Groups}}">
+    {{end}}
+    {{if .NeedStatic}}<div class="field">
+      <label for="c-static">Static headers</label>
+      <textarea class="input" id="c-static" name="static_headers" autocomplete="off" spellcheck="false" required></textarea>
+      <p class="hint">Enter the static value again. It is never kept on this page. One per line as Name: Value.</p>
+    </div>{{end}}
+    <div class="field">
+      <label for="c-name">Type <span class="mono">{{.Name}}</span> to confirm</label>
+      <input class="input" type="text" id="c-name" name="confirm_name" autocomplete="off" spellcheck="false" required>
+    </div>
+    <div class="actions">
+      <a class="btn" href="/admin">Cancel</a>
+      <button type="submit" class="btn btn-danger">{{if .Remove}}Remove server{{else}}Replace and sign everyone out{{end}}</button>
+    </div>
+  </form>
+</main>
+{{end}}

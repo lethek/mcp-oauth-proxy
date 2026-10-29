@@ -15,14 +15,11 @@ func TestPrepareUpstreamHeaders(t *testing.T) {
 		r := httptest.NewRequest("POST", "/mcp", nil)
 		r.Header.Set("Authorization", "Bearer caller-token")
 
-		settled := prepareUpstreamHeaders(r, map[string]string{
+		prepareUpstreamHeaders(r, map[string]string{
 			"Authorization":    "Bearer plane-pat",
 			"x-workspace-slug": "acme",
 		})
 
-		if !settled {
-			t.Fatal("want settled=true in static mode")
-		}
 		if got := r.Header.Get("Authorization"); got != "Bearer plane-pat" {
 			t.Errorf("Authorization = %q, want the static credential", got)
 		}
@@ -37,11 +34,8 @@ func TestPrepareUpstreamHeaders(t *testing.T) {
 		r := httptest.NewRequest("POST", "/mcp", nil)
 		r.Header.Set("Authorization", "Bearer caller-token")
 
-		settled := prepareUpstreamHeaders(r, map[string]string{"x-api-key": "k"})
+		prepareUpstreamHeaders(r, map[string]string{"x-api-key": "k"})
 
-		if !settled {
-			t.Fatal("want settled=true")
-		}
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Fatalf("caller's token leaked upstream: %q", got)
 		}
@@ -64,13 +58,12 @@ func TestPrepareUpstreamHeaders(t *testing.T) {
 		}
 	})
 
-	t.Run("token mode reports unsettled and clears the caller's token", func(t *testing.T) {
+	t.Run("token mode clears the caller's token", func(t *testing.T) {
 		r := httptest.NewRequest("POST", "/mcp", nil)
 		r.Header.Set("Authorization", "Bearer caller-token")
 
-		if settled := prepareUpstreamHeaders(r, nil); settled {
-			t.Fatal("want settled=false with no static headers")
-		}
+		prepareUpstreamHeaders(r, nil)
+
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Fatalf("caller's token should be cleared before the token swap, got %q", got)
 		}
@@ -99,7 +92,7 @@ func TestUpstreamConcurrencyIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	front := httptest.NewServer(newReverseProxy(target, ""))
+	front := httptest.NewServer(newReverseProxyWith(upstreamTransport, target, ""))
 	defer front.Close()
 
 	// Fill every slot. Each of these stays parked in the upstream handler until
@@ -161,7 +154,7 @@ func TestConcurrencySlotsAreReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	front := httptest.NewServer(newReverseProxy(target, ""))
+	front := httptest.NewServer(newReverseProxyWith(upstreamTransport, target, ""))
 	defer front.Close()
 
 	for i := range maxInFlightPerTarget * 3 {

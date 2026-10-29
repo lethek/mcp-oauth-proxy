@@ -96,9 +96,15 @@ func (s *Server) handleSettingsLogout(w http.ResponseWriter, r *http.Request) {
 // handleSettings renders the catalogue, sending the user through the provider
 // first when they are not signed in.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	// With nothing to enrol there is nothing to protect, so an anonymous visitor
+	// is not sent to the provider just to be told so.
+	if !s.reg.Load().HasPerUserTargets() {
+		renderSettings(w, settingsView{})
+		return
+	}
 	identity := s.identityFrom(r)
 	if identity.Subject == "" {
-		s.startSettingsLogin(w, r)
+		s.startLogin(w, r, flowKindSettings, s.settingsRedirectURI())
 		return
 	}
 
@@ -110,11 +116,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := settingsView{Subject: identity.Label(), Notice: r.URL.Query().Get("notice")}
-	for _, t := range s.cfg.Targets {
+	for _, e := range s.reg.Load().entries {
+		t := e.Target
 		if t.Mode != CredPerUser {
 			continue
 		}
-		row := targetRow{Name: t.Name, Display: t.DisplayName, Fields: t.UserFields, Stamp: t.Stamp()}
+		row := targetRow{Name: t.Name, Display: t.DisplayName, Host: upstreamHost(t), Fields: t.UserFields, Stamp: t.Stamp()}
 		if at, ok := enrolled[StampedName{t.Name, row.Stamp}]; ok {
 			row.Enrolled = true
 			row.UpdatedAt = at.UTC().Format("2006-01-02 15:04 MST")
@@ -126,18 +133,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	renderSettings(w, view)
 }
 
-func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
+// startLogin sends the browser to the provider. The settings page and the admin
+// page both use it, each with its own kind and callback address.
+func (s *Server) startLogin(w http.ResponseWriter, r *http.Request, kind, redirectURI string) {
 	meta, err := s.upstream.Meta(r.Context())
 	if err != nil {
-		slog.Error("settings: provider discovery failed", "err", err)
+		slog.Error(kind+": provider discovery failed", "err", err)
 		renderError(w, http.StatusBadGateway, "Sign-in unavailable", "The identity provider could not be reached. Try again in a moment.")
 		return
 	}
 
 	flowID := newSecret()
 	verifier := newSecret()
-	if err := s.store.CreateSettingsFlow(r.Context(), flowID, verifier, s.browserSecret(w, r)); err != nil {
-		slog.Error("settings: could not start a login", "err", err)
+	if err := s.store.CreateSettingsFlow(r.Context(), flowID, verifier, s.browserSecret(w, r), kind); err != nil {
+		slog.Error(kind+": could not start a login", "err", err)
 		renderError(w, http.StatusInternalServerError, "Something went wrong", "The sign-in could not be started. Try again in a moment.")
 		return
 	}
@@ -149,7 +158,7 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	q := dest.Query()
 	q.Set("client_id", s.cfg.UpstreamClientID)
-	q.Set("redirect_uri", s.settingsRedirectURI())
+	q.Set("redirect_uri", redirectURI)
 	q.Set("response_type", "code")
 	q.Set("scope", s.cfg.UpstreamScopes)
 	q.Set("state", flowID)
@@ -160,31 +169,46 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, dest.String(), http.StatusFound)
 }
 
-func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) {
+// finishLogin redeems the callback of a login started by startLogin and says who
+// signed in. On any failure it has already answered through render and returns
+// false.
+func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, kind, redirectURI string, render func(w http.ResponseWriter, status int, heading, message string)) (UserIdentity, bool) {
 	q := r.URL.Query()
 
-	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r))
+	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r), kind)
 	if err != nil {
-		renderSettingsError(w, http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the settings page again to sign in.")
-		return
+		render(w, http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the "+kind+" page again to sign in.")
+		return UserIdentity{}, false
 	}
 	if e := q.Get("error"); e != "" {
-		renderSettingsError(w, http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
-		return
+		render(w, http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
+		return UserIdentity{}, false
 	}
 
-	tok, err := s.upstream.ExchangeWithRedirect(r.Context(), q.Get("code"), verifier, s.settingsRedirectURI())
+	tok, err := s.upstream.ExchangeWithRedirect(r.Context(), q.Get("code"), verifier, redirectURI)
 	if err != nil {
-		slog.Error("settings: upstream exchange failed", "err", err)
-		renderSettingsError(w, http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
-		return
+		slog.Error(kind+": upstream exchange failed", "err", err)
+		render(w, http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
+		return UserIdentity{}, false
 	}
 
 	// Without a stable subject there is nothing to key a credential on.
 	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
-		slog.Error("settings: could not resolve the user", "err", err)
-		renderSettingsError(w, http.StatusBadGateway, "Sign-in failed", "The identity provider would not say who you are, so credentials cannot be stored.")
+		slog.Error(kind+": could not resolve the user", "err", err)
+		msg := "The identity provider would not say who you are."
+		if kind == flowKindSettings {
+			msg = "The identity provider would not say who you are, so credentials cannot be stored."
+		}
+		render(w, http.StatusBadGateway, "Sign-in failed", msg)
+		return UserIdentity{}, false
+	}
+	return identity, true
+}
+
+func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.finishLogin(w, r, flowKindSettings, s.settingsRedirectURI(), renderSettingsError)
+	if !ok {
 		return
 	}
 
@@ -219,9 +243,9 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	// rather than trusted. Only a per_user target can be written.
 	name := r.PostForm.Get("target")
 	var target Target
-	for _, t := range s.cfg.Targets {
-		if t.Name == name && t.Mode == CredPerUser {
-			target = t
+	for _, e := range s.reg.Load().entries {
+		if e.Target.Name == name && e.Target.Mode == CredPerUser {
+			target = e.Target
 		}
 	}
 	if target.Name == "" {
@@ -283,7 +307,15 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
-	if err := s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, stamp, sealed); err != nil {
+	err = s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, stamp, sealed)
+	if errors.Is(err, ErrStaleTarget) {
+		// The definition changed between the page loading and this write, on a
+		// replica that had not yet seen it. Nothing was stored.
+		renderSettingsError(w, http.StatusConflict, "Settings changed",
+			"This server's settings changed after the page was loaded. Reload the page and try again.")
+		return
+	}
+	if err != nil {
 		slog.Error("settings: could not store the credential", "err", err, "target", target.Name)
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
@@ -295,13 +327,18 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, s.cfg.PublicURL+"/settings?notice=saved", http.StatusFound)
 }
 
-// userHeadersFor unseals the caller's credential for a target.
-func (s *Server) userHeadersFor(r *http.Request, sessionID string, t Target) (map[string]string, error) {
-	sealed, err := s.store.UserCredentialForSession(r.Context(), sessionID, t.Name)
+// userHeadersFor unseals the caller's credential for a target. It returns
+// errBehind, with nothing unsealed, when the database holds a different
+// definition of the target than the entry this replica is serving.
+func (s *Server) userHeadersFor(r *http.Request, sessionID string, e *entry) (map[string]string, error) {
+	sealed, current, err := s.store.UserCredentialForSession(r.Context(), sessionID, e.Target.Name)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.sealer.open(boundPurpose(purposeUserCredential, t.Stamp()), sealed)
+	if s.reg.enabled() && e.behind(current) {
+		return nil, errBehind
+	}
+	raw, err := s.sealer.open(boundPurpose(purposeUserCredential, e.Stamp), sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -322,6 +359,7 @@ type targetRow struct {
 	// Display is only ever shown.
 	Name    string
 	Display string
+	Host    string
 	// Stamp is posted back so a save can tell the definition it was rendered
 	// under from the one being served when it arrives.
 	Stamp     string

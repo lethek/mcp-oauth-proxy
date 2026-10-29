@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -49,9 +51,23 @@ type Config struct {
 	UpstreamClientSecret string
 	UpstreamScopes       string
 
-	// Targets is every upstream MCP server this proxy serves, always at least
-	// one. A deployment configured the original way has a single unnamed target.
+	// Targets is every upstream MCP server the environment defines. A deployment
+	// configured the original way has a single unnamed target. It is empty only
+	// when admin targets are enabled, which is what supplies the rest.
 	Targets []Target
+
+	// AdminSubjects and AdminGroups say who may manage targets from the web page.
+	// Setting either enables the feature. Both live in the environment so nobody
+	// can grant themselves admin through the page.
+	AdminSubjects []string
+	AdminGroups   []string
+
+	// AllowedUpstreamHosts and AllowedUpstreamNetworks bound where an admin target
+	// may point. They are independent: a listed host does not open any address
+	// range, and a listed network does not authorise any host. Neither applies to
+	// config targets, which the operator controls.
+	AllowedUpstreamHosts    []hostPattern
+	AllowedUpstreamNetworks []netip.Prefix
 
 	// CIMDEnabled accepts an https client_id and fetches the client's metadata
 	// from it, per draft-ietf-oauth-client-id-metadata-document.
@@ -147,6 +163,12 @@ type Target struct {
 	// token issued for it. Computed once, because comparing it is on the path of
 	// every proxied request.
 	Resource string
+
+	// Source is SourceAdmin for a target stored in the database and empty (config)
+	// otherwise. Generation is the random id of an admin target's row, re-rolled
+	// on every replacement, and is empty for config. Both feed Stamp.
+	Source     string
+	Generation string
 }
 
 // envPrefix maps a target name onto its variable prefix: "git-mcp" reads
@@ -245,9 +267,15 @@ func LoadConfig() (*Config, error) {
 		"UPSTREAM_CLIENT_SECRET": c.UpstreamClientSecret,
 		"DATABASE_URL":           c.DatabaseURL,
 	}
+	if err := c.loadAdmin(); err != nil {
+		return nil, err
+	}
+
 	// UPSTREAM_MCP_URL describes the single legacy target and is required only
-	// when TARGETS is absent.
-	if strings.TrimSpace(os.Getenv("TARGETS")) == "" {
+	// when TARGETS is absent, and not even then when admin targets will supply
+	// the targets.
+	unnamed := strings.TrimSpace(os.Getenv("TARGETS")) == ""
+	if unnamed && !c.AdminEnabled() {
 		required["UPSTREAM_MCP_URL"] = c.UpstreamMCP
 	}
 
@@ -299,11 +327,18 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	targets, err := parseTargets(c.PublicURL)
-	if err != nil {
-		return nil, err
+	switch {
+	case !unnamed || !c.AdminEnabled():
+		targets, err := parseTargets(c.PublicURL)
+		if err != nil {
+			return nil, err
+		}
+		c.Targets = targets
+	case c.UpstreamMCP != "" || os.Getenv("UPSTREAM_STATIC_HEADERS") != "":
+		// The unnamed target serves /mcp, and adding a second target flips the
+		// meaning of the resource parameter and of resource-less sessions.
+		return nil, fmt.Errorf("ADMIN_SUBJECTS and ADMIN_GROUPS need named targets, so they cannot be combined with UPSTREAM_MCP_URL or UPSTREAM_STATIC_HEADERS; move those into TARGETS and TARGET_<NAME>_* variables")
 	}
-	c.Targets = targets
 
 	rawKey := os.Getenv("ENCRYPTION_KEY")
 	if rawKey == "" {
@@ -329,6 +364,110 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return c, nil
+}
+
+// AdminEnabled reports whether targets can be managed from the web page.
+func (c *Config) AdminEnabled() bool {
+	return len(c.AdminSubjects) > 0 || len(c.AdminGroups) > 0
+}
+
+// NamedMode reports whether this deployment serves named targets at
+// /<name>/mcp, as opposed to one unnamed target at /mcp. It is fixed by the
+// configuration, not by what happens to be in the registry, so a deployment
+// whose admin targets are all removed is still named.
+func (c *Config) NamedMode() bool {
+	return c.AdminEnabled() || (len(c.Targets) > 0 && c.Targets[0].Name != "")
+}
+
+// loadAdmin reads the variables that switch on admin-managed targets. The
+// feature has no safe default for where targets may point, so enabling it
+// without ALLOWED_UPSTREAM_HOSTS is refused rather than left open.
+func (c *Config) loadAdmin() error {
+	var err error
+	if c.AdminSubjects, err = commaList("ADMIN_SUBJECTS"); err != nil {
+		return err
+	}
+	if c.AdminGroups, err = commaList("ADMIN_GROUPS"); err != nil {
+		return err
+	}
+
+	hosts, err := commaList("ALLOWED_UPSTREAM_HOSTS")
+	if err != nil {
+		return err
+	}
+	for _, h := range hosts {
+		p, err := parseHostPattern(h)
+		if err != nil {
+			return fmt.Errorf("ALLOWED_UPSTREAM_HOSTS: %w", err)
+		}
+		c.AllowedUpstreamHosts = append(c.AllowedUpstreamHosts, p)
+	}
+
+	nets, err := commaList("ALLOWED_UPSTREAM_NETWORKS")
+	if err != nil {
+		return err
+	}
+	for _, n := range nets {
+		p, err := netip.ParsePrefix(n)
+		if err != nil {
+			return fmt.Errorf("ALLOWED_UPSTREAM_NETWORKS must be a comma-separated list of networks in CIDR notation, got %q", n)
+		}
+		c.AllowedUpstreamNetworks = append(c.AllowedUpstreamNetworks, p.Masked())
+	}
+
+	if !c.AdminEnabled() {
+		return nil
+	}
+	if len(c.AllowedUpstreamHosts) == 0 {
+		return fmt.Errorf("ADMIN_SUBJECTS or ADMIN_GROUPS is set, so ALLOWED_UPSTREAM_HOSTS must list the host:port pairs admin targets may use")
+	}
+	// Some providers send groups only when the scope is requested, so this is a
+	// warning: the first admin sign-in finds out if the claim never arrives.
+	if len(c.AdminGroups) > 0 && !slices.Contains(strings.Fields(c.UpstreamScopes), "groups") {
+		slog.Warn("ADMIN_GROUPS is set but UPSTREAM_SCOPES has no groups scope; the provider may not send the groups claim")
+	}
+	return nil
+}
+
+// commaList reads a comma-separated variable. A value that is set but names
+// nothing is an error, because for an access list "empty" would silently mean
+// "feature off" or "no restriction".
+func commaList(name string) ([]string, error) {
+	raw := os.Getenv(name)
+	out := splitList(raw)
+	if strings.TrimSpace(raw) != "" && len(out) == 0 {
+		return nil, fmt.Errorf("%s is set but names nothing", name)
+	}
+	return out, nil
+}
+
+// splitList splits a comma-separated value, trimming each entry and dropping
+// empty ones. It returns nil when nothing is left.
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// parseHostPattern reads one host:port entry. The port is required because a
+// name alone would also admit every other service on that machine.
+func parseHostPattern(raw string) (hostPattern, error) {
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil {
+		return hostPattern{}, fmt.Errorf("%q is not host:port", raw)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return hostPattern{}, fmt.Errorf("%q has an invalid port", raw)
+	}
+	if host == "" || strings.ContainsAny(host, "/@*? \t") {
+		return hostPattern{}, fmt.Errorf("%q has an invalid host", raw)
+	}
+	return hostPattern{Host: strings.ToLower(host), Port: port}, nil
 }
 
 // parseTargets builds the target list from either the multi-target variables or
@@ -363,6 +502,9 @@ func parseTargets(publicURL string) ([]Target, error) {
 		if err := checkTargetURL("UPSTREAM_MCP_URL", t.UpstreamMCP); err != nil {
 			return nil, err
 		}
+		if err := validateTarget(t); err != nil {
+			return nil, err
+		}
 		return []Target{t}, nil
 	}
 
@@ -377,8 +519,10 @@ func parseTargets(publicURL string) ([]Target, error) {
 		if name == "" {
 			continue
 		}
-		if !targetNamePattern.MatchString(name) {
-			return nil, fmt.Errorf("TARGETS: %q is not a valid target name (lowercase letters, digits and hyphens)", name)
+		// Checked before the variables are read, so a bad name is reported as
+		// such rather than as a missing TARGET_<NAME>_UPSTREAM_MCP_URL.
+		if err := validateTargetName(name); err != nil {
+			return nil, err
 		}
 		if seen[name] {
 			return nil, fmt.Errorf("TARGETS: %q is listed twice", name)
@@ -403,23 +547,13 @@ func parseTargets(publicURL string) ([]Target, error) {
 			return nil, err
 		}
 
-		switch t.Mode {
-		case "":
+		if t.Mode == "" {
 			t.Mode = CredProviderToken
-		case CredProviderToken, CredStatic, CredPerUser:
-		default:
-			return nil, fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static, per_user", p, t.Mode)
 		}
 
 		headers, err := parseStaticHeaders(p+"STATIC_HEADERS", os.Getenv(p+"STATIC_HEADERS"))
 		if err != nil {
 			return nil, err
-		}
-		if t.Mode == CredStatic && len(headers) == 0 {
-			return nil, fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
-		}
-		if t.Mode != CredStatic && len(headers) > 0 {
-			return nil, fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
 		}
 		t.StaticHeaders = headers
 
@@ -427,26 +561,19 @@ func parseTargets(publicURL string) ([]Target, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%sUSER_HEADERS: %w", p, err)
 		}
-		if t.Mode == CredPerUser && len(fields) == 0 {
-			return nil, fmt.Errorf("%sUSER_HEADERS is required when %sCREDENTIAL_MODE is per_user", p, p)
-		}
-		if t.Mode != CredPerUser && len(fields) > 0 {
-			return nil, fmt.Errorf("%sUSER_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
-		}
 		t.UserFields = fields
 
 		rawGroups := os.Getenv(p + "ALLOWED_GROUPS")
-		for _, g := range strings.Split(rawGroups, ",") {
-			if g = strings.TrimSpace(g); g != "" {
-				t.AllowedGroups = append(t.AllowedGroups, g)
-			}
-		}
+		t.AllowedGroups = splitList(rawGroups)
 		// A value that names no group would otherwise read as "no restriction",
 		// opening the target to everyone while the config says it is limited.
 		if strings.TrimSpace(rawGroups) != "" && len(t.AllowedGroups) == 0 {
 			return nil, fmt.Errorf("%sALLOWED_GROUPS is set but names no groups", p)
 		}
 
+		if err := validateTarget(t); err != nil {
+			return nil, err
+		}
 		targets = append(targets, t)
 	}
 
@@ -479,30 +606,110 @@ func parseUserHeaderFields(raw string) ([]UserHeaderField, error) {
 	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
 		return nil, fmt.Errorf("not valid JSON: %w", err)
 	}
+	if err := validateUserFields(fields); err != nil {
+		return nil, err
+	}
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("names no fields")
+	}
+	return fields, nil
+}
+
+func validateUserFields(fields []UserHeaderField) error {
 	seen := map[string]bool{}
 	for i, f := range fields {
 		// Validated here rather than left to fail at request time, when the value
 		// would be rejected by the transport and surface to a user as a 502 on
 		// every call with nothing to point at.
 		if !httpguts.ValidHeaderFieldName(f.Header) {
-			return nil, fmt.Errorf("field %d has an invalid header name %q", i, f.Header)
+			return fmt.Errorf("field %d has an invalid header name %q", i, f.Header)
 		}
 		if strings.TrimSpace(f.Label) == "" {
-			return nil, fmt.Errorf("field %q has no label", f.Header)
+			return fmt.Errorf("field %q has no label", f.Header)
 		}
 		if !httpguts.ValidHeaderFieldValue(f.Prefix) {
-			return nil, fmt.Errorf("field %q has an invalid prefix", f.Header)
+			return fmt.Errorf("field %q has an invalid prefix", f.Header)
 		}
 		key := http.CanonicalHeaderKey(f.Header)
 		if seen[key] {
-			return nil, fmt.Errorf("field %q is listed twice", f.Header)
+			return fmt.Errorf("field %q is listed twice", f.Header)
 		}
 		seen[key] = true
 	}
-	if len(fields) == 0 {
-		return nil, fmt.Errorf("names no fields")
+	return nil
+}
+
+func validateTargetName(name string) error {
+	if !targetNamePattern.MatchString(name) {
+		return fmt.Errorf("TARGETS: %q is not a valid target name (lowercase letters, digits and hyphens)", name)
 	}
-	return fields, nil
+	return nil
+}
+
+// validateTarget holds the rules every target must meet, wherever it was
+// defined, so the environment parser and the admin handlers cannot drift apart.
+// The messages name the environment variables, which suits the boot path.
+func validateTarget(t Target) error {
+	p := "UPSTREAM_"
+	if t.Name != "" {
+		if err := validateTargetName(t.Name); err != nil {
+			return err
+		}
+		p = envPrefix(t.Name)
+	}
+	if strings.TrimSpace(t.DisplayName) == "" {
+		return fmt.Errorf("%sDISPLAY_NAME is empty", p)
+	}
+
+	switch t.Mode {
+	case CredProviderToken, CredStatic, CredPerUser:
+	default:
+		return fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static, per_user", p, t.Mode)
+	}
+
+	// A name or value the transport rejects would otherwise surface as a 502 on
+	// every proxied call, with nothing to point at. RFC 9110 section 5.
+	// Names that differ only in case are one header, and a map would send
+	// whichever came first in iteration order.
+	canonical := map[string]bool{}
+	for name, value := range t.StaticHeaders {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return fmt.Errorf("%sSTATIC_HEADERS: %q is not a valid header name", p, name)
+		}
+		key := http.CanonicalHeaderKey(name)
+		if canonical[key] {
+			return fmt.Errorf("%sSTATIC_HEADERS: %s is listed twice", p, key)
+		}
+		canonical[key] = true
+		if !httpguts.ValidHeaderFieldValue(value) {
+			return fmt.Errorf("%sSTATIC_HEADERS: the value of %s is not a valid header value", p, name)
+		}
+	}
+	if t.Mode == CredStatic && len(t.StaticHeaders) == 0 {
+		return fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
+	}
+	if t.Mode != CredStatic && len(t.StaticHeaders) > 0 {
+		return fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
+	}
+
+	if err := validateUserFields(t.UserFields); err != nil {
+		return fmt.Errorf("%sUSER_HEADERS: %w", p, err)
+	}
+	if t.Mode == CredPerUser && len(t.UserFields) == 0 {
+		return fmt.Errorf("%sUSER_HEADERS is required when %sCREDENTIAL_MODE is per_user", p, p)
+	}
+	if t.Mode != CredPerUser && len(t.UserFields) > 0 {
+		return fmt.Errorf("%sUSER_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
+	}
+
+	// An empty group would match a provider group with no name, or read as no
+	// restriction, either of which is not what a limited target means.
+	for _, g := range t.AllowedGroups {
+		if strings.TrimSpace(g) == "" {
+			return fmt.Errorf("%sALLOWED_GROUPS contains an empty group", p)
+		}
+	}
+	return nil
 }
 
 // Admits reports whether someone in these groups may authorize for the target.
@@ -512,16 +719,6 @@ func (t Target) Admits(groups []string) bool {
 	}
 	for _, g := range groups {
 		if slices.Contains(t.AllowedGroups, g) {
-			return true
-		}
-	}
-	return false
-}
-
-// HasPerUserTargets reports whether the enrolment page has anything to offer.
-func (c *Config) HasPerUserTargets() bool {
-	for _, t := range c.Targets {
-		if t.Mode == CredPerUser {
 			return true
 		}
 	}
@@ -647,36 +844,6 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-// ResourceURI is the canonical identifier of the MCP endpoint, used as the
-// `resource` value in metadata and as the audience of the tokens we issue.
-// Meaningful only for a single-target deployment.
-func (c *Config) ResourceURI() string { return c.Targets[0].Resource }
-
-// MultiTarget reports whether this deployment serves named targets. It governs
-// two behaviours: whether the `resource` parameter is required at /authorize,
-// and whether a session carrying no resource may be used at all.
-func (c *Config) MultiTarget() bool { return c.Targets[0].Name != "" }
-
-// TargetByResource finds the target a `resource` value names.
-func (c *Config) TargetByResource(resource string) (Target, bool) {
-	resource = strings.TrimRight(resource, "/")
-	for _, t := range c.Targets {
-		if t.Resource == resource {
-			return t, true
-		}
-	}
-	return Target{}, false
-}
-
-// ResourceList is every resource this proxy serves, for error messages.
-func (c *Config) ResourceList() string {
-	out := make([]string, 0, len(c.Targets))
-	for _, t := range c.Targets {
-		out = append(out, t.Resource)
-	}
-	return strings.Join(out, ", ")
 }
 
 // MetadataPath is where RFC 9728 says this target's protected-resource document

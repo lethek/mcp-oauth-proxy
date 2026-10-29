@@ -10,6 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// TakeRefreshToken takes a refresh token outside a grant. Production always
+// takes it inside one, so this lives with the tests.
+func (s *Store) TakeRefreshToken(ctx context.Context, token, clientID string) (sessionID string, err error) {
+	ref, err := s.takeRefreshToken(ctx, s.pool, token, clientID)
+	return ref.ID, err
+}
+
 // newTestStore connects to the database named by TEST_DATABASE_URL and clears
 // it. Without that variable the database-backed tests skip, so `go test ./...`
 // still works on a machine with no Postgres. Under CI they fail instead: a
@@ -37,7 +44,7 @@ func newTestStore(t *testing.T) *Store {
 	// everything. user_credentials is NOT among the cascades: it deliberately has
 	// no foreign key to sessions, so it survives one and has to be cleared here
 	// or an enrolment leaks into the next test and makes "not enrolled" pass.
-	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "stamp_seen", "clients"} {
+	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "stamp_seen", "targets", "clients"} {
 		if _, err := s.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clearing %s: %v", table, err)
 		}
@@ -48,7 +55,7 @@ func newTestStore(t *testing.T) *Store {
 func mustSession(t *testing.T, s *Store) string {
 	t.Helper()
 	id := newSecret()
-	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", "test", "config:test", []byte("sealed")); err != nil {
+	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", "test", "config:test", []byte("sealed"), nil); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	return id
@@ -337,7 +344,7 @@ func TestEmptyStampSessionsAreRefused(t *testing.T) {
 	ctx := context.Background()
 
 	id := newSecret()
-	if err := s.CreateSession(ctx, id, "sub", "https://p/mcp", "", "", []byte("sealed")); err != nil {
+	if err := s.CreateSession(ctx, id, "sub", "https://p/mcp", "", "", []byte("sealed"), nil); err != nil {
 		t.Fatal(err)
 	}
 	access := newSecret()
@@ -356,7 +363,7 @@ func TestSessionTokenRequiresTheSessionsStamp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	id := newSecret()
-	if err := s.CreateSession(ctx, id, "sub", "r", "plane", "config:a", []byte("sealed")); err != nil {
+	if err := s.CreateSession(ctx, id, "sub", "r", "plane", "config:a", []byte("sealed"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.SessionToken(ctx, id, "config:a"); err != nil {
@@ -592,7 +599,7 @@ func TestSweepRunsAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{store: s, cfg: &Config{}}
+	srv := &Server{store: s, cfg: &Config{}, reg: testRegistry(t, Target{Name: "plane", UpstreamMCP: "https://plane.example/mcp"})}
 	swept, cancel := context.WithCancel(ctx)
 	go srv.sweep(swept)
 
@@ -684,19 +691,19 @@ func TestCredentialIsReadOnlyThroughASessionWithTheSameStamp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	id := newSecret()
-	if err := s.CreateSession(ctx, id, "u", "r", "plane", "config:a", []byte("tok")); err != nil {
+	if err := s.CreateSession(ctx, id, "u", "r", "plane", "config:a", []byte("tok"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.UserCredentialForSession(ctx, id, "plane"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.UserCredentialForSession(ctx, id, "plane"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("a credential for another stamp was returned: %v", err)
 	}
 	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A")); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := s.UserCredentialForSession(ctx, id, "plane"); err != nil || string(b) != "A" {
+	if b, _, err := s.UserCredentialForSession(ctx, id, "plane"); err != nil || string(b) != "A" {
 		t.Errorf("got %q, %v; want the credential for the session's own stamp", b, err)
 	}
 }
@@ -731,7 +738,7 @@ func TestSweepRemovesEmptyStampRows(t *testing.T) {
 	ctx := context.Background()
 	empty, kept := newSecret(), newSecret()
 	for _, c := range []struct{ id, stamp string }{{empty, ""}, {kept, "config:a"}} {
-		if err := s.CreateSession(ctx, c.id, "u", "r", "plane", c.stamp, []byte("x")); err != nil {
+		if err := s.CreateSession(ctx, c.id, "u", "r", "plane", c.stamp, []byte("x"), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -858,8 +865,9 @@ func TestSweepRemovesOldStampSeenRows(t *testing.T) {
 func TestSweepOnceSkipsStraySweepWhenRecordingFails(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	srv := &Server{store: s, cfg: &Config{Targets: []Target{{Name: "plane", UpstreamMCP: "https://plane.example/mcp"}}}}
-	stamp := srv.cfg.Targets[0].Stamp()
+	plane := Target{Name: "plane", UpstreamMCP: "https://plane.example/mcp"}
+	srv := &Server{store: s, cfg: &Config{Targets: []Target{plane}}, reg: testRegistry(t, plane)}
+	stamp := plane.Stamp()
 	if _, err := s.pool.Exec(ctx,
 		`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u','plane',$1,'\x01', now() - INTERVAL '14 days')`, stamp); err != nil {
 		t.Fatal(err)
@@ -956,5 +964,29 @@ func TestMigrateWithAnEmptySchemaFirstOnTheSearchPath(t *testing.T) {
 	}
 	if err := other.PutUserCredential(ctx, "u", "plane", "config:b", []byte("b")); err != nil {
 		t.Fatalf("a second stamp for the same user and target must coexist: %v", err)
+	}
+}
+
+// The admin page and a target edit filter these tables by (target, stamp), and
+// user_credentials' key leads with subject. Booting twice also proves the
+// statements are idempotent, since they run on every start.
+func TestTargetStampIndexesExistAndBootIsRepeatable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	again, err := NewStore(ctx, os.Getenv("TEST_DATABASE_URL"), time.Hour, time.Hour)
+	if err != nil {
+		t.Fatalf("a second NewStore against a migrated database must succeed: %v", err)
+	}
+	again.Close()
+
+	for _, name := range []string{"sessions_target_stamp_idx", "flows_target_stamp_idx", "user_credentials_target_stamp_idx"} {
+		var n int
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Errorf("index %s is missing after NewStore", name)
+		}
 	}
 }

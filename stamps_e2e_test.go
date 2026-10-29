@@ -23,15 +23,13 @@ func (h *harness) replica(mutate func([]Target)) *httptest.Server {
 		flowLimit:       newLimiter(1000, time.Minute),
 		credentialLimit: newLimiter(1000, time.Minute),
 		mcpLimit:        newLimiter(1000, time.Minute),
-		proxies:         map[string]http.Handler{},
+		reg:             &registry{},
 	}
-	for _, tgt := range cfg.Targets {
-		u, err := url.Parse(tgt.UpstreamMCP)
-		if err != nil {
-			h.t.Fatal(err)
-		}
-		s.proxies[tgt.Name] = newReverseProxy(u, "")
+	snap, err := newSnapshot(cfg.Targets, &cfg, nil)
+	if err != nil {
+		h.t.Fatal(err)
 	}
+	s.reg.Store(snap)
 	srv := httptest.NewServer(s.routes())
 	h.t.Cleanup(srv.Close)
 	return srv

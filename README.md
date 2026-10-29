@@ -54,20 +54,24 @@ where a default is shown.
 | Variable | Meaning |
 | --- | --- |
 | `PUBLIC_URL` | The origin clients dial, e.g. `https://git-mcp.example.com`. Used as the OAuth issuer and as the base of every advertised URL, so it must match reality. Must be `https` unless it is loopback. No trailing slash. A bare origin, so no path, query string, fragment or credentials; anything else is refused at boot. Spelling out a default port is fine; it is normalised before being compared against a browser's `Origin`. |
-| `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set. |
+| `UPSTREAM_MCP_URL` | The MCP server to forward to once a request is authorized. Plain `http` is accepted here for private-network deployments, and warned about at boot when it is not loopback. Required unless `TARGETS` is set or admin targets are enabled. |
 | `TARGETS` | Comma-separated names, to serve several MCP servers from one proxy. See below. |
 | `UPSTREAM_ISSUER` | The OAuth provider's issuer URL, e.g. `https://auth.example.com/application/o/mcp-proxy/` for an Authentik application with the slug `mcp-proxy`. Discovery is read from `/.well-known/openid-configuration` under it, falling back to `/.well-known/oauth-authorization-server`. |
 | `UPSTREAM_CLIENT_ID` | Client id of the application you registered with the provider. |
 | `UPSTREAM_CLIENT_SECRET` | Its secret. |
 | `UPSTREAM_SCOPES` | Space-separated. Default `openid profile email`. |
 | `UPSTREAM_STATIC_HEADERS` | Optional. Newline-separated `Name: Value` pairs, sent to the MCP server in place of the provider's token. See below. |
-| `DATABASE_URL` | PostgreSQL connection string. The schema is created on boot. |
+| `DATABASE_URL` | PostgreSQL connection string, PostgreSQL 13 or later. The schema is created on boot. |
 | `ENCRYPTION_KEY` | Base64 of exactly 32 bytes. Encrypts provider tokens at rest with AES-256-GCM. Changing it invalidates every stored session. |
 | `REFRESH_TOKEN_TTL` | How long a refresh token stays usable. Rotation issues a new one, so this acts as an idle timeout. Go duration, default `720h` (30 days). |
 | `SESSION_TTL` | Absolute cap on one authorization, however actively it is refreshed. Reaching it sends the user back through the provider. Go duration, default `2160h` (90 days). Must not be shorter than `REFRESH_TOKEN_TTL`. |
 | `CIMD_ENABLED` | Accept an https `client_id` as a Client ID Metadata Document. Default `false`. See below. |
 | `TRUSTED_PROXY_HOPS` | How many reverse proxies sit in front. Default `0`, meaning `X-Forwarded-For` is ignored. See below. |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated networks in CIDR notation that those proxies connect from, such as `10.0.0.0/8`. Required whenever `TRUSTED_PROXY_HOPS` is set. |
+| `ADMIN_SUBJECTS` | Optional. Comma-separated provider subjects who may manage targets. Setting this or `ADMIN_GROUPS` enables admin-managed targets. See below. |
+| `ADMIN_GROUPS` | Optional. Comma-separated provider groups whose members may manage targets. Needs the provider to send a `groups` claim, so boot warns when `UPSTREAM_SCOPES` has no `groups`. |
+| `ALLOWED_UPSTREAM_HOSTS` | Comma-separated `host:port` pairs an admin target may use, such as `mcp.example.com:443`. The port is required and matching is exact. Required when admin targets are enabled. |
+| `ALLOWED_UPSTREAM_NETWORKS` | Optional. Comma-separated CIDR ranges an admin target may reach even though they are private, such as `10.0.0.0/8`. Plain `http` is allowed only to an address inside one. |
 | `LISTEN_ADDR` | Default `:8080`. |
 
 Generate a key with:
@@ -142,6 +146,9 @@ shows instead, defaulting to the name with its first letter capitalised.
 - `static`, which sends the fixed `..._STATIC_HEADERS` instead.
 - `per_user`, which sends the credential each user stored for themselves. See
   below.
+
+Static header names that differ only in case, such as `Authorization` and
+`authorization`, are refused at boot.
 
 Each target is served at `PUBLIC_URL/<name>/mcp` and is a distinct OAuth
 resource, with its own RFC 9728 document at
@@ -250,6 +257,117 @@ at most `SESSION_TTL` later. To make it immediate, delete their rows from the
 `sessions` table (matched on `subject` and `resource`), which cascades to the
 tokens issued from them.
 
+### Admin-managed targets
+
+Setting `ADMIN_SUBJECTS` or `ADMIN_GROUPS` lets targets live in the database as
+well as in the environment, and adds the page at **`PUBLIC_URL/admin`** for
+managing them.
+
+Enabling it has these requirements, and the proxy refuses to start without them:
+
+- `ALLOWED_UPSTREAM_HOSTS` must be set. An admin target can only point at a
+  listed `host:port`, and the list is checked again each time targets are loaded.
+  It does not apply to targets defined in the environment.
+- The deployment must be named. `UPSTREAM_MCP_URL` and `UPSTREAM_STATIC_HEADERS`
+  cannot be combined with it. `TARGETS` may be empty, because admin targets can
+  supply them all. While none exist, `/authorize` answers `temporarily_unavailable`
+  and says no MCP servers are available yet.
+
+The `targets` and `targets_version` tables and the `settings_flows.kind` column
+are created at boot even when the feature is off. `ADMIN_*` and
+`ALLOWED_UPSTREAM_*` variables are validated whenever they are set, so a bad
+value stops the proxy starting either way.
+
+In `provider_token` mode, whoever administers targets can send any user's
+provider token to any host on `ALLOWED_UPSTREAM_HOSTS`. The user's defence is the
+consent page, which shows the upstream host before they approve. The settings
+page shows it too. Keep the list short and treat admin access as equal to access
+to those tokens.
+
+Where an admin target may connect is decided by address as well as name. The
+address actually dialled must be public, unless it falls in
+`ALLOWED_UPSTREAM_NETWORKS`. A host on `ALLOWED_UPSTREAM_HOSTS` does not open any
+range, so a DNS answer pointing at an internal address is refused. Plain `http`
+is allowed only when the address dialled is in `ALLOWED_UPSTREAM_NETWORKS`, and
+that is checked on every connection. Link-local, `100.100.100.200`, `0.0.0.0/8`,
+multicast and NAT64 addresses are refused whatever the lists say. Admin targets
+ignore `HTTP_PROXY` and `HTTPS_PROXY`, so an egress proxy has to enforce the same
+rules itself.
+
+A name belongs to one source at a time. The admin page refuses to create a target
+whose name an environment target uses. If an environment target is added later
+under the name of an admin target, the environment entry is left out and logged, and the
+proxy still starts. Removing the admin target gives the name back to the
+environment entry, which inherits none of its sessions or credentials. The
+removal page says when that will happen.
+
+Changes reach every replica within about 5 seconds. A replica that has not yet
+polled catches up on the first request for an unknown target name, rather than
+answering `404`, and rate limits that check to about one a second. A replica that
+has not yet seen a change to a target it serves answers `503` with `Retry-After`
+rather than serving the old definition. Static values are encrypted with `ENCRYPTION_KEY`, so rotating the
+key makes them unreadable and those targets are not served until a new value is
+entered. Anyone with write access to the database can redirect an admin target,
+so treat that access as equal to admin.
+
+Replacing or removing an admin target ends every sign-in, session and personal
+credential made for the old definition, and the proxy deletes them once the
+change commits. A sign-in or a settings save that was already in progress when
+the target changed is refused, and the settings page asks the person to reload.
+A sign-in is checked against the target's current allowed groups, even on a
+replica that has not yet seen a change. Editing the display name or allowed
+groups keeps existing sessions, as does any edit that leaves the stamp unchanged,
+such as a static header value or a user-field label. If the delete is interrupted, the next sweep
+repeats it, even if the feature has since been switched off. Rows for a target that
+still exists are kept. Removal does not close streams that are already open. They keep
+running until the client or the server ends them, although no new request is
+accepted.
+
+#### The admin page
+
+`/admin` runs its own sign-in with the provider, separate from `/settings`. Its
+callback address, `PUBLIC_URL/admin/callback`, must be registered with the
+provider alongside the others before the feature is switched on. An admin is
+anyone whose subject is in `ADMIN_SUBJECTS` or whose `groups` claim contains a
+name in `ADMIN_GROUPS`. Both are read from the environment at sign-in, so nobody
+can grant themselves access from the page. Anyone else is shown a 403 page.
+
+The admin session lasts 30 minutes and then asks the provider again. The proxy
+sends no `prompt=login` or `max_age`, so a person with a live provider session is
+signed straight back in, and the 30 minutes is the only limit on how long a
+stolen or unattended browser can administer. Removing someone from an admin
+group takes effect within that time.
+
+The page has a Sign out button, which posts to `/admin/logout`. It removes the
+cookie from that browser only. The session is stateless, so a copied cookie stays
+valid until its 30 minutes are up. Signing out writes one log line,
+`admin: signed out`.
+
+Group names are only safe where users cannot create groups. If your provider
+lets any user create a group or organisation whose name appears in the `groups`
+claim, `ADMIN_GROUPS=admins` is satisfied by anyone who creates one. Use
+`ADMIN_SUBJECTS` there. The same applies to `..._ALLOWED_GROUPS`.
+
+The page lists each target with its host and mode. Targets from the
+environment are shown read only, and an environment target left out because an
+admin target holds its name is shown with that reason. A form can change the
+display name, URL, mode, per-user fields, static headers and allowed groups. A
+change to the URL, mode or per-user fields is a replacement, and the form marks
+those fields. A replacement and a removal each show how many sessions and saved
+credentials they will end and need the target's name typed to go ahead.
+Per-user fields are entered as the same JSON list as `..._USER_HEADERS`.
+
+Static header values are write-only. They are never shown again and never
+logged. Leave the field empty on an edit to keep the stored value, which is
+possible only while the URL and mode stay the same. A replacement asks for the
+value again on its confirmation page.
+
+Every change writes one log line, `admin: target changed`, with the admin's
+subject, the operation and the names of the fields that changed. It never
+includes values. A removal is not recoverable, so that line is the only record
+of it. Forms carry a token tied to the admin session. A submission with a
+missing or wrong token, or from another origin, is refused.
+
 ### Static upstream credentials
 
 By default the proxy forwards the provider's own token to the MCP server. Some
@@ -266,6 +384,9 @@ UPSTREAM_STATIC_HEADERS: |
 ```
 
 Newlines separate the pairs, because header values routinely contain commas.
+Header names and values are checked at boot, and a name or value that is not a
+valid HTTP header stops the proxy from starting instead of failing every request
+later.
 
 The provider still authenticates every user, and the proxy still issues and
 validates its own tokens, so an unauthenticated caller gets nowhere. What
@@ -320,6 +441,7 @@ If a target's stamp changes, they stop working for that target.
   running.** Finish the rollout first. After the first new replica starts, an older
   replica cannot save a per-user credential, because the table's key has changed
   and its save fails.
+- **The first start after this release builds three indexes** on `sessions`, `flows` and `user_credentials`. A plain `CREATE INDEX` blocks writes to each table while it builds, which is brief because these tables are bounded by session lifetime.
 - **One database belongs to one deployment.** A stored credential for a
   definition is deleted once it has not been saved for 7 days and no process
   has served that definition for 7 days. Two deployments with different targets
@@ -336,7 +458,8 @@ If a target's stamp changes, they stop working for that target.
 | `/callback`, `/token` | Provider redirect and token issuance. Authorization code flow with PKCE. |
 | `/revoke` | RFC 7009. Presenting either token ends the whole session. |
 | `/mcp` | Authenticated pass-through to the upstream MCP server. With `TARGETS`, each target is at `/<name>/mcp` instead. |
-| `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Served only when some target is `per_user`. |
+| `/settings`, `/settings/callback`, `/settings/logout` | Where users store their own credentials. Always served. When no target is `per_user`, the page says there is nothing to enrol. |
+| `/admin`, `/admin/callback`, `/admin/targets/...`, `/admin/logout` | The admin page: sign-in, list, the add, edit, confirm and remove forms, and sign-out. Served only when `ADMIN_SUBJECTS` or `ADMIN_GROUPS` is set. |
 | `/healthz` | Liveness. Reports only on this process. |
 
 ## Security notes

@@ -30,6 +30,10 @@ type consentView struct {
 	// credential it will end up spending, so the question has to name it.
 	TargetName string
 
+	// TargetHost is where that server is, shown beside its name because an
+	// admin can point a name at any allowed host.
+	TargetHost string
+
 	RedirectURI string
 	FlowID      string
 	ConsentPath string
@@ -51,6 +55,15 @@ func renderConsent(w http.ResponseWriter, v consentView) {
 		formAction = append(formAction, src)
 	}
 	writePage(w, http.StatusOK, consentTemplate, strings.Join(formAction, " "), v)
+}
+
+// upstreamHost is the host:port a target's MCP server is reached at.
+func upstreamHost(t Target) string {
+	u, err := url.Parse(t.UpstreamMCP)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // redirectSource turns a registered redirect URI into a CSP source expression:

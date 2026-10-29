@@ -60,6 +60,12 @@ const (
 	purposeUpstreamToken   = "upstream-token"
 	purposeUserCredential  = "user-credential"
 	purposeSettingsSession = "settings-session"
+	// purposeAdminSession seals the admin cookie, so a settings cookie cannot be
+	// presented at /admin or the reverse.
+	purposeAdminSession = "admin-session"
+	// purposeAdminStatic seals an admin target's static headers. It is bound to
+	// the target name and row id, so a value copied to another row fails to open.
+	purposeAdminStatic = "admin-static"
 )
 
 // boundPurpose ties a sealed value to the stamp of the target it was made for.

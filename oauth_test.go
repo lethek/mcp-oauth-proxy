@@ -362,17 +362,23 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	cfg.Targets = build(cfg, h.provider.URL)
 	s.upstream = NewUpstream(cfg)
 
-	s.proxies = map[string]http.Handler{}
-	for _, tgt := range cfg.Targets {
-		u, parseErr := url.Parse(tgt.UpstreamMCP)
-		if parseErr != nil {
-			t.Fatal(parseErr)
+	if cfg.AdminEnabled() {
+		// The builder switches the feature on by setting the admin fields, as the
+		// environment does.
+		store.EnableAdminTargets(seal, cfg.AllowedUpstreamHosts, cfg.AllowedUpstreamNetworks)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		s.reg = newAdminRegistry(ctx, cfg, store)
+		if err := s.reg.Rebuild(ctx); err != nil {
+			t.Fatal(err)
 		}
-		enrolURL := ""
-		if tgt.Mode == CredPerUser {
-			enrolURL = cfg.PublicURL + "/settings"
+	} else {
+		snap, snapErr := newSnapshot(cfg.Targets, cfg, nil)
+		if snapErr != nil {
+			t.Fatal(snapErr)
 		}
-		s.proxies[tgt.Name] = newReverseProxy(u, enrolURL)
+		s.reg = &registry{}
+		s.reg.Store(snap)
 	}
 
 	h.proxy.Config.Handler = s.routes()
@@ -1143,7 +1149,7 @@ func TestRefreshAbortsWhenTheSessionIsRevokedWhileWaiting(t *testing.T) {
 		RefreshToken: "stale-refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
-	if err := h.srv.createSession(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired); err != nil {
+	if err := h.srv.createSession(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired, nil); err != nil {
 		t.Fatal(err)
 	}
 

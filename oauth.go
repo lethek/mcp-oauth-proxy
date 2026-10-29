@@ -147,24 +147,45 @@ func oauthError(w http.ResponseWriter, status int, code, desc string) {
 // handleProtectedResourceMetadata implements RFC 9728. This is the document a
 // client fetches first; it names us as our own authorization server, which is
 // what lets us present dynamic registration over a provider that has none.
-func (s *Server) handleProtectedResourceMetadata(t Target) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"resource":                 t.Resource,
-			"authorization_servers":    []string{s.cfg.PublicURL},
-			"bearer_methods_supported": []string{"header"},
-			"scopes_supported":         []string{"mcp"},
-		})
+func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	// Empty in a single-target deployment, whose routes have no {target}.
+	e := s.reg.Load().byName[r.PathValue("target")]
+	if e == nil && s.reg.enabled() {
+		snap, err := s.catchUp(r)
+		if err != nil {
+			retryShortly(w)
+			return
+		}
+		e = snap.byName[r.PathValue("target")]
 	}
+	if e == nil {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resource":                 e.Target.Resource,
+		"authorization_servers":    []string{s.cfg.PublicURL},
+		"bearer_methods_supported": []string{"header"},
+		"scopes_supported":         []string{"mcp"},
+	})
 }
+
+// noTargetsMessage is what a client is told while admin targets are enabled and
+// none exist yet.
+const noTargetsMessage = "no MCP servers are available yet; ask the administrator to add one"
 
 // handleAmbiguousResourceMetadata answers the bare RFC 9728 path when several
 // targets are served. There is no single resource to name, and returning one of
 // them arbitrarily would send a client to the wrong upstream with a token that
 // will not work there. Better to say so.
 func (s *Server) handleAmbiguousResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	snap := s.reg.Load()
+	if len(snap.entries) == 0 {
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", noTargetsMessage)
+		return
+	}
 	oauthError(w, http.StatusNotFound, "invalid_request",
-		"this proxy serves several resources; request the metadata for one of them: "+s.cfg.ResourceList())
+		"this proxy serves several resources; request the metadata for one of them: "+snap.ResourceList())
 }
 
 // handleAuthorizationServerMetadata implements RFC 8414. We advertise only what
@@ -326,23 +347,50 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// default, and guessing would hand out a token for the wrong service. With
 	// one target it stays optional, for clients predating the requirement.
 	res := strings.TrimRight(q.Get("resource"), "/")
-	if res == "" && s.cfg.MultiTarget() {
+	snap := s.reg.Load()
+	// A replica that has not polled yet may not know a target created moments
+	// ago, so an unknown resource, or an empty snapshot, is checked against the
+	// database once before it is refused.
+	if s.reg.enabled() {
+		if _, known := snap.TargetByResource(res); !known && (res != "" || len(snap.entries) == 0) {
+			var err error
+			if snap, err = s.catchUp(r); err != nil {
+				w.Header().Set("Retry-After", "2")
+				s.redirectErr(w, r, redirectURI, q.Get("state"), "temporarily_unavailable",
+					"this server's targets are being updated; retry shortly")
+				return
+			}
+		}
+	}
+	// Admin targets may leave the snapshot empty. No resource is wrong then, so
+	// naming an empty list would only confuse. It is temporary: an administrator
+	// adding a target fixes it, which is what temporarily_unavailable (the
+	// redirect form of 503) tells the client.
+	if len(snap.entries) == 0 {
+		s.redirectErr(w, r, redirectURI, q.Get("state"), "temporarily_unavailable", noTargetsMessage)
+		return
+	}
+	if res == "" && snap.MultiTarget() {
 		s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target",
-			"the resource parameter is required; this proxy serves "+s.cfg.ResourceList())
+			"the resource parameter is required; this proxy serves "+snap.ResourceList())
 		return
 	}
 	// Resolved here so the consent screen can name the target. Which upstream a
 	// token will be spent against is chosen entirely by the client, so the user
 	// has to be told which one they are approving.
-	target := s.cfg.Targets[0]
+	// With no resource the deployment is unnamed, and so has exactly one target.
+	// A named one with none yet returned above.
+	var target Target
 	if res != "" {
-		found, ok := s.cfg.TargetByResource(res)
+		found, ok := snap.TargetByResource(res)
 		if !ok {
 			s.redirectErr(w, r, redirectURI, q.Get("state"), "invalid_target",
-				"this proxy only issues tokens for "+s.cfg.ResourceList())
+				"this proxy only issues tokens for "+snap.ResourceList())
 			return
 		}
 		target = found
+	} else {
+		target = snap.entries[0].Target
 	}
 
 	flow := Flow{
@@ -367,6 +415,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		ClientName:      client.Name,
 		ClientID:        client.ID,
 		TargetName:      target.DisplayName,
+		TargetHost:      upstreamHost(target),
 		RedirectURI:     redirectURI,
 		FlowID:          flow.ID,
 		ConsentPath:     "/consent",
@@ -446,11 +495,17 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, ok := s.targetForFlow(flow)
-	if !ok {
+	// The same refusal whether the stamp mismatch is found here, against this
+	// replica's snapshot (a config target, or an admin edit it has seen), or
+	// under the database fence (an edit it has not).
+	stale := func() {
 		slog.Warn("callback: the flow no longer matches a target definition", "target", flow.Target)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "temporarily_unavailable",
 			"the server's configuration changed during sign-in; start again from your client")
+	}
+	target, ok := targetForFlow(s.reg.Load(), flow)
+	if !ok {
+		stale()
 		return
 	}
 
@@ -519,16 +574,37 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Checked before any session exists, so a refused caller holds nothing. An
 	// identity that could not be resolved has no groups and is refused too.
-	if !target.Admits(identity.Groups) {
+	//
+	// An admin target's allowed_groups can change without moving its stamp, so
+	// this snapshot's copy may be out of date. For those the check runs inside
+	// the fenced insert, against the groups the database holds now.
+	deny := func(allowed []string) {
 		slog.Warn("callback: user is not in a group allowed for the target", "target", target.Name,
-			"subject", identity.Label(), "groups", identity.Groups, "allowed", target.AllowedGroups)
+			"subject", identity.Label(), "groups", identity.Groups, "allowed", allowed)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "access_denied",
 			"your account is not allowed to use "+target.DisplayName)
+	}
+	if !target.FromAdmin() && !target.Admits(identity.Groups) {
+		deny(target.AllowedGroups)
 		return
 	}
 
 	sessionID := newSecret()
-	if err := s.createSession(r.Context(), sessionID, identity.Subject, flow.Resource, target, tok); err != nil {
+	// The response is written after the fence is released, never inside it.
+	var fenced []string
+	err = s.createSession(r.Context(), sessionID, identity.Subject, flow.Resource, target, tok, func(allowed []string) bool {
+		fenced = allowed
+		return Target{AllowedGroups: allowed}.Admits(identity.Groups)
+	})
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrNotAdmitted):
+		deny(fenced)
+		return
+	case errors.Is(err, ErrStaleTarget):
+		stale()
+		return
+	default:
 		slog.Error("callback: could not store session", "err", err)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error", "could not store the session")
 		return
@@ -571,19 +647,19 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 // target's stamp is no longer the one /authorize resolved. There is no fallback
 // to the first target: with several, that hands the user a session for a server
 // they did not approve.
-func (s *Server) targetForFlow(flow Flow) (Target, bool) {
+func targetForFlow(snap *snapshot, flow Flow) (Target, bool) {
 	var t Target
 	switch {
 	case flow.Resource != "":
-		found, ok := s.cfg.TargetByResource(flow.Resource)
+		found, ok := snap.TargetByResource(flow.Resource)
 		if !ok {
 			return Target{}, false
 		}
 		t = found
-	case s.cfg.MultiTarget():
+	case snap.MultiTarget():
 		return Target{}, false
 	default:
-		t = s.cfg.Targets[0]
+		t = snap.entries[0].Target
 	}
 	return t, flow.Stamp != "" && flow.Stamp == t.Stamp()
 }
@@ -683,7 +759,8 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 	// The client id is passed in and matched inside the same statement that
 	// consumes the token, so a wrong or missing one leaves the token unused.
 	clientID := r.PostForm.Get("client_id")
-	sessionID, err := g.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
+	ref, err := g.TakeRefreshToken(r.Context(), r.PostForm.Get("refresh_token"), clientID)
+	sessionID := ref.ID
 	if errors.Is(err, ErrTokenReused) {
 		// Either the client replayed a token it should have discarded, or someone
 		// else is holding a copy. We cannot tell which, and only one of those is
@@ -701,6 +778,24 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		// caller whether a token exists and which client holds it.
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "the refresh token is unknown, expired, or was issued to a different client")
 		return
+	}
+
+	// Both refusals return before the grant commits, so the deferred rollback
+	// leaves the refresh token unused.
+	if s.reg.enabled() {
+		e := s.reg.Load().byName[ref.Target]
+		if e.behind(ref.CurrentStamp) {
+			// temporarily_unavailable, so the client keeps its refresh token and
+			// retries once this replica has caught up.
+			s.refuseBehind(w)
+			return
+		}
+		// A target this replica does not serve, with no row behind it either, was
+		// removed. The session is dead, not merely stale.
+		if e == nil || ref.Stamp != e.Stamp {
+			oauthError(w, http.StatusBadRequest, "invalid_grant", "the target changed since this session was issued; authorize again")
+			return
+		}
 	}
 	s.issue(w, r, g, sessionID, clientID)
 }
@@ -781,13 +876,13 @@ func (s *Server) sealUpstreamToken(stamp string, tok UpstreamToken) ([]byte, err
 	return s.sealer.seal(boundPurpose(purposeUpstreamToken, stamp), raw)
 }
 
-func (s *Server) createSession(ctx context.Context, sessionID, subject, resource string, target Target, tok UpstreamToken) error {
+func (s *Server) createSession(ctx context.Context, sessionID, subject, resource string, target Target, tok UpstreamToken, admits func(allowed []string) bool) error {
 	stamp := target.Stamp()
 	sealed, err := s.sealUpstreamToken(stamp, tok)
 	if err != nil {
 		return err
 	}
-	return s.store.CreateSession(ctx, sessionID, subject, resource, target.Name, stamp, sealed)
+	return s.store.CreateSession(ctx, sessionID, subject, resource, target.Name, stamp, sealed, admits)
 }
 
 func (s *Server) updateSessionToken(ctx context.Context, sessionID, stamp string, tok UpstreamToken) error {

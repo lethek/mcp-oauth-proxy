@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,9 +29,9 @@ type Server struct {
 	upstream *Upstream
 	sealer   *sealer
 
-	// proxies holds one reverse proxy per target, keyed by target name. A
-	// single-target deployment keys it on the empty string.
-	proxies map[string]http.Handler
+	// reg holds the targets being served. A request loads its snapshot once and
+	// uses it throughout.
+	reg *registry
 
 	// cimd resolves https client ids to their metadata documents.
 	cimd *cimdClient
@@ -78,25 +77,6 @@ func run() error {
 		return err
 	}
 
-	proxies := map[string]http.Handler{}
-	for _, t := range cfg.Targets {
-		u, err := url.Parse(t.UpstreamMCP)
-		if err != nil {
-			return fmt.Errorf("target %q: %w", t.Name, err)
-		}
-		// Only a per_user target can produce an upstream 401 the user can act on.
-		enrolURL := ""
-		if t.Mode == CredPerUser {
-			enrolURL = cfg.PublicURL + "/settings"
-		}
-		proxies[t.Name] = newReverseProxy(u, enrolURL)
-
-		if isPlaintextURL(t.UpstreamMCP) {
-			slog.Warn("the MCP server is reached over plain http; the credential crosses that hop in the clear",
-				"target", t.Name, "upstream_mcp", t.UpstreamMCP)
-		}
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -106,12 +86,39 @@ func run() error {
 	}
 	defer store.Close()
 
+	var reg *registry
+	if cfg.AdminEnabled() {
+		store.EnableAdminTargets(seal, cfg.AllowedUpstreamHosts, cfg.AllowedUpstreamNetworks)
+		reg = newAdminRegistry(ctx, cfg, store)
+		// Failing here rather than serving config targets alone: a replica that
+		// cannot read the table would answer 503 for every admin target's session
+		// anyway, and starting without it hides the fault.
+		if err := reg.Rebuild(ctx); err != nil {
+			return fmt.Errorf("loading admin targets: %w", err)
+		}
+		go reg.Poll(ctx, pollInterval)
+	} else {
+		snap, err := newSnapshot(cfg.Targets, cfg, nil)
+		if err != nil {
+			return err
+		}
+		reg = &registry{}
+		reg.Store(snap)
+	}
+	served := reg.Load()
+	for _, e := range served.entries {
+		if isPlaintextURL(e.Target.UpstreamMCP) {
+			slog.Warn("the MCP server is reached over plain http; the credential crosses that hop in the clear",
+				"target", e.Target.Name, "upstream_mcp", e.Target.UpstreamMCP)
+		}
+	}
+
 	s := &Server{
 		cfg:             cfg,
 		store:           store,
 		upstream:        NewUpstream(cfg),
 		sealer:          seal,
-		proxies:         proxies,
+		reg:             reg,
 		cimd:            newCIMDClient(),
 		registerLimit:   newLimiter(20, time.Minute),
 		flowLimit:       newLimiter(120, time.Minute),
@@ -153,9 +160,11 @@ func run() error {
 		// of them, and the old one printed an empty upstream and only the first
 		// target's resource, which read as a misconfiguration rather than a
 		// summary.
-		for _, t := range cfg.Targets {
+		for _, e := range served.entries {
+			t := e.Target
 			slog.Info("serving target",
 				"target", t.Name,
+				"source", orDefault(t.Source, SourceConfig),
 				"path", t.MCPPath(),
 				"resource", t.Resource,
 				"credential_mode", t.Mode,
@@ -165,7 +174,7 @@ func run() error {
 			"version", version,
 			"addr", cfg.ListenAddr,
 			"public_url", cfg.PublicURL,
-			"targets", len(cfg.Targets),
+			"targets", len(served.entries),
 			"cimd_enabled", cfg.CIMDEnabled)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
@@ -190,13 +199,16 @@ func (s *Server) routes() http.Handler {
 	// so each target gets its own document. The bare path is only meaningful when
 	// there is a single resource to mean; with several it says so rather than
 	// naming one of them arbitrarily.
-	if s.cfg.MultiTarget() {
+	//
+	// Read once: the single or multi route shape is fixed at boot. Admin targets
+	// will require named mode, so it cannot change while the process runs.
+	multi := s.reg.Load().MultiTarget()
+	if multi {
 		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleAmbiguousResourceMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource/{target}/mcp", s.handleProtectedResourceMetadata)
 	} else {
-		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata(s.cfg.Targets[0]))
-	}
-	for _, t := range s.cfg.Targets {
-		mux.HandleFunc("GET "+t.MetadataPath(), s.handleProtectedResourceMetadata(t))
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleProtectedResourceMetadata)
 	}
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthorizationServerMetadata)
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server/mcp", s.handleAuthorizationServerMetadata)
@@ -222,21 +234,42 @@ func (s *Server) routes() http.Handler {
 	// and are the busiest route, so a shared cap would let ordinary traffic here
 	// refuse the authorization endpoints; an unauthenticated request still costs
 	// a database round trip, so leaving them uncapped is not right either.
-	for _, t := range s.cfg.Targets {
-		h := limited(s.mcpLimit, s.cfg, s.handleMCP(t))
-		mux.HandleFunc(t.MCPPath(), h)
-		mux.HandleFunc(t.MCPPath()+"/", h)
+	//
+	// Named targets are looked up per request, so the table does not have to be
+	// rebuilt when the set of targets changes. An unknown name answers 404 in the
+	// handler.
+	mcp := limited(s.mcpLimit, s.cfg, s.handleMCP)
+	if multi {
+		mux.HandleFunc("/{target}/mcp", mcp)
+		mux.HandleFunc("/{target}/mcp/{rest...}", mcp)
+	} else {
+		mux.HandleFunc("/mcp", mcp)
+		mux.HandleFunc("/mcp/", mcp)
 	}
 
-	// The enrolment page, registered only when some target actually wants a
-	// credential of the user's own. It runs its own login rather than sharing the
-	// consent flow, which is bound to one MCP client's authorization and cannot
-	// answer "who is this browser" outside it.
-	if s.cfg.HasPerUserTargets() {
-		mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg, s.handleSettings))
-		mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg, s.handleSettingsLogout))
-		mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg, s.handleSettingsCallback))
-		mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg, s.handleSettingsSave))
+	// The enrolment page is always served, because whether any target wants a
+	// credential of the user's own can change while the process runs. It runs its
+	// own login rather than sharing the consent flow, which is bound to one MCP
+	// client's authorization and cannot answer "who is this browser" outside it.
+	mux.HandleFunc("GET /settings", limited(s.flowLimit, s.cfg, s.handleSettings))
+	mux.HandleFunc("POST /settings/logout", limited(s.credentialLimit, s.cfg, s.handleSettingsLogout))
+	mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg, s.handleSettingsCallback))
+	mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg, s.handleSettingsSave))
+
+	// The admin pages exist only when the feature is on. They run their own login
+	// and cookie. Their paths cannot meet a target's, because a target's routes
+	// end in /mcp and a target may not be named admin or settings in the database.
+	if s.cfg.AdminEnabled() {
+		mux.HandleFunc("GET /admin", limited(s.flowLimit, s.cfg, s.handleAdmin))
+		mux.HandleFunc("GET /admin/callback", limited(s.credentialLimit, s.cfg, s.handleAdminCallback))
+		mux.HandleFunc("GET /admin/targets/new", limited(s.flowLimit, s.cfg, s.handleAdminNew))
+		mux.HandleFunc("POST /admin/targets/new", limited(s.credentialLimit, s.cfg, s.handleAdminCreate))
+		mux.HandleFunc("GET /admin/targets/{name}/edit", limited(s.flowLimit, s.cfg, s.handleAdminEdit))
+		mux.HandleFunc("POST /admin/targets/{name}/edit", limited(s.credentialLimit, s.cfg, s.handleAdminUpdate))
+		mux.HandleFunc("POST /admin/targets/{name}/confirm", limited(s.credentialLimit, s.cfg, s.handleAdminConfirm))
+		mux.HandleFunc("GET /admin/targets/{name}/remove", limited(s.flowLimit, s.cfg, s.handleAdminRemoveForm))
+		mux.HandleFunc("POST /admin/targets/{name}/remove", limited(s.credentialLimit, s.cfg, s.handleAdminRemove))
+		mux.HandleFunc("POST /admin/logout", limited(s.credentialLimit, s.cfg, s.handleAdminLogout))
 	}
 
 	// Liveness only. It says this process is up, not that the provider or the
@@ -275,9 +308,10 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	// strength of it. A failure here skips the stray credential sweep, which
 	// would otherwise judge this process's own definitions unserved, but it
 	// does not stop the expiry sweep.
-	served := make([]StampedName, 0, len(s.cfg.Targets))
-	for _, target := range s.cfg.Targets {
-		served = append(served, StampedName{target.Name, target.Stamp()})
+	snap := s.reg.Load()
+	served := make([]StampedName, 0, len(snap.entries))
+	for _, e := range snap.entries {
+		served = append(served, StampedName{e.Target.Name, e.Stamp})
 	}
 	recorded := true
 	if err := s.store.RecordServedStamps(ctx, served); err != nil {
