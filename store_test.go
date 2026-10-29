@@ -592,7 +592,7 @@ func TestSweepRunsAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{store: s, cfg: &Config{}, reg: testRegistry(t)}
+	srv := &Server{store: s, cfg: &Config{}, reg: testRegistry(t, Target{Name: "plane", UpstreamMCP: "https://plane.example/mcp"})}
 	swept, cancel := context.WithCancel(ctx)
 	go srv.sweep(swept)
 
