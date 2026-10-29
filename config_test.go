@@ -372,3 +372,81 @@ func TestDefaultDisplayName(t *testing.T) {
 		}
 	}
 }
+
+// The transport rejects an invalid header at request time, which shows up as a
+// 502 on every call. validateTarget turns it into a boot failure instead.
+func TestValidateTargetStaticHeaders(t *testing.T) {
+	static := func(h map[string]string) Target {
+		return Target{Name: "plane", DisplayName: "Plane", Mode: CredStatic, StaticHeaders: h}
+	}
+
+	if err := validateTarget(static(map[string]string{"Authorization": "Bearer x", "x-workspace-slug": "acme"})); err != nil {
+		t.Fatalf("valid headers rejected: %v", err)
+	}
+
+	for name, h := range map[string]map[string]string{
+		"name with a space":       {"Bad Header": "v"},
+		"name with a separator":   {"X(Y)": "v"},
+		"value with a newline":    {"X-Test": "a\nb"},
+		"value with a NUL":        {"X-Test": "a\x00b"},
+		"names differing in case": {"Authorization": "a", "authorization": "b"},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			if err := validateTarget(static(h)); err == nil {
+				t.Fatalf("want an error for %v", h)
+			}
+		})
+	}
+
+	t.Run("a bad header in the environment fails parseTargets", func(t *testing.T) {
+		t.Setenv("TARGETS", "plane")
+		t.Setenv("TARGET_PLANE_UPSTREAM_MCP_URL", "http://plane:8211")
+		t.Setenv("TARGET_PLANE_CREDENTIAL_MODE", "static")
+		t.Setenv("TARGET_PLANE_STATIC_HEADERS", "Bad Header: v")
+		if _, err := parseTargets("https://proxy.example"); err == nil {
+			t.Fatal("want an error for an invalid header name")
+		}
+	})
+
+	t.Run("a bad header in the unnamed target fails parseTargets", func(t *testing.T) {
+		t.Setenv("UPSTREAM_MCP_URL", "http://plane:8211")
+		t.Setenv("UPSTREAM_STATIC_HEADERS", "Bad Header: v")
+		if _, err := parseTargets("https://proxy.example"); err == nil {
+			t.Fatal("want an error for an invalid header name")
+		}
+	})
+}
+
+func TestValidateTarget(t *testing.T) {
+	ok := Target{Name: "plane", DisplayName: "Plane", Mode: CredProviderToken}
+	if err := validateTarget(ok); err != nil {
+		t.Fatalf("valid target rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Target){
+		"bad name":              func(t *Target) { t.Name = "Plane" },
+		"empty display name":    func(t *Target) { t.DisplayName = " " },
+		"unknown mode":          func(t *Target) { t.Mode = "magic" },
+		"static without header": func(t *Target) { t.Mode = CredStatic },
+		"header without static": func(t *Target) { t.StaticHeaders = map[string]string{"A": "b"} },
+		"per_user without field": func(t *Target) {
+			t.Mode = CredPerUser
+		},
+		"field without per_user": func(t *Target) {
+			t.UserFields = []UserHeaderField{{Header: "X-Token", Label: "Token"}}
+		},
+		"duplicate fields": func(t *Target) {
+			t.Mode = CredPerUser
+			t.UserFields = []UserHeaderField{{Header: "X-Token", Label: "A"}, {Header: "x-token", Label: "B"}}
+		},
+		"empty group": func(t *Target) { t.AllowedGroups = []string{"ops", " "} },
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			bad := ok
+			mutate(&bad)
+			if err := validateTarget(bad); err == nil {
+				t.Fatal("want an error")
+			}
+		})
+	}
+}

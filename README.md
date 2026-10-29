@@ -266,6 +266,9 @@ UPSTREAM_STATIC_HEADERS: |
 ```
 
 Newlines separate the pairs, because header values routinely contain commas.
+Header names and values are checked at boot, and a name or value that is not a
+valid HTTP header stops the proxy from starting instead of failing every request
+later.
 
 The provider still authenticates every user, and the proxy still issues and
 validates its own tokens, so an unauthenticated caller gets nowhere. What

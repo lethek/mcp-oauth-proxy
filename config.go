@@ -363,6 +363,9 @@ func parseTargets(publicURL string) ([]Target, error) {
 		if err := checkTargetURL("UPSTREAM_MCP_URL", t.UpstreamMCP); err != nil {
 			return nil, err
 		}
+		if err := validateTarget(t); err != nil {
+			return nil, err
+		}
 		return []Target{t}, nil
 	}
 
@@ -377,8 +380,10 @@ func parseTargets(publicURL string) ([]Target, error) {
 		if name == "" {
 			continue
 		}
-		if !targetNamePattern.MatchString(name) {
-			return nil, fmt.Errorf("TARGETS: %q is not a valid target name (lowercase letters, digits and hyphens)", name)
+		// Checked before the variables are read, so a bad name is reported as
+		// such rather than as a missing TARGET_<NAME>_UPSTREAM_MCP_URL.
+		if err := validateTargetName(name); err != nil {
+			return nil, err
 		}
 		if seen[name] {
 			return nil, fmt.Errorf("TARGETS: %q is listed twice", name)
@@ -403,35 +408,19 @@ func parseTargets(publicURL string) ([]Target, error) {
 			return nil, err
 		}
 
-		switch t.Mode {
-		case "":
+		if t.Mode == "" {
 			t.Mode = CredProviderToken
-		case CredProviderToken, CredStatic, CredPerUser:
-		default:
-			return nil, fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static, per_user", p, t.Mode)
 		}
 
 		headers, err := parseStaticHeaders(p+"STATIC_HEADERS", os.Getenv(p+"STATIC_HEADERS"))
 		if err != nil {
 			return nil, err
 		}
-		if t.Mode == CredStatic && len(headers) == 0 {
-			return nil, fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
-		}
-		if t.Mode != CredStatic && len(headers) > 0 {
-			return nil, fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
-		}
 		t.StaticHeaders = headers
 
 		fields, err := parseUserHeaderFields(os.Getenv(p + "USER_HEADERS"))
 		if err != nil {
 			return nil, fmt.Errorf("%sUSER_HEADERS: %w", p, err)
-		}
-		if t.Mode == CredPerUser && len(fields) == 0 {
-			return nil, fmt.Errorf("%sUSER_HEADERS is required when %sCREDENTIAL_MODE is per_user", p, p)
-		}
-		if t.Mode != CredPerUser && len(fields) > 0 {
-			return nil, fmt.Errorf("%sUSER_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
 		}
 		t.UserFields = fields
 
@@ -447,6 +436,9 @@ func parseTargets(publicURL string) ([]Target, error) {
 			return nil, fmt.Errorf("%sALLOWED_GROUPS is set but names no groups", p)
 		}
 
+		if err := validateTarget(t); err != nil {
+			return nil, err
+		}
 		targets = append(targets, t)
 	}
 
@@ -479,30 +471,110 @@ func parseUserHeaderFields(raw string) ([]UserHeaderField, error) {
 	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
 		return nil, fmt.Errorf("not valid JSON: %w", err)
 	}
+	if err := validateUserFields(fields); err != nil {
+		return nil, err
+	}
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("names no fields")
+	}
+	return fields, nil
+}
+
+func validateUserFields(fields []UserHeaderField) error {
 	seen := map[string]bool{}
 	for i, f := range fields {
 		// Validated here rather than left to fail at request time, when the value
 		// would be rejected by the transport and surface to a user as a 502 on
 		// every call with nothing to point at.
 		if !httpguts.ValidHeaderFieldName(f.Header) {
-			return nil, fmt.Errorf("field %d has an invalid header name %q", i, f.Header)
+			return fmt.Errorf("field %d has an invalid header name %q", i, f.Header)
 		}
 		if strings.TrimSpace(f.Label) == "" {
-			return nil, fmt.Errorf("field %q has no label", f.Header)
+			return fmt.Errorf("field %q has no label", f.Header)
 		}
 		if !httpguts.ValidHeaderFieldValue(f.Prefix) {
-			return nil, fmt.Errorf("field %q has an invalid prefix", f.Header)
+			return fmt.Errorf("field %q has an invalid prefix", f.Header)
 		}
 		key := http.CanonicalHeaderKey(f.Header)
 		if seen[key] {
-			return nil, fmt.Errorf("field %q is listed twice", f.Header)
+			return fmt.Errorf("field %q is listed twice", f.Header)
 		}
 		seen[key] = true
 	}
-	if len(fields) == 0 {
-		return nil, fmt.Errorf("names no fields")
+	return nil
+}
+
+func validateTargetName(name string) error {
+	if !targetNamePattern.MatchString(name) {
+		return fmt.Errorf("TARGETS: %q is not a valid target name (lowercase letters, digits and hyphens)", name)
 	}
-	return fields, nil
+	return nil
+}
+
+// validateTarget holds the rules every target must meet, wherever it was
+// defined, so the environment parser and the admin handlers cannot drift apart.
+// The messages name the environment variables, which suits the boot path.
+func validateTarget(t Target) error {
+	p := "UPSTREAM_"
+	if t.Name != "" {
+		if err := validateTargetName(t.Name); err != nil {
+			return err
+		}
+		p = envPrefix(t.Name)
+	}
+	if strings.TrimSpace(t.DisplayName) == "" {
+		return fmt.Errorf("%sDISPLAY_NAME is empty", p)
+	}
+
+	switch t.Mode {
+	case CredProviderToken, CredStatic, CredPerUser:
+	default:
+		return fmt.Errorf("%sCREDENTIAL_MODE: %q is not one of provider_token, static, per_user", p, t.Mode)
+	}
+
+	// A name or value the transport rejects would otherwise surface as a 502 on
+	// every proxied call, with nothing to point at. RFC 9110 section 5.
+	// Names that differ only in case are one header, and a map would send
+	// whichever came first in iteration order.
+	canonical := map[string]bool{}
+	for name, value := range t.StaticHeaders {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return fmt.Errorf("%sSTATIC_HEADERS: %q is not a valid header name", p, name)
+		}
+		key := http.CanonicalHeaderKey(name)
+		if canonical[key] {
+			return fmt.Errorf("%sSTATIC_HEADERS: %s is listed twice", p, key)
+		}
+		canonical[key] = true
+		if !httpguts.ValidHeaderFieldValue(value) {
+			return fmt.Errorf("%sSTATIC_HEADERS: the value of %s is not a valid header value", p, name)
+		}
+	}
+	if t.Mode == CredStatic && len(t.StaticHeaders) == 0 {
+		return fmt.Errorf("%sSTATIC_HEADERS is required when %sCREDENTIAL_MODE is static", p, p)
+	}
+	if t.Mode != CredStatic && len(t.StaticHeaders) > 0 {
+		return fmt.Errorf("%sSTATIC_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
+	}
+
+	if err := validateUserFields(t.UserFields); err != nil {
+		return fmt.Errorf("%sUSER_HEADERS: %w", p, err)
+	}
+	if t.Mode == CredPerUser && len(t.UserFields) == 0 {
+		return fmt.Errorf("%sUSER_HEADERS is required when %sCREDENTIAL_MODE is per_user", p, p)
+	}
+	if t.Mode != CredPerUser && len(t.UserFields) > 0 {
+		return fmt.Errorf("%sUSER_HEADERS is set but %sCREDENTIAL_MODE is %s", p, p, t.Mode)
+	}
+
+	// An empty group would match a provider group with no name, or read as no
+	// restriction, either of which is not what a limited target means.
+	for _, g := range t.AllowedGroups {
+		if strings.TrimSpace(g) == "" {
+			return fmt.Errorf("%sALLOWED_GROUPS contains an empty group", p)
+		}
+	}
+	return nil
 }
 
 // Admits reports whether someone in these groups may authorize for the target.
