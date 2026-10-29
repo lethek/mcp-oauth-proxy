@@ -852,6 +852,38 @@ func TestSweepRemovesOldStampSeenRows(t *testing.T) {
 	}
 }
 
+// When recording the served stamps fails, the stray sweep must not run: the
+// credential below is old and stamp_seen has no row for it, so a sweep would
+// delete a definition this process is serving.
+func TestSweepOnceSkipsStraySweepWhenRecordingFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	srv := &Server{store: s, cfg: &Config{Targets: []Target{{Name: "plane", UpstreamMCP: "https://plane.example/mcp"}}}}
+	stamp := srv.cfg.Targets[0].Stamp()
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u','plane',$1,'\x01', now() - INTERVAL '14 days')`, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	// A trigger that rejects inserts makes RecordServedStamps fail while the
+	// stray sweep, which only reads stamp_seen, would still succeed.
+	if _, err := s.pool.Exec(ctx, `
+CREATE FUNCTION reject_stamp_seen() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'rejected'; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER reject_stamp_seen BEFORE INSERT ON stamp_seen FOR EACH ROW EXECUTE FUNCTION reject_stamp_seen();`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DROP TRIGGER reject_stamp_seen ON stamp_seen; DROP FUNCTION reject_stamp_seen();`)
+	})
+
+	srv.sweepOnce(ctx)
+
+	got, _ := s.EnrolledTargets(ctx, "u")
+	if _, present := got[StampedName{"plane", stamp}]; !present {
+		t.Error("credential for a served definition was deleted after recording failed")
+	}
+}
+
 // legacyCredentialsTable puts user_credentials back in the shape the previous
 // release created, in the default schema.
 func legacyCredentialsTable(t *testing.T, s *Store) {

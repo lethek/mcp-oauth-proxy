@@ -261,25 +261,36 @@ func (s *Server) sweep(ctx context.Context) {
 	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
 	for {
-		// Record what this process serves before anything is deleted on the
-		// strength of it. A failure here does not stop the sweeps.
-		served := make([]StampedName, 0, len(s.cfg.Targets))
-		for _, target := range s.cfg.Targets {
-			served = append(served, StampedName{target.Name, target.Stamp()})
-		}
-		if err := s.store.RecordServedStamps(ctx, served); err != nil {
-			slog.Warn("recording served stamps failed", "err", err)
-		}
-		if err := s.store.Sweep(ctx); err != nil {
-			slog.Warn("sweep failed", "err", err)
-		}
-		if err := s.store.SweepStrayCredentials(ctx); err != nil {
-			slog.Warn("stray credential sweep failed", "err", err)
-		}
+		s.sweepOnce(ctx)
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+	}
+}
+
+func (s *Server) sweepOnce(ctx context.Context) {
+	// Record what this process serves before anything is deleted on the
+	// strength of it. A failure here skips the stray credential sweep, which
+	// would otherwise judge this process's own definitions unserved, but it
+	// does not stop the expiry sweep.
+	served := make([]StampedName, 0, len(s.cfg.Targets))
+	for _, target := range s.cfg.Targets {
+		served = append(served, StampedName{target.Name, target.Stamp()})
+	}
+	recorded := true
+	if err := s.store.RecordServedStamps(ctx, served); err != nil {
+		recorded = false
+		slog.Warn("recording served stamps failed; skipping the stray credential sweep", "err", err)
+	}
+	if err := s.store.Sweep(ctx); err != nil {
+		slog.Warn("sweep failed", "err", err)
+	}
+	if !recorded {
+		return
+	}
+	if err := s.store.SweepStrayCredentials(ctx); err != nil {
+		slog.Warn("stray credential sweep failed", "err", err)
 	}
 }
