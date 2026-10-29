@@ -477,7 +477,12 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 		upstreamTok, err := s.currentUpstreamToken(r, sessionID, stamp)
 		if err != nil {
-			slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
+			// A session that is gone or whose target was replaced is expected, not a fault.
+			level := slog.LevelError
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrStaleTarget) {
+				level = slog.LevelWarn
+			}
+			slog.Log(r.Context(), level, "mcp: could not resolve the upstream token", "err", err, "session", sessionID)
 			s.challengeFor(w, t, "invalid_token", "the upstream credential for this session is no longer usable")
 			return
 		}
@@ -556,7 +561,9 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID, stamp string) 
 // briefly rather than taken as final.
 //
 // A revoked session is the exception. There is no row to write back to and
-// nothing of the session may be served, so ErrNotFound returns immediately.
+// nothing of the session may be served, so ErrNotFound returns immediately. So
+// does ErrStaleTarget: the target was replaced mid-refresh, the session is no
+// longer valid, and the write was refused.
 func (s *Server) persistRefreshed(ctx context.Context, sessionID, stamp string, tok UpstreamToken) error {
 	const attempts = 3
 	var err error
@@ -569,7 +576,7 @@ func (s *Server) persistRefreshed(ctx context.Context, sessionID, stamp string, 
 			}
 		}
 		err = s.updateSessionToken(ctx, sessionID, stamp, tok)
-		if err == nil || errors.Is(err, ErrNotFound) {
+		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrStaleTarget) {
 			return err
 		}
 		slog.Warn("could not persist the refreshed upstream token; retrying",

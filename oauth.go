@@ -455,11 +455,17 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, ok := targetForFlow(s.reg.Load(), flow)
-	if !ok {
+	// The same refusal whether the stamp mismatch is found here, against this
+	// replica's snapshot (a config target, or an admin edit it has seen), or
+	// under the database fence (an edit it has not).
+	stale := func() {
 		slog.Warn("callback: the flow no longer matches a target definition", "target", flow.Target)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "temporarily_unavailable",
 			"the server's configuration changed during sign-in; start again from your client")
+	}
+	target, ok := targetForFlow(s.reg.Load(), flow)
+	if !ok {
+		stale()
 		return
 	}
 
@@ -528,16 +534,37 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Checked before any session exists, so a refused caller holds nothing. An
 	// identity that could not be resolved has no groups and is refused too.
-	if !target.Admits(identity.Groups) {
+	//
+	// An admin target's allowed_groups can change without moving its stamp, so
+	// this snapshot's copy may be out of date. For those the check runs inside
+	// the fenced insert, against the groups the database holds now.
+	deny := func(allowed []string) {
 		slog.Warn("callback: user is not in a group allowed for the target", "target", target.Name,
-			"subject", identity.Label(), "groups", identity.Groups, "allowed", target.AllowedGroups)
+			"subject", identity.Label(), "groups", identity.Groups, "allowed", allowed)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "access_denied",
 			"your account is not allowed to use "+target.DisplayName)
+	}
+	if target.Source != SourceAdmin && !target.Admits(identity.Groups) {
+		deny(target.AllowedGroups)
 		return
 	}
 
 	sessionID := newSecret()
-	if err := s.createSession(r.Context(), sessionID, identity.Subject, flow.Resource, target, tok); err != nil {
+	// The response is written after the fence is released, never inside it.
+	var fenced []string
+	err = s.createSession(r.Context(), sessionID, identity.Subject, flow.Resource, target, tok, func(allowed []string) bool {
+		fenced = allowed
+		return Target{AllowedGroups: allowed}.Admits(identity.Groups)
+	})
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrNotAdmitted):
+		deny(fenced)
+		return
+	case errors.Is(err, ErrStaleTarget):
+		stale()
+		return
+	default:
 		slog.Error("callback: could not store session", "err", err)
 		s.redirectErr(w, r, flow.RedirectURI, flow.ClientState, "server_error", "could not store the session")
 		return
@@ -809,13 +836,13 @@ func (s *Server) sealUpstreamToken(stamp string, tok UpstreamToken) ([]byte, err
 	return s.sealer.seal(boundPurpose(purposeUpstreamToken, stamp), raw)
 }
 
-func (s *Server) createSession(ctx context.Context, sessionID, subject, resource string, target Target, tok UpstreamToken) error {
+func (s *Server) createSession(ctx context.Context, sessionID, subject, resource string, target Target, tok UpstreamToken, admits func(allowed []string) bool) error {
 	stamp := target.Stamp()
 	sealed, err := s.sealUpstreamToken(stamp, tok)
 	if err != nil {
 		return err
 	}
-	return s.store.CreateSession(ctx, sessionID, subject, resource, target.Name, stamp, sealed)
+	return s.store.CreateSession(ctx, sessionID, subject, resource, target.Name, stamp, sealed, admits)
 }
 
 func (s *Server) updateSessionToken(ctx context.Context, sessionID, stamp string, tok UpstreamToken) error {

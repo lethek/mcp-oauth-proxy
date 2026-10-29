@@ -1149,7 +1149,7 @@ func TestRefreshAbortsWhenTheSessionIsRevokedWhileWaiting(t *testing.T) {
 		RefreshToken: "stale-refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Hour),
 	}
-	if err := h.srv.createSession(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired); err != nil {
+	if err := h.srv.createSession(ctx, sessionID, "subject", h.srv.cfg.Targets[0].Resource, h.srv.cfg.Targets[0], expired, nil); err != nil {
 		t.Fatal(err)
 	}
 

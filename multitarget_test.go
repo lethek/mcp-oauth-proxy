@@ -113,7 +113,7 @@ func TestResourcelessTokenIsRefusedWithSeveralTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessionID := newSecret()
-	if err := h.srv.store.CreateSession(t.Context(), sessionID, "user-42", "", first.Name, first.Stamp(), sealed); err != nil {
+	if err := h.srv.store.CreateSession(t.Context(), sessionID, "user-42", "", first.Name, first.Stamp(), sealed, nil); err != nil {
 		t.Fatal(err)
 	}
 	access := newSecret()

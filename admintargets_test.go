@@ -135,6 +135,7 @@ func TestConfigReplicaAnswers503OnceAdminTargetTakesTheName(t *testing.T) {
 // does so without consuming the client's refresh token.
 func TestReplicaBehindAReplacementAnswers503AndKeepsRefreshToken(t *testing.T) {
 	h := newHarnessWith(t, adminTwoTargets)
+	h.srv.store.skipCleanup = true // the freshness check is under test, not the purge
 	created := h.createAdmin(h.adminTarget("gamma", "/alpha-upstream"))
 	h.rebuild()
 
@@ -202,6 +203,7 @@ func TestEditThatKeepsTheStampDoesNotRefuse(t *testing.T) {
 // The freshness rules for a per_user target hold at the credential read too.
 func TestPerUserCredentialReadRefusesWhenBehind(t *testing.T) {
 	h := newHarnessWith(t, adminPerUserTargets)
+	h.srv.store.skipCleanup = true // the freshness check is under test, not the purge
 	fields := []UserHeaderField{{Header: "Authorization", Label: "Token", Prefix: "Bearer "}}
 	in := Target{Name: "gamma", DisplayName: "Gamma", UpstreamMCP: h.provider.URL + "/alpha-upstream", Mode: CredPerUser, UserFields: fields}
 	created := h.createAdmin(in)
@@ -276,6 +278,7 @@ func TestRebuildRacingAnEditPublishesOneConsistentState(t *testing.T) {
 // consumes the refresh token, so the answer does not turn into a reuse alarm.
 func TestRefreshForReplacedOrRemovedTargetIsInvalidGrant(t *testing.T) {
 	h := newHarnessWith(t, adminTwoTargets)
+	h.srv.store.skipCleanup = true // the stamp check is under test, not the purge
 	created := h.createAdmin(h.adminTarget("gamma", "/alpha-upstream"))
 	h.rebuild()
 	clientID := h.register(testRedirect)

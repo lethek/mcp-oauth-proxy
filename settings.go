@@ -290,7 +290,15 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
-	if err := s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, stamp, sealed); err != nil {
+	err = s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, stamp, sealed)
+	if errors.Is(err, ErrStaleTarget) {
+		// The definition changed between the page loading and this write, on a
+		// replica that had not yet seen it. Nothing was stored.
+		renderSettingsError(w, http.StatusConflict, "Settings changed",
+			"This server's settings changed after the page was loaded. Reload the page and try again.")
+		return
+	}
+	if err != nil {
 		slog.Error("settings: could not store the credential", "err", err, "target", target.Name)
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
