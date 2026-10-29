@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -547,4 +549,24 @@ func TestAdminConfig(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+func TestAdminGroupsWarnsWithoutGroupsScope(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for scopes, want := range map[string]bool{"openid profile": true, "openid groups": false} {
+		buf.Reset()
+		adminEnv(t)
+		t.Setenv("ADMIN_GROUPS", "ops")
+		t.Setenv("UPSTREAM_SCOPES", scopes)
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("scopes %q: %v", scopes, err)
+		}
+		if got := strings.Contains(buf.String(), "groups scope"); got != want {
+			t.Errorf("scopes %q: warned = %v, want %v", scopes, got, want)
+		}
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -68,6 +69,31 @@ var upstreamTransport = &http.Transport{
 	ExpectContinueTimeout: 1 * time.Second,
 }
 
+// newAdminTransport is upstreamTransport for an admin-supplied URL, with the
+// destination policy enforced in the dialler. It sets no Proxy: with
+// HTTPS_PROXY in effect the guard would see only the egress proxy, which would
+// then resolve the real destination itself. A deployment that must use an
+// egress proxy has to enforce the equivalent policy there.
+//
+// requireListed is for plain http, where the dialled address must be in nets
+// even if it is public, so a name that later resolves elsewhere cannot carry
+// the credential across the internet in cleartext.
+func newAdminTransport(nets []netip.Prefix, requireListed bool) *http.Transport {
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   dialGuard(nets, requireListed),
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
 // maxInFlightPerTarget bounds how many requests may be forwarded to one
 // upstream at a time.
 //
@@ -120,8 +146,14 @@ func (b *boundHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The concurrency bound is applied here rather than by the caller so that no
 // construction site can forget it.
 func newReverseProxy(target *url.URL, enrolURL string) http.Handler {
+	return newReverseProxyWith(upstreamTransport, target, enrolURL)
+}
+
+// newReverseProxyWith is newReverseProxy over a transport of the caller's
+// choosing, which is how an admin target gets its dial guard.
+func newReverseProxyWith(rt http.RoundTripper, target *url.URL, enrolURL string) http.Handler {
 	p := &httputil.ReverseProxy{
-		Transport: upstreamTransport,
+		Transport: rt,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
@@ -181,6 +213,19 @@ func replaceWithEnrolAdvice(resp *http.Response, enrolURL string) error {
 	resp.Header.Del("Content-Encoding")
 	resp.Uncompressed = true
 	return nil
+}
+
+// errBehind means this replica's snapshot is older than the database's
+// definition of a target.
+var errBehind = errors.New("this replica has not seen the latest change to the target")
+
+// refuseBehind answers a request this replica cannot judge yet, and starts the
+// rebuild that will let it. The client keeps whatever it holds and retries.
+func (s *Server) refuseBehind(w http.ResponseWriter) {
+	s.reg.RequestRebuild()
+	w.Header().Set("Retry-After", "2")
+	oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable",
+		"this server's targets are being updated; retry shortly")
 }
 
 // notEnrolled tells the caller what to do about it. An MCP client surfaces
@@ -340,6 +385,15 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Freshness comes first. If this replica is behind about the target, every
+	// other answer it could give, including "invalid token", is a statement about
+	// a definition that may no longer exist. A session for another target is left
+	// to the checks below, which refuse it.
+	if s.reg.enabled() && ref.Target == t.Name && e.behind(ref.CurrentStamp) {
+		s.refuseBehind(w)
+		return
+	}
+
 	// The audience check. Without it a token minted for one target would work
 	// against every other, which would turn separate upstreams into one
 	// permission. A challenge naming THIS target's metadata is returned rather
@@ -373,9 +427,12 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		// 401 challenge: the caller authenticated correctly and re-authenticating
 		// will not help, so a challenge would only put a well-behaved client into a
 		// retry loop. The upstream is never contacted.
-		headers, err := s.userHeadersFor(r, sessionID, t)
+		headers, err := s.userHeadersFor(r, sessionID, e)
 		switch {
 		case err == nil:
+		case errors.Is(err, errBehind):
+			s.refuseBehind(w)
+			return
 		case errors.Is(err, ErrNotFound):
 			s.notEnrolled(w, t)
 			return

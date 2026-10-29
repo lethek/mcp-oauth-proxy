@@ -8,10 +8,15 @@ import (
 	"testing"
 )
 
+// testConfig is the smallest Config a snapshot build reads.
+func testConfig(targets ...Target) *Config {
+	return &Config{PublicURL: "https://p.example", Targets: targets}
+}
+
 // testRegistry serves targets for tests that build a Server by hand.
 func testRegistry(t *testing.T, targets ...Target) *registry {
 	t.Helper()
-	snap, err := newSnapshot(targets, "https://p.example", nil)
+	snap, err := newSnapshot(targets, testConfig(targets...), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +83,7 @@ func TestRebuildReusesProxyForUnchangedStamp(t *testing.T) {
 		{Name: "alpha", UpstreamMCP: "http://alpha.internal/mcp", Mode: CredProviderToken, Resource: "https://p.example/alpha/mcp"},
 		{Name: "beta", UpstreamMCP: "http://beta.internal/mcp", Mode: CredProviderToken, Resource: "https://p.example/beta/mcp"},
 	}
-	first, err := newSnapshot(targets, "https://p.example", nil)
+	first, err := newSnapshot(targets, testConfig(targets...), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +92,7 @@ func TestRebuildReusesProxyForUnchangedStamp(t *testing.T) {
 	next[1].UpstreamMCP = "http://beta.internal/moved"
 	// A field outside the stamp, which must not cost alpha its proxy.
 	next[0].DisplayName = "Renamed"
-	second, err := newSnapshot(next, "https://p.example", first)
+	second, err := newSnapshot(next, testConfig(next...), first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +201,26 @@ func TestPerUserTargetNeverReceivesProviderToken(t *testing.T) {
 }
 
 func TestNewSnapshotRefusesNoTargets(t *testing.T) {
-	if _, err := newSnapshot(nil, "https://p.example", nil); err == nil {
+	if _, err := newSnapshot(nil, testConfig(), nil); err == nil {
 		t.Error("an empty target list was accepted")
+	}
+}
+
+// A named deployment whose admin targets are all gone serves nothing, and every
+// accessor copes with that instead of indexing the first entry.
+func TestEmptyNamedSnapshotIsSafe(t *testing.T) {
+	cfg := &Config{PublicURL: "https://p.example", AdminSubjects: []string{"root"}}
+	snap, err := newSnapshot(nil, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.MultiTarget() {
+		t.Error("an admin deployment with no targets reads as unnamed")
+	}
+	if snap.HasPerUserTargets() || snap.ResourceList() != "" {
+		t.Error("an empty snapshot claims to serve something")
+	}
+	if _, ok := snap.TargetByResource("https://p.example/x/mcp"); ok {
+		t.Error("an empty snapshot resolved a resource")
 	}
 }

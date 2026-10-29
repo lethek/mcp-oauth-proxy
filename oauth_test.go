@@ -362,12 +362,24 @@ func newHarnessWith(t *testing.T, build targetBuilder) *harness {
 	cfg.Targets = build(cfg, h.provider.URL)
 	s.upstream = NewUpstream(cfg)
 
-	snap, snapErr := newSnapshot(cfg.Targets, cfg.PublicURL, nil)
-	if snapErr != nil {
-		t.Fatal(snapErr)
+	if cfg.AdminEnabled() {
+		// The builder switches the feature on by setting the admin fields, as the
+		// environment does.
+		store.EnableAdminTargets(seal, cfg.AllowedUpstreamHosts, cfg.AllowedUpstreamNetworks)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		s.reg = newAdminRegistry(ctx, cfg, store)
+		if err := s.reg.Rebuild(ctx); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		snap, snapErr := newSnapshot(cfg.Targets, cfg, nil)
+		if snapErr != nil {
+			t.Fatal(snapErr)
+		}
+		s.reg = &registry{}
+		s.reg.Store(snap)
 	}
-	s.reg = &registry{}
-	s.reg.Store(snap)
 
 	h.proxy.Config.Handler = s.routes()
 	h.proxy.Start()
