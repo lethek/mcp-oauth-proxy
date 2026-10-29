@@ -257,6 +257,21 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /settings/callback", limited(s.credentialLimit, s.cfg, s.handleSettingsCallback))
 	mux.HandleFunc("POST /settings", limited(s.credentialLimit, s.cfg, s.handleSettingsSave))
 
+	// The admin pages exist only when the feature is on. They run their own login
+	// and cookie. Their paths cannot meet a target's, because a target's routes
+	// end in /mcp and a target may not be named admin or settings in the database.
+	if s.cfg.AdminEnabled() {
+		mux.HandleFunc("GET /admin", limited(s.flowLimit, s.cfg, s.handleAdmin))
+		mux.HandleFunc("GET /admin/callback", limited(s.credentialLimit, s.cfg, s.handleAdminCallback))
+		mux.HandleFunc("GET /admin/targets/new", limited(s.flowLimit, s.cfg, s.handleAdminNew))
+		mux.HandleFunc("POST /admin/targets/new", limited(s.credentialLimit, s.cfg, s.handleAdminCreate))
+		mux.HandleFunc("GET /admin/targets/{name}/edit", limited(s.flowLimit, s.cfg, s.handleAdminEdit))
+		mux.HandleFunc("POST /admin/targets/{name}/edit", limited(s.credentialLimit, s.cfg, s.handleAdminUpdate))
+		mux.HandleFunc("POST /admin/targets/{name}/confirm", limited(s.credentialLimit, s.cfg, s.handleAdminConfirm))
+		mux.HandleFunc("GET /admin/targets/{name}/remove", limited(s.flowLimit, s.cfg, s.handleAdminRemoveForm))
+		mux.HandleFunc("POST /admin/targets/{name}/remove", limited(s.credentialLimit, s.cfg, s.handleAdminRemove))
+	}
+
 	// Liveness only. It says this process is up, not that the provider or the
 	// MCP server behind it are, so it can never take the pod down for their sake.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

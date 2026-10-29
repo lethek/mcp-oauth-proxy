@@ -1,0 +1,67 @@
+{{define "title"}}{{if .New}}Add server{{else}}Edit {{.Name}}{{end}}{{end}}
+{{define "content"}}
+<header class="page-head">
+  <h1>{{if .New}}Add a server{{else}}Edit {{.Name}}{{end}}</h1>
+  {{if not .New}}<p class="lede">Fields marked Replaces change where credentials are sent. Saving a change to one
+  signs everyone out of this server and deletes the credentials people saved for it. You will be asked to confirm first.</p>{{end}}
+</header>
+
+<section class="card">
+  {{if .Error}}<p class="banner banner-error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="{{.Action}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="row_id" value="{{.RowID}}">
+    <input type="hidden" name="revision" value="{{.Revision}}">
+
+    {{if .New}}<div class="field">
+      <label for="f-name">Name</label>
+      <input class="input" type="text" id="f-name" name="name" value="{{.Name}}" autocomplete="off" spellcheck="false" required>
+      <p class="hint">Lowercase letters, digits and hyphens. It becomes the address, /name/mcp, and cannot be changed later.</p>
+    </div>{{end}}
+
+    <div class="field">
+      <label for="f-display">Display name</label>
+      <input class="input" type="text" id="f-display" name="display_name" value="{{.Fields.Display}}" autocomplete="off" required>
+    </div>
+
+    <div class="field">
+      <label for="f-upstream">MCP server URL{{if not .New}} <span class="pill pill-warn">Replaces</span>{{end}}</label>
+      <input class="input" type="text" id="f-upstream" name="upstream_mcp" value="{{.Fields.Upstream}}" autocomplete="off" spellcheck="false" required>
+      <p class="hint">The host and port must be on the allowed list for this proxy.</p>
+    </div>
+
+    <div class="field">
+      <label for="f-mode">Credential mode{{if not .New}} <span class="pill pill-warn">Replaces</span>{{end}}</label>
+      <select class="input" id="f-mode" name="mode">
+        <option value="provider_token"{{if eq .Fields.Mode "provider_token"}} selected{{end}}>provider_token: forward the user's sign-in token</option>
+        <option value="static"{{if eq .Fields.Mode "static"}} selected{{end}}>static: send fixed headers</option>
+        <option value="per_user"{{if eq .Fields.Mode "per_user"}} selected{{end}}>per_user: each person saves their own</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="f-static">Static headers</label>
+      <textarea class="input" id="f-static" name="static_headers" autocomplete="off" spellcheck="false"></textarea>
+      <p class="hint">Static mode only. One per line as Name: Value.
+      {{if .HasStatic}}A value is stored and is never shown again. Leave this empty to keep it. It can be kept only if the URL and mode are unchanged.{{else}}Values are never shown again after saving.{{end}}</p>
+    </div>
+
+    <div class="field">
+      <label for="f-user">User fields{{if not .New}} <span class="pill pill-warn">Replaces</span>{{end}}</label>
+      <textarea class="input" id="f-user" name="user_fields" autocomplete="off" spellcheck="false">{{.Fields.UserFields}}</textarea>
+      <p class="hint">Per-user mode only. A JSON list such as [{"header": "Authorization", "label": "API token", "prefix": "Bearer "}].</p>
+    </div>
+
+    <div class="field">
+      <label for="f-groups">Allowed groups</label>
+      <input class="input" type="text" id="f-groups" name="allowed_groups" value="{{.Fields.Groups}}" autocomplete="off" spellcheck="false">
+      <p class="hint">Comma separated. Empty admits everyone the provider admits. Narrowing this does not end sessions that already exist.</p>
+    </div>
+
+    <div class="row">
+      <button type="submit" class="btn btn-primary">{{if .New}}Add server{{else}}Save changes{{end}}</button>
+      <a class="btn" href="/admin">Cancel</a>
+    </div>
+  </form>
+</section>
+{{end}}

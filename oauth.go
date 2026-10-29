@@ -376,6 +376,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		ClientName:      client.Name,
 		ClientID:        client.ID,
 		TargetName:      target.DisplayName,
+		TargetHost:      upstreamHost(target),
 		RedirectURI:     redirectURI,
 		FlowID:          flow.ID,
 		ConsentPath:     "/consent",

@@ -8,6 +8,10 @@
   <div class="facts">
     <dl>
       <div>
+        <dt>Server</dt>
+        <dd>{{.TargetName}}{{if .TargetHost}} <span class="mono muted">{{.TargetHost}}</span>{{end}}</dd>
+      </div>
+      <div>
         <dt>Application</dt>
         <dd>{{.ClientName}}</dd>
       </div>

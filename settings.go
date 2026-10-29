@@ -104,7 +104,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	identity := s.identityFrom(r)
 	if identity.Subject == "" {
-		s.startSettingsLogin(w, r)
+		s.startLogin(w, r, flowKindSettings, s.settingsRedirectURI())
 		return
 	}
 
@@ -121,7 +121,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if t.Mode != CredPerUser {
 			continue
 		}
-		row := targetRow{Name: t.Name, Display: t.DisplayName, Fields: t.UserFields, Stamp: t.Stamp()}
+		row := targetRow{Name: t.Name, Display: t.DisplayName, Host: upstreamHost(t), Fields: t.UserFields, Stamp: t.Stamp()}
 		if at, ok := enrolled[StampedName{t.Name, row.Stamp}]; ok {
 			row.Enrolled = true
 			row.UpdatedAt = at.UTC().Format("2006-01-02 15:04 MST")
@@ -133,18 +133,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	renderSettings(w, view)
 }
 
-func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
+// startLogin sends the browser to the provider. The settings page and the admin
+// page both use it, each with its own kind and callback address.
+func (s *Server) startLogin(w http.ResponseWriter, r *http.Request, kind, redirectURI string) {
 	meta, err := s.upstream.Meta(r.Context())
 	if err != nil {
-		slog.Error("settings: provider discovery failed", "err", err)
+		slog.Error(kind+": provider discovery failed", "err", err)
 		renderError(w, http.StatusBadGateway, "Sign-in unavailable", "The identity provider could not be reached. Try again in a moment.")
 		return
 	}
 
 	flowID := newSecret()
 	verifier := newSecret()
-	if err := s.store.CreateSettingsFlow(r.Context(), flowID, verifier, s.browserSecret(w, r)); err != nil {
-		slog.Error("settings: could not start a login", "err", err)
+	if err := s.store.CreateSettingsFlow(r.Context(), flowID, verifier, s.browserSecret(w, r), kind); err != nil {
+		slog.Error(kind+": could not start a login", "err", err)
 		renderError(w, http.StatusInternalServerError, "Something went wrong", "The sign-in could not be started. Try again in a moment.")
 		return
 	}
@@ -156,7 +158,7 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	q := dest.Query()
 	q.Set("client_id", s.cfg.UpstreamClientID)
-	q.Set("redirect_uri", s.settingsRedirectURI())
+	q.Set("redirect_uri", redirectURI)
 	q.Set("response_type", "code")
 	q.Set("scope", s.cfg.UpstreamScopes)
 	q.Set("state", flowID)
@@ -167,31 +169,44 @@ func (s *Server) startSettingsLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, dest.String(), http.StatusFound)
 }
 
-func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) {
+// finishLogin redeems the callback of a login started by startLogin and says who
+// signed in. On any failure it has already answered through fail and returns
+// false.
+func (s *Server) finishLogin(r *http.Request, kind, redirectURI string, fail func(status int, heading, message string)) (UserIdentity, bool) {
 	q := r.URL.Query()
 
-	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r))
+	verifier, err := s.store.TakeSettingsFlow(r.Context(), q.Get("state"), s.readBrowserSecret(r), kind)
 	if err != nil {
-		renderSettingsError(w, http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the settings page again to sign in.")
-		return
+		fail(http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was already used. Open the "+kind+" page again to sign in.")
+		return UserIdentity{}, false
 	}
 	if e := q.Get("error"); e != "" {
-		renderSettingsError(w, http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
-		return
+		fail(http.StatusForbidden, "Sign-in refused", "The identity provider refused the sign-in: "+e)
+		return UserIdentity{}, false
 	}
 
-	tok, err := s.upstream.ExchangeWithRedirect(r.Context(), q.Get("code"), verifier, s.settingsRedirectURI())
+	tok, err := s.upstream.ExchangeWithRedirect(r.Context(), q.Get("code"), verifier, redirectURI)
 	if err != nil {
-		slog.Error("settings: upstream exchange failed", "err", err)
-		renderSettingsError(w, http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
-		return
+		slog.Error(kind+": upstream exchange failed", "err", err)
+		fail(http.StatusBadGateway, "Sign-in failed", "The identity provider rejected the sign-in. Try again.")
+		return UserIdentity{}, false
 	}
 
 	// Without a stable subject there is nothing to key a credential on.
 	identity, err := s.upstream.Identity(r.Context(), tok.AccessToken)
 	if err != nil {
-		slog.Error("settings: could not resolve the user", "err", err)
-		renderSettingsError(w, http.StatusBadGateway, "Sign-in failed", "The identity provider would not say who you are, so credentials cannot be stored.")
+		slog.Error(kind+": could not resolve the user", "err", err)
+		fail(http.StatusBadGateway, "Sign-in failed", "The identity provider would not say who you are.")
+		return UserIdentity{}, false
+	}
+	return identity, true
+}
+
+func (s *Server) handleSettingsCallback(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.finishLogin(r, flowKindSettings, s.settingsRedirectURI(), func(status int, heading, message string) {
+		renderSettingsError(w, status, heading, message)
+	})
+	if !ok {
 		return
 	}
 
@@ -342,6 +357,7 @@ type targetRow struct {
 	// Display is only ever shown.
 	Name    string
 	Display string
+	Host    string
 	// Stamp is posted back so a save can tell the definition it was rendered
 	// under from the one being served when it arrives.
 	Stamp     string

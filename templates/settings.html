@@ -21,7 +21,7 @@ your identity provider, you will be signed straight back in.</p>{{end}}
 {{range .Targets}}{{$name := .Name}}
 <section class="card">
   <div class="card-head">
-    <h2>{{.Display}}</h2>
+    <h2>{{.Display}}{{if .Host}} <span class="mono muted">{{.Host}}</span>{{end}}</h2>
     {{if .Enrolled}}<span class="pill pill-ok">Configured</span>{{else}}<span class="pill">Not configured</span>{{end}}
   </div>
   {{if .Enrolled}}<p class="muted">Last updated {{.UpdatedAt}}. Saved values are never shown again, so enter a new one to replace it.</p>

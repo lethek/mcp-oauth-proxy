@@ -135,6 +135,10 @@ a { color: var(--accent); }
   font-size: .75rem; font-weight: 700; letter-spacing: .02em;
 }
 .pill-ok { background: var(--ok-bg); border-color: transparent; color: var(--ok-text); }
+.pill-warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+.banner-error { background: var(--danger-bg); color: var(--danger); }
+.section { margin: 1.5rem .25rem 0; font-size: 1.125rem; }
+textarea.input { min-height: 5rem; resize: vertical; }
 .field { margin-top: 1rem; }
 label { display: block; margin: 0 0 .375rem; font-size: .9375rem; font-weight: 600; }
 .input {

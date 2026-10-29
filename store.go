@@ -300,6 +300,9 @@ CREATE TABLE IF NOT EXISTS settings_flows (
     browser_hash      BYTEA NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Which page started the login, so a flow cannot be redeemed at the other
+-- page's callback. Rows from before the column belong to the settings page.
+ALTER TABLE settings_flows ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'settings';
 
 -- Targets an admin manages from the web page, beside the ones in the
 -- environment. stamp is maintained by the application on every save, and
@@ -870,24 +873,31 @@ func (s *Store) DeleteUserCredential(ctx context.Context, subject, target, stamp
 
 // ---------- settings login ----------
 
-func (s *Store) CreateSettingsFlow(ctx context.Context, id, verifier, browserSecret string) error {
+// The login pages that share settings_flows.
+const (
+	flowKindSettings = "settings"
+	flowKindAdmin    = "admin"
+)
+
+func (s *Store) CreateSettingsFlow(ctx context.Context, id, verifier, browserSecret, kind string) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO settings_flows (id, upstream_verifier, browser_hash) VALUES ($1,$2,$3)`,
-		id, verifier, hashToken(browserSecret))
+		`INSERT INTO settings_flows (id, upstream_verifier, browser_hash, kind) VALUES ($1,$2,$3,$4)`,
+		id, verifier, hashToken(browserSecret), kind)
 	return err
 }
 
-// TakeSettingsFlow consumes the flow, demanding the same browser that started it.
-// Single use by deletion, so a replayed callback finds nothing.
-func (s *Store) TakeSettingsFlow(ctx context.Context, id, browserSecret string) (verifier string, err error) {
+// TakeSettingsFlow consumes the flow, demanding the same browser that started it
+// and the same kind of login. Single use by deletion, so a replayed callback
+// finds nothing, and a flow of the wrong kind is left for its own callback.
+func (s *Store) TakeSettingsFlow(ctx context.Context, id, browserSecret, kind string) (verifier string, err error) {
 	if browserSecret == "" {
 		return "", ErrNotFound
 	}
 	err = s.pool.QueryRow(ctx,
 		`DELETE FROM settings_flows
-		 WHERE id=$1 AND created_at > now() - $2::interval AND browser_hash=$3
+		 WHERE id=$1 AND created_at > now() - $2::interval AND browser_hash=$3 AND kind=$4
 		 RETURNING upstream_verifier`,
-		id, flowTTL.String(), hashToken(browserSecret)).Scan(&verifier)
+		id, flowTTL.String(), hashToken(browserSecret), kind).Scan(&verifier)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -1170,7 +1180,37 @@ func (s *Store) checkAdminTarget(t Target) error {
 	if err := validateTarget(t); err != nil {
 		return err
 	}
-	return validateAdminUpstream(t.UpstreamMCP, s.admin.hosts, s.admin.nets)
+	if err := validateAdminUpstream(t.UpstreamMCP, s.admin.hosts, s.admin.nets); err != nil {
+		return fmt.Errorf("Upstream MCP URL: %w", err)
+	}
+	return nil
+}
+
+// InvalidTargetError marks a refusal the person can fix by changing what they
+// entered, as opposed to a failure of the store. Its text is the cause's.
+type InvalidTargetError struct{ Err error }
+
+func (e *InvalidTargetError) Error() string { return e.Err.Error() }
+func (e *InvalidTargetError) Unwrap() error { return e.Err }
+
+// GetTarget reads one admin target row, or ErrNotFound.
+func (s *Store) GetTarget(ctx context.Context, name string) (AdminTarget, error) {
+	a, err := scanAdminTarget(s.pool.QueryRow(ctx, `SELECT `+adminColumns+` FROM targets WHERE name=$1`, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AdminTarget{}, ErrNotFound
+	}
+	return a, err
+}
+
+// TargetUsage counts what a replacement or removal of the definition with this
+// stamp would end: the sessions issued under it and the per-user credentials
+// enrolled under it.
+func (s *Store) TargetUsage(ctx context.Context, name, stamp string) (sessions, enrolments int, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT (SELECT count(*) FROM sessions WHERE target=$1 AND stamp=$2),
+		        (SELECT count(*) FROM user_credentials WHERE target=$1 AND stamp=$2)`,
+		name, stamp).Scan(&sessions, &enrolments)
+	return sessions, enrolments, err
 }
 
 // sealedFor returns the columns that depend on the mode. A static value is only
@@ -1218,7 +1258,7 @@ func (s *Store) CreateTarget(ctx context.Context, t Target, by string) (AdminTar
 	}
 	t = normaliseAdminTarget(t)
 	if err := s.checkAdminTarget(t); err != nil {
-		return AdminTarget{}, err
+		return AdminTarget{}, &InvalidTargetError{err}
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -1304,11 +1344,11 @@ func (s *Store) UpdateTarget(ctx context.Context, key TargetKey, t Target, by st
 			return AdminTarget{}, ErrStaticValueRequired
 		}
 		if t.StaticHeaders, err = s.openStatic(cur); err != nil {
-			return AdminTarget{}, fmt.Errorf("the stored static value cannot be read, so supply a new one: %w", err)
+			return AdminTarget{}, &InvalidTargetError{fmt.Errorf("the stored static value cannot be read, so supply a new one: %w", err)}
 		}
 	}
 	if err := s.checkAdminTarget(t); err != nil {
-		return AdminTarget{}, err
+		return AdminTarget{}, &InvalidTargetError{err}
 	}
 
 	t.Generation = cur.Target.Generation
