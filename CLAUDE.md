@@ -36,7 +36,7 @@ The proxy adds an OAuth 2.1 authorization server in front of MCP servers that ha
 - `oauth.go` serves registration, `/authorize`, `/callback`, `/token`, `/revoke` and the metadata documents. `consent.go` renders the consent page that every flow must pass before it reaches the provider.
 - `proxy.go` serves `handleMCP`. It checks the bearer token, refreshes the provider token if needed, swaps in the target's credential and reverse-proxies to the MCP server.
 - `settings.go` serves `/settings`, where users enrol their own credentials for `per_user` targets. It runs its own login, separate from the consent flow.
-- `store.go` holds all SQL. The schema is one idempotent `CREATE TABLE IF NOT EXISTS` / `ALTER` block that runs on every boot, with no migration framework. Single-use codes and refresh rotation with reuse detection are enforced in SQL. It also holds `targets` and `targets_version`, the `FOR SHARE` fences for admin-target writes, the freshness join, and the purge of stale `admin:` rows.
+- `store.go` holds all SQL. The schema is one idempotent `CREATE TABLE IF NOT EXISTS` / `ALTER` block that runs on every boot, with no migration framework. Single-use codes and refresh rotation with reuse detection are enforced in SQL. It also holds `targets` and `targets_version`, the `FOR SHARE` fences for admin-target writes, the freshness join, and the purge of stale `admin:` rows. `sessions`, `flows` and `user_credentials` are indexed by `(target, stamp)`.
 - `crypto.go` holds the `sealer` (AES-256-GCM). It authenticates a purpose string, which is bound to a target stamp with `boundPurpose`.
 - `cimd.go` fetches Client ID Metadata Documents. It blocks private addresses at dial time, refuses redirects and caps the response size.
 

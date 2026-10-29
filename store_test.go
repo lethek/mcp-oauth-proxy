@@ -966,3 +966,27 @@ func TestMigrateWithAnEmptySchemaFirstOnTheSearchPath(t *testing.T) {
 		t.Fatalf("a second stamp for the same user and target must coexist: %v", err)
 	}
 }
+
+// The admin page and a target edit filter these tables by (target, stamp), and
+// user_credentials' key leads with subject. Booting twice also proves the
+// statements are idempotent, since they run on every start.
+func TestTargetStampIndexesExistAndBootIsRepeatable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	again, err := NewStore(ctx, os.Getenv("TEST_DATABASE_URL"), time.Hour, time.Hour)
+	if err != nil {
+		t.Fatalf("a second NewStore against a migrated database must succeed: %v", err)
+	}
+	again.Close()
+
+	for _, name := range []string{"sessions_target_stamp_idx", "flows_target_stamp_idx", "user_credentials_target_stamp_idx"} {
+		var n int
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Errorf("index %s is missing after NewStore", name)
+		}
+	}
+}

@@ -441,6 +441,7 @@ If a target's stamp changes, they stop working for that target.
   running.** Finish the rollout first. After the first new replica starts, an older
   replica cannot save a per-user credential, because the table's key has changed
   and its save fails.
+- **The first start after this release builds three indexes** on `sessions`, `flows` and `user_credentials`. A plain `CREATE INDEX` blocks writes to each table while it builds, which is brief because these tables are bounded by session lifetime.
 - **One database belongs to one deployment.** A stored credential for a
   definition is deleted once it has not been saved for 7 days and no process
   has served that definition for 7 days. Two deployments with different targets

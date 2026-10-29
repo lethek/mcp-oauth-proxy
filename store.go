@@ -342,6 +342,14 @@ CREATE INDEX IF NOT EXISTS refresh_tokens_session_idx ON refresh_tokens (session
 CREATE INDEX IF NOT EXISTS access_tokens_client_idx  ON access_tokens (client_id);
 CREATE INDEX IF NOT EXISTS refresh_tokens_client_idx ON refresh_tokens (client_id);
 CREATE INDEX IF NOT EXISTS flows_client_idx          ON flows (client_id);
+
+-- The admin page counts rows per (target, stamp), and a target edit purges the
+-- rows of one target. user_credentials cannot use its key for either because
+-- subject leads it. The sweep's purge of every orphaned admin row reads all
+-- admin rows whatever the indexes, so these do not serve it.
+CREATE INDEX IF NOT EXISTS sessions_target_stamp_idx         ON sessions (target, stamp);
+CREATE INDEX IF NOT EXISTS flows_target_stamp_idx            ON flows (target, stamp);
+CREATE INDEX IF NOT EXISTS user_credentials_target_stamp_idx ON user_credentials (target, stamp);
 `)
 	return err
 }
