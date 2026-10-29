@@ -107,12 +107,13 @@ func TestResourcelessTokenIsRefusedWithSeveralTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := h.srv.sealer.seal(purposeUpstreamToken, raw)
+	first := h.srv.cfg.Targets[0]
+	sealed, err := h.srv.sealer.seal(boundPurpose(purposeUpstreamToken, first.Stamp()), raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sessionID := newSecret()
-	if err := h.srv.store.CreateSession(t.Context(), sessionID, "user-42", "", sealed); err != nil {
+	if err := h.srv.store.CreateSession(t.Context(), sessionID, "user-42", "", first.Name, first.Stamp(), sealed); err != nil {
 		t.Fatal(err)
 	}
 	access := newSecret()

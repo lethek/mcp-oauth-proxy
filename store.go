@@ -71,6 +71,30 @@ func NewStore(ctx context.Context, url string, refreshTTL, sessionTTL time.Durat
 
 func (s *Store) Close() { s.pool.Close() }
 
+// credentialKeyMigration rewrites the key of user_credentials in a database
+// created before stamps, which keyed it on (subject, target). The advisory lock
+// lets two replicas boot together without both rewriting the key.
+//
+// The table is found with a regclass cast, which resolves through search_path
+// exactly as the statements around it do. Asking information_schema for
+// current_schema() instead can look in a different schema than they use.
+const credentialKeyMigration = `
+DO $$
+DECLARE
+    pk_name text;
+    pk_cols int;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('mcp-oauth-proxy-credential-key'));
+    SELECT conname, cardinality(conkey) INTO pk_name, pk_cols
+      FROM pg_constraint
+     WHERE conrelid = 'user_credentials'::regclass AND contype = 'p';
+    IF pk_cols = 2 THEN
+        EXECUTE format('ALTER TABLE user_credentials DROP CONSTRAINT %I', pk_name);
+        ALTER TABLE user_credentials ADD PRIMARY KEY (subject, target, stamp);
+    END IF;
+END $$;
+`
+
 // migrate is deliberately a single idempotent statement block rather than a
 // migration framework. The schema is small and this runs on every boot. The
 // ALTERs bring a database created by an earlier version up to date.
@@ -96,6 +120,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS resource TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS target TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS stamp  TEXT NOT NULL DEFAULT '';
 
 -- An in-flight authorization: created when the client hits /authorize, marked
 -- approved when the user accepts at /consent, and consumed when the upstream
@@ -122,6 +148,8 @@ ALTER TABLE flows ADD COLUMN IF NOT EXISTS browser_hash BYTEA;
 -- time it is enforced: with several targets it decides which upstream a token
 -- may be used against. Empty means a single-target deployment that never asked.
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS resource TEXT NOT NULL DEFAULT '';
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS target TEXT NOT NULL DEFAULT '';
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS stamp  TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS auth_codes (
     code_hash      BYTEA PRIMARY KEY,
@@ -154,17 +182,30 @@ ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used BOOLEAN NOT NULL DEFAUL
 ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
 
 -- What a user supplied for themselves, for a target whose MCP server wants its
--- own credential rather than the provider's token. Keyed on (subject, target)
--- because one person may hold a different credential at each.
+-- own credential rather than the provider's token. Keyed on (subject, target,
+-- stamp) because one person may hold a different credential at each target, and
+-- at each definition of it.
 --
 -- No foreign key to sessions: a credential outlives any single authorization and
 -- must survive the user re-authorising.
 CREATE TABLE IF NOT EXISTS user_credentials (
     subject        TEXT NOT NULL,
     target         TEXT NOT NULL,
+    stamp          TEXT NOT NULL DEFAULT '',
     sealed_headers BYTEA NOT NULL,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (subject, target)
+    PRIMARY KEY (subject, target, stamp)
+);
+ALTER TABLE user_credentials ADD COLUMN IF NOT EXISTS stamp TEXT NOT NULL DEFAULT '';
+`+credentialKeyMigration+`
+-- When any process last served each (target, stamp). The stray credential sweep
+-- reads it so that a definition a rolling deploy, canary or rollback still
+-- serves elsewhere does not lose its credentials.
+CREATE TABLE IF NOT EXISTS stamp_seen (
+    target  TEXT NOT NULL,
+    stamp   TEXT NOT NULL,
+    seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (target, stamp)
 );
 
 -- An in-flight login for the enrolment page. Separate from flows because there
@@ -229,17 +270,23 @@ type Flow struct {
 	// to /callback so the session it creates records the right audience.
 	Resource string
 
+	// Target and Stamp are the name and stamp of the definition /authorize
+	// resolved, so the callback can refuse a flow whose definition has since
+	// changed.
+	Target string
+	Stamp  string
+
 	// BrowserSecret ties this flow to the browser that was shown the consent
 	// page. Only the hash is stored. It is write-only: CreateFlow reads it and
 	// nothing ever returns it, so a caller cannot accidentally leak it back out.
 	BrowserSecret string
 }
 
-const flowColumns = `id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, resource`
+const flowColumns = `id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, resource, target, stamp`
 
 func scanFlow(row pgx.Row) (Flow, error) {
 	var f Flow
-	err := row.Scan(&f.ID, &f.ClientID, &f.RedirectURI, &f.ClientState, &f.CodeChallenge, &f.UpstreamVerifier, &f.Resource)
+	err := row.Scan(&f.ID, &f.ClientID, &f.RedirectURI, &f.ClientState, &f.CodeChallenge, &f.UpstreamVerifier, &f.Resource, &f.Target, &f.Stamp)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return f, ErrNotFound
 	}
@@ -248,10 +295,10 @@ func scanFlow(row pgx.Row) (Flow, error) {
 
 func (s *Store) CreateFlow(ctx context.Context, f Flow) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO flows (id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, resource, browser_hash)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		`INSERT INTO flows (id, client_id, redirect_uri, client_state, code_challenge, upstream_verifier, resource, target, stamp, browser_hash)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		f.ID, f.ClientID, f.RedirectURI, f.ClientState, f.CodeChallenge, f.UpstreamVerifier,
-		f.Resource, hashToken(f.BrowserSecret))
+		f.Resource, f.Target, f.Stamp, hashToken(f.BrowserSecret))
 	return err
 }
 
@@ -301,18 +348,21 @@ func (s *Store) TakeApprovedFlow(ctx context.Context, id string) (Flow, error) {
 
 // ---------- sessions ----------
 
-func (s *Store) CreateSession(ctx context.Context, id, subject, resource string, sealedToken []byte) error {
+func (s *Store) CreateSession(ctx context.Context, id, subject, resource, target, stamp string, sealedToken []byte) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO sessions (id, subject, resource, upstream_token) VALUES ($1,$2,$3,$4)`,
-		id, subject, resource, sealedToken)
+		`INSERT INTO sessions (id, subject, resource, target, stamp, upstream_token) VALUES ($1,$2,$3,$4,$5,$6)`,
+		id, subject, resource, target, stamp, sealedToken)
 	return err
 }
 
-func (s *Store) SessionToken(ctx context.Context, id string) ([]byte, error) {
+// SessionToken returns the sealed provider token only to a caller that names the
+// stamp the session was created under. An empty stamp never matches.
+func (s *Store) SessionToken(ctx context.Context, id, stamp string) ([]byte, error) {
 	var b []byte
 	err := s.pool.QueryRow(ctx,
-		`SELECT upstream_token FROM sessions WHERE id=$1 AND created_at > now() - $2::interval`,
-		id, s.sessionTTL.String()).Scan(&b)
+		`SELECT upstream_token FROM sessions
+		 WHERE id=$1 AND stamp=$2 AND stamp <> '' AND created_at > now() - $3::interval`,
+		id, stamp, s.sessionTTL.String()).Scan(&b)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -322,9 +372,10 @@ func (s *Store) SessionToken(ctx context.Context, id string) ([]byte, error) {
 // UpdateSessionToken reports ErrNotFound when the session has gone. An UPDATE
 // that matches no rows is not an error to Postgres, so without this a write
 // against a revoked session looks like success and the caller carries on.
-func (s *Store) UpdateSessionToken(ctx context.Context, id string, sealedToken []byte) error {
+func (s *Store) UpdateSessionToken(ctx context.Context, id, stamp string, sealedToken []byte) error {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE sessions SET upstream_token=$2, updated_at=now() WHERE id=$1`, id, sealedToken)
+		`UPDATE sessions SET upstream_token=$3, updated_at=now() WHERE id=$1 AND stamp=$2 AND stamp <> ''`,
+		id, stamp, sealedToken)
 	if err != nil {
 		return err
 	}
@@ -391,22 +442,34 @@ func (s *Store) CreateAccessToken(ctx context.Context, token, sessionID, clientI
 	return err
 }
 
+// SessionRef is what a proxied request needs to know about the session behind
+// its token, fetched in the one query so that path pays no second round trip.
+type SessionRef struct {
+	ID       string
+	Resource string
+	Target   string
+	Stamp    string
+}
+
 // LookupAccessToken also enforces the session's absolute lifetime, so an access
 // token minted just before that deadline does not outlive it.
 //
-// It returns the session's resource in the same query, because every proxied
-// request needs it to check the token's audience and a second round trip on that
-// path would be paid on every call.
-func (s *Store) LookupAccessToken(ctx context.Context, token string) (sessionID, resource string, err error) {
-	err = s.pool.QueryRow(ctx,
-		`SELECT t.session_id, s.resource FROM access_tokens t
+// It returns the session's resource, target and stamp in the same query, because
+// every proxied request needs them to check the token's audience and that the
+// target is still the one the session was issued for. A session with an empty
+// stamp, one that predates stamps, is never returned.
+func (s *Store) LookupAccessToken(ctx context.Context, token string) (SessionRef, error) {
+	var ref SessionRef
+	err := s.pool.QueryRow(ctx,
+		`SELECT t.session_id, s.resource, s.target, s.stamp FROM access_tokens t
 		 JOIN sessions s ON s.id = t.session_id
-		 WHERE t.token_hash=$1 AND t.expires_at > now() AND s.created_at > now() - $2::interval`,
-		hashToken(token), s.sessionTTL.String()).Scan(&sessionID, &resource)
+		 WHERE t.token_hash=$1 AND t.expires_at > now() AND s.stamp <> ''
+		   AND s.created_at > now() - $2::interval`,
+		hashToken(token), s.sessionTTL.String()).Scan(&ref.ID, &ref.Resource, &ref.Target, &ref.Stamp)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", "", ErrNotFound
+		return SessionRef{}, ErrNotFound
 	}
-	return sessionID, resource, err
+	return ref, err
 }
 
 // CreateTokenPair writes both credentials of one grant in a single
@@ -565,28 +628,36 @@ func (s *Store) SessionForToken(ctx context.Context, token string) (string, erro
 
 // ---------- per-user credentials ----------
 
-// PutUserCredential replaces whatever the subject had for this target. Replacing
-// rather than erroring on a duplicate is the point: rotating a leaked token is
-// the same action as setting one for the first time.
-func (s *Store) PutUserCredential(ctx context.Context, subject, target string, sealed []byte) error {
+// StampedName is a target name together with the stamp a credential was saved
+// under.
+type StampedName struct{ Name, Stamp string }
+
+// PutUserCredential replaces whatever the subject had for this target under this
+// stamp. Replacing rather than erroring on a duplicate is the point: rotating a
+// leaked token is the same action as setting one for the first time.
+func (s *Store) PutUserCredential(ctx context.Context, subject, target, stamp string, sealed []byte) error {
+	if stamp == "" {
+		return errors.New("a credential needs the stamp of the target it is for")
+	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ($1,$2,$3)
-		 ON CONFLICT (subject, target)
+		`INSERT INTO user_credentials (subject, target, stamp, sealed_headers) VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (subject, target, stamp)
 		 DO UPDATE SET sealed_headers = EXCLUDED.sealed_headers, updated_at = now()`,
-		subject, target, sealed)
+		subject, target, stamp, sealed)
 	return err
 }
 
 // UserCredentialForSession resolves a session straight to its owner's credential
 // for a target, in one query. Every proxied request in per_user mode needs it, so
 // fetching the subject and then the credential would cost a second round trip on
-// that path.
+// that path. The credential must have been saved under the stamp the session was
+// issued under.
 func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target string) ([]byte, error) {
 	var sealed []byte
 	err := s.pool.QueryRow(ctx,
 		`SELECT c.sealed_headers FROM sessions s
-		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2
-		 WHERE s.id = $1 AND s.subject <> ''`,
+		 JOIN user_credentials c ON c.subject = s.subject AND c.target = $2 AND c.stamp = s.stamp
+		 WHERE s.id = $1 AND s.subject <> '' AND s.stamp <> ''`,
 		sessionID, target).Scan(&sealed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -595,29 +666,32 @@ func (s *Store) UserCredentialForSession(ctx context.Context, sessionID, target 
 }
 
 // EnrolledTargets is the set a subject has already configured, for the catalogue.
-func (s *Store) EnrolledTargets(ctx context.Context, subject string) (map[string]time.Time, error) {
+// It is keyed on the stamp as well as the name, so the catalogue shows a target
+// as configured only when the credential belongs to the definition being served
+// now.
+func (s *Store) EnrolledTargets(ctx context.Context, subject string) (map[StampedName]time.Time, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT target, updated_at FROM user_credentials WHERE subject=$1`, subject)
+		`SELECT target, stamp, updated_at FROM user_credentials WHERE subject=$1`, subject)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := map[string]time.Time{}
+	out := map[StampedName]time.Time{}
 	for rows.Next() {
-		var target string
+		var target, stamp string
 		var at time.Time
-		if err := rows.Scan(&target, &at); err != nil {
+		if err := rows.Scan(&target, &stamp, &at); err != nil {
 			return nil, err
 		}
-		out[target] = at
+		out[StampedName{target, stamp}] = at
 	}
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteUserCredential(ctx context.Context, subject, target string) error {
+func (s *Store) DeleteUserCredential(ctx context.Context, subject, target, stamp string) error {
 	_, err := s.pool.Exec(ctx,
-		`DELETE FROM user_credentials WHERE subject=$1 AND target=$2`, subject, target)
+		`DELETE FROM user_credentials WHERE subject=$1 AND target=$2 AND stamp=$3`, subject, target, stamp)
 	return err
 }
 
@@ -663,6 +737,16 @@ func (s *Store) Sweep(ctx context.Context) error {
 		{sql: `DELETE FROM auth_codes WHERE created_at < now() - INTERVAL '1 hour'`},
 		{sql: `DELETE FROM access_tokens WHERE expires_at < now() - INTERVAL '1 day'`},
 
+		// Rows written before stamps, or by a replica that predates them. They
+		// match no definition and are refused, so they are only taking space (and,
+		// for sessions, holding a provider token that nothing can reach).
+		{sql: `DELETE FROM flows WHERE stamp = ''`},
+		{sql: `DELETE FROM sessions WHERE stamp = ''`},
+		{sql: `DELETE FROM user_credentials WHERE stamp = ''`},
+
+		// Long past the week the stray credential sweep looks back over.
+		{sql: `DELETE FROM stamp_seen WHERE seen_at < now() - INTERVAL '30 days'`},
+
 		// A used token is kept for one refresh lifetime beyond its own, so a late
 		// replay is still recognised as reuse rather than mistaken for an unknown
 		// token.
@@ -707,4 +791,47 @@ DELETE FROM clients c
 		}
 	}
 	return nil
+}
+
+// strayCredentialAge is how long a config credential must go unsaved, and its
+// definition unserved by any process, before it is deleted. The wait has to
+// outlast a rolling deploy, canary or rollback; a second definition lingering
+// longer than that is not supported (one database, one deployment).
+const strayCredentialAge = 7 * 24 * time.Hour
+
+// RecordServedStamps notes that this process serves each of these (name, stamp)
+// pairs now. Every process calls it on each sweep pass, so stamp_seen says when
+// any process last served a definition.
+func (s *Store) RecordServedStamps(ctx context.Context, served []StampedName) error {
+	if len(served) == 0 {
+		return nil
+	}
+	names := make([]string, len(served))
+	stamps := make([]string, len(served))
+	for i, v := range served {
+		names[i], stamps[i] = v.Name, v.Stamp
+	}
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO stamp_seen (target, stamp, seen_at)
+SELECT DISTINCT n, st, now() FROM unnest($1::text[], $2::text[]) AS v(n, st)
+ON CONFLICT (target, stamp) DO UPDATE SET seen_at = now()`,
+		names, stamps)
+	return err
+}
+
+// SweepStrayCredentials deletes a config credential once it has not been saved
+// for 7 days AND no process has served its definition for 7 days. Credentials
+// have no lifetime of their own, so without this one outlives its definition
+// indefinitely. The first condition protects a fresh save; the second protects
+// a definition that another pod still serves during a rollout or rollback.
+func (s *Store) SweepStrayCredentials(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+DELETE FROM user_credentials c
+ WHERE c.stamp LIKE 'config:%'
+   AND c.updated_at < now() - $1::interval
+   AND NOT EXISTS (SELECT 1 FROM stamp_seen s
+                    WHERE s.target = c.target AND s.stamp = c.stamp
+                      AND s.seen_at > now() - $1::interval)`,
+		strayCredentialAge.String())
+	return err
 }

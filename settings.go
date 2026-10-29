@@ -114,8 +114,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if t.Mode != CredPerUser {
 			continue
 		}
-		row := targetRow{Name: t.Name, Display: t.DisplayName, Fields: t.UserFields}
-		if at, ok := enrolled[t.Name]; ok {
+		row := targetRow{Name: t.Name, Display: t.DisplayName, Fields: t.UserFields, Stamp: t.Stamp()}
+		if at, ok := enrolled[StampedName{t.Name, row.Stamp}]; ok {
 			row.Enrolled = true
 			row.UpdatedAt = at.UTC().Format("2006-01-02 15:04 MST")
 		}
@@ -229,8 +229,18 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The form carries the stamp of the definition it was rendered under. If the
+	// server's settings have changed since, what the person typed was meant for a
+	// different destination and is not stored.
+	stamp := target.Stamp()
+	if r.PostForm.Get("stamp") != stamp {
+		renderSettingsError(w, http.StatusConflict, "Settings changed",
+			"This server's settings changed after the page was loaded. Reload the page and try again.")
+		return
+	}
+
 	if r.PostForm.Get("action") == "clear" {
-		if err := s.store.DeleteUserCredential(r.Context(), identity.Subject, target.Name); err != nil {
+		if err := s.store.DeleteUserCredential(r.Context(), identity.Subject, target.Name, stamp); err != nil {
 			slog.Error("settings: could not clear the credential", "err", err, "target", target.Name)
 			renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be removed. Try again.")
 			return
@@ -267,13 +277,13 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
-	sealed, err := s.sealer.seal(purposeUserCredential, raw)
+	sealed, err := s.sealer.seal(boundPurpose(purposeUserCredential, stamp), raw)
 	if err != nil {
 		slog.Error("settings: could not seal the credential", "err", err)
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
 	}
-	if err := s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, sealed); err != nil {
+	if err := s.store.PutUserCredential(r.Context(), identity.Subject, target.Name, stamp, sealed); err != nil {
 		slog.Error("settings: could not store the credential", "err", err, "target", target.Name)
 		renderSettingsError(w, http.StatusInternalServerError, "Something went wrong", "The credential could not be saved. Try again.")
 		return
@@ -286,12 +296,12 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 }
 
 // userHeadersFor unseals the caller's credential for a target.
-func (s *Server) userHeadersFor(r *http.Request, sessionID, target string) (map[string]string, error) {
-	sealed, err := s.store.UserCredentialForSession(r.Context(), sessionID, target)
+func (s *Server) userHeadersFor(r *http.Request, sessionID string, t Target) (map[string]string, error) {
+	sealed, err := s.store.UserCredentialForSession(r.Context(), sessionID, t.Name)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.sealer.open(purposeUserCredential, sealed)
+	raw, err := s.sealer.open(boundPurpose(purposeUserCredential, t.Stamp()), sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -310,8 +320,11 @@ func (s *Server) userHeadersFor(r *http.Request, sessionID, target string) (map[
 type targetRow struct {
 	// Name is the identifier posted back and matched against configuration.
 	// Display is only ever shown.
-	Name      string
-	Display   string
+	Name    string
+	Display string
+	// Stamp is posted back so a save can tell the definition it was rendered
+	// under from the one being served when it arrives.
+	Stamp     string
 	Fields    []UserHeaderField
 	Enrolled  bool
 	UpdatedAt string

@@ -296,6 +296,7 @@ func refreshLock(sessionID string) *sync.Mutex {
 // forwards.
 func (s *Server) handleMCP(t Target) http.HandlerFunc {
 	proxy := s.proxies[t.Name]
+	stamp := t.Stamp()
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Before authentication, because a traversal is malformed whoever sent it
@@ -312,7 +313,8 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 			return
 		}
 
-		sessionID, resource, err := s.store.LookupAccessToken(r.Context(), token)
+		ref, err := s.store.LookupAccessToken(r.Context(), token)
+		sessionID := ref.ID
 		if err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				slog.Error("mcp: token lookup failed", "err", err)
@@ -330,10 +332,20 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 		// An empty resource means a session from a single-target deployment that
 		// never asked for one. That is only acceptable while there is exactly one
 		// target to mean; with several it fails shut.
-		if resource != t.Resource && (resource != "" || s.cfg.MultiTarget()) {
+		if ref.Resource != t.Resource && (ref.Resource != "" || s.cfg.MultiTarget()) {
 			slog.Warn("mcp: token presented at the wrong resource",
-				"session", sessionID, "token_resource", resource, "target", t.Resource)
+				"session", sessionID, "token_resource", ref.Resource, "target", t.Resource)
 			s.challengeFor(w, t, "invalid_token", "this token was not issued for "+t.Resource)
+			return
+		}
+
+		// The audience check names the target; the stamp says it is still the
+		// same target. A session issued under another definition of this name
+		// would otherwise reach whatever this one points at now.
+		if ref.Stamp != stamp {
+			slog.Warn("mcp: session was issued under a different definition of this target",
+				"session", sessionID, "target", t.Name)
+			s.challengeFor(w, t, "invalid_token", "the access token is unknown or expired")
 			return
 		}
 
@@ -343,7 +355,7 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 		// will not help, so a challenge would only put a well-behaved client into a
 		// retry loop. The upstream is never contacted.
 		if t.Mode == CredPerUser {
-			headers, err := s.userHeadersFor(r, sessionID, t.Name)
+			headers, err := s.userHeadersFor(r, sessionID, t)
 			switch {
 			case err == nil:
 			case errors.Is(err, ErrNotFound):
@@ -377,7 +389,7 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 			return
 		}
 
-		upstreamTok, err := s.currentUpstreamToken(r, sessionID)
+		upstreamTok, err := s.currentUpstreamToken(r, sessionID, stamp)
 		if err != nil {
 			slog.Error("mcp: could not resolve the upstream token", "err", err, "session", sessionID)
 			s.challengeFor(w, t, "invalid_token", "the upstream credential for this session is no longer usable")
@@ -391,8 +403,8 @@ func (s *Server) handleMCP(t Target) http.HandlerFunc {
 
 // currentUpstreamToken returns a usable upstream token, refreshing it first if
 // the provider gave us an expiry and we have passed it.
-func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (UpstreamToken, error) {
-	tok, err := s.loadToken(r.Context(), sessionID)
+func (s *Server) currentUpstreamToken(r *http.Request, sessionID, stamp string) (UpstreamToken, error) {
+	tok, err := s.loadToken(r.Context(), sessionID, stamp)
 	if err != nil {
 		return tok, err
 	}
@@ -412,7 +424,7 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 	// revoked out from under us. The error is not ignorable, because treating a
 	// revoked session as "no fresher token available" would send us on to
 	// refresh with a credential the session no longer has any claim to.
-	fresh, err := s.loadToken(r.Context(), sessionID)
+	fresh, err := s.loadToken(r.Context(), sessionID, stamp)
 	if err != nil {
 		return tok, err
 	}
@@ -430,7 +442,7 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 	if refreshed.RefreshToken == "" {
 		refreshed.RefreshToken = fresh.RefreshToken
 	}
-	if err := s.persistRefreshed(r.Context(), sessionID, refreshed); err != nil {
+	if err := s.persistRefreshed(r.Context(), sessionID, stamp, refreshed); err != nil {
 		// The rotated pair could not be recorded, so the session now holds a
 		// refresh token the provider will not honour again and is finished.
 		// Serving this request anyway would hide that until some later refresh
@@ -453,7 +465,7 @@ func (s *Server) currentUpstreamToken(r *http.Request, sessionID string) (Upstre
 //
 // A revoked session is the exception. There is no row to write back to and
 // nothing of the session may be served, so ErrNotFound returns immediately.
-func (s *Server) persistRefreshed(ctx context.Context, sessionID string, tok UpstreamToken) error {
+func (s *Server) persistRefreshed(ctx context.Context, sessionID, stamp string, tok UpstreamToken) error {
 	const attempts = 3
 	var err error
 	for i := range attempts {
@@ -464,9 +476,7 @@ func (s *Server) persistRefreshed(ctx context.Context, sessionID string, tok Ups
 				return ctx.Err()
 			}
 		}
-		// subject and resource are ignored on an update; both belong to the
-		// session as created and a refresh must not be able to change either.
-		err = s.persistToken(ctx, sessionID, "", "", tok, false)
+		err = s.updateSessionToken(ctx, sessionID, stamp, tok)
 		if err == nil || errors.Is(err, ErrNotFound) {
 			return err
 		}

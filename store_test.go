@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // newTestStore connects to the database named by TEST_DATABASE_URL and clears
@@ -35,7 +37,7 @@ func newTestStore(t *testing.T) *Store {
 	// everything. user_credentials is NOT among the cascades: it deliberately has
 	// no foreign key to sessions, so it survives one and has to be cleared here
 	// or an enrolment leaks into the next test and makes "not enrolled" pass.
-	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "clients"} {
+	for _, table := range []string{"sessions", "flows", "settings_flows", "user_credentials", "stamp_seen", "clients"} {
 		if _, err := s.pool.Exec(ctx, "DELETE FROM "+table); err != nil {
 			t.Fatalf("clearing %s: %v", table, err)
 		}
@@ -46,7 +48,7 @@ func newTestStore(t *testing.T) *Store {
 func mustSession(t *testing.T, s *Store) string {
 	t.Helper()
 	id := newSecret()
-	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", []byte("sealed")); err != nil {
+	if err := s.CreateSession(context.Background(), id, "test-subject", "https://proxy.example/mcp", "test", "config:test", []byte("sealed")); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	return id
@@ -143,7 +145,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.LookupAccessToken(ctx, access); err != nil {
+	if _, err := s.LookupAccessToken(ctx, access); err != nil {
 		t.Fatalf("access token should work before revocation: %v", err)
 	}
 
@@ -151,7 +153,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token after revocation: err = %v, want ErrNotFound", err)
 	}
 	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); !errors.Is(err, ErrNotFound) {
@@ -160,7 +162,7 @@ func TestRevokeSessionKillsEveryCredential(t *testing.T) {
 	if _, err := s.TakeAuthCode(ctx, code); !errors.Is(err, ErrNotFound) {
 		t.Errorf("auth code after revocation: err = %v, want ErrNotFound", err)
 	}
-	if _, err := s.SessionToken(ctx, session); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SessionToken(ctx, session, "config:test"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("session after revocation: err = %v, want ErrNotFound", err)
 	}
 }
@@ -225,7 +227,7 @@ func TestExpiredCredentialsAreRefused(t *testing.T) {
 	if err := s.CreateAccessToken(ctx, access, session, "c1", -time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expired access token: err = %v, want ErrNotFound", err)
 	}
 
@@ -261,13 +263,13 @@ func TestSessionLifetimeOutranksTokenLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
 		t.Errorf("access token outlived its session: err = %v, want ErrNotFound", err)
 	}
 	if _, err := s.TakeRefreshToken(ctx, refresh, "c1"); errors.Is(err, nil) {
 		t.Error("refresh succeeded against a session past its absolute lifetime")
 	}
-	if _, err := s.SessionToken(ctx, session); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SessionToken(ctx, session, "config:test"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("SessionToken on an over-age session: err = %v, want ErrNotFound", err)
 	}
 }
@@ -319,14 +321,52 @@ func TestSweepClearsAbandonedSessionsAndClients(t *testing.T) {
 		t.Fatalf("Sweep: %v", err)
 	}
 
-	if _, err := s.SessionToken(ctx, abandoned); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SessionToken(ctx, abandoned, "config:test"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("abandoned session survived the sweep: err = %v", err)
 	}
-	if _, err := s.SessionToken(ctx, live); err != nil {
+	if _, err := s.SessionToken(ctx, live, "config:test"); err != nil {
 		t.Errorf("session with a live token was swept: %v", err)
 	}
 	if _, err := s.GetClient(ctx, unused.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unused client survived the sweep: err = %v", err)
+	}
+}
+
+func TestEmptyStampSessionsAreRefused(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	id := newSecret()
+	if err := s.CreateSession(ctx, id, "sub", "https://p/mcp", "", "", []byte("sealed")); err != nil {
+		t.Fatal(err)
+	}
+	access := newSecret()
+	if err := s.CreateAccessToken(ctx, access, id, "client", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LookupAccessToken(ctx, access); !errors.Is(err, ErrNotFound) {
+		t.Errorf("empty-stamp session was honoured: %v", err)
+	}
+	if _, err := s.SessionToken(ctx, id, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("empty stamp read a token: %v", err)
+	}
+}
+
+func TestSessionTokenRequiresTheSessionsStamp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := newSecret()
+	if err := s.CreateSession(ctx, id, "sub", "r", "plane", "config:a", []byte("sealed")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SessionToken(ctx, id, "config:a"); err != nil {
+		t.Fatalf("matching stamp: %v", err)
+	}
+	if _, err := s.SessionToken(ctx, id, "config:b"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a different stamp read the token: %v", err)
+	}
+	if err := s.UpdateSessionToken(ctx, id, "config:b", []byte("x")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a different stamp wrote the token: %v", err)
 	}
 }
 
@@ -335,7 +375,7 @@ func TestUpdateSessionTokenReportsAVanishedSession(t *testing.T) {
 	ctx := context.Background()
 	session := mustSession(t, s)
 
-	if err := s.UpdateSessionToken(ctx, session, []byte("still here")); err != nil {
+	if err := s.UpdateSessionToken(ctx, session, "config:test", []byte("still here")); err != nil {
 		t.Fatalf("update on a live session: %v", err)
 	}
 
@@ -345,7 +385,7 @@ func TestUpdateSessionTokenReportsAVanishedSession(t *testing.T) {
 	if err := s.RevokeSession(ctx, session); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateSessionToken(ctx, session, []byte("gone")); !errors.Is(err, ErrNotFound) {
+	if err := s.UpdateSessionToken(ctx, session, "config:test", []byte("gone")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("update on a revoked session: err = %v, want ErrNotFound", err)
 	}
 }
@@ -552,7 +592,7 @@ func TestSweepRunsAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{store: s}
+	srv := &Server{store: s, cfg: &Config{}}
 	swept, cancel := context.WithCancel(ctx)
 	go srv.sweep(swept)
 
@@ -577,4 +617,344 @@ func TestSweepRunsAtStartup(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	cancel()
+}
+
+func TestCredentialKeyMigratesInPlace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Put the table back in the shape the previous release created.
+	if _, err := s.pool.Exec(ctx, `
+DROP TABLE user_credentials;
+CREATE TABLE user_credentials (
+    subject TEXT NOT NULL, target TEXT NOT NULL, sealed_headers BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (subject, target));
+INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ('u', 'plane', '\x01');`); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 { // the second run must be a no-op
+		if err := s.migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	}
+
+	var stamp string
+	if err := s.pool.QueryRow(ctx, `SELECT stamp FROM user_credentials WHERE subject='u' AND target='plane'`).Scan(&stamp); err != nil || stamp != "" {
+		t.Fatalf("existing row: stamp %q, err %v", stamp, err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("b")); err != nil {
+		t.Fatalf("a second stamp for the same user and target must coexist: %v", err)
+	}
+}
+
+func TestCredentialsUnderDifferentStampsCoexist(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A2")); err != nil { // replaces its own
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteUserCredential(ctx, "u", "plane", "config:a"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.EnrolledTargets(ctx, "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[StampedName{"plane", "config:a"}]; ok {
+		t.Error("clear for one stamp left its own row")
+	}
+	if _, ok := got[StampedName{"plane", "config:b"}]; !ok {
+		t.Error("clear for one stamp removed another stamp's row")
+	}
+}
+
+func TestCredentialIsReadOnlyThroughASessionWithTheSameStamp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := newSecret()
+	if err := s.CreateSession(ctx, id, "u", "r", "plane", "config:a", []byte("tok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:b", []byte("B")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserCredentialForSession(ctx, id, "plane"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a credential for another stamp was returned: %v", err)
+	}
+	if err := s.PutUserCredential(ctx, "u", "plane", "config:a", []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.UserCredentialForSession(ctx, id, "plane"); err != nil || string(b) != "A" {
+		t.Errorf("got %q, %v; want the credential for the session's own stamp", b, err)
+	}
+}
+
+func TestEmptyStampCredentialIsRefused(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.PutUserCredential(context.Background(), "u", "plane", "", []byte("x")); err == nil {
+		t.Error("stored a credential with no stamp")
+	}
+}
+
+func TestCredentialKeyMigrationOnAFreshDatabase(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP TABLE user_credentials`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := s.migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	}
+	for _, stamp := range []string{"config:a", "config:b"} {
+		if err := s.PutUserCredential(ctx, "u", "plane", stamp, []byte("x")); err != nil {
+			t.Fatalf("stamp %s: %v", stamp, err)
+		}
+	}
+}
+
+func TestSweepRemovesEmptyStampRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	empty, kept := newSecret(), newSecret()
+	for _, c := range []struct{ id, stamp string }{{empty, ""}, {kept, "config:a"}} {
+		if err := s.CreateSession(ctx, c.id, "u", "r", "plane", c.stamp, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO user_credentials (subject,target,stamp,sealed_headers) VALUES ('u','plane','','\x01')`); err != nil {
+		t.Fatal(err)
+	}
+	emptyFlow, keptFlow := newSecret(), newSecret()
+	for _, c := range []struct{ id, stamp string }{{emptyFlow, ""}, {keptFlow, "config:a"}} {
+		if err := s.CreateFlow(ctx, Flow{ID: c.id, ClientID: "c", RedirectURI: "r", CodeChallenge: "x", UpstreamVerifier: "v", Target: "plane", Stamp: c.stamp, BrowserSecret: "b"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM flows WHERE id=$1`, emptyFlow).Scan(&n)
+	if n != 0 {
+		t.Error("empty-stamp flow survived")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM flows WHERE id=$1`, keptFlow).Scan(&n)
+	if n != 1 {
+		t.Error("stamped flow was swept")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id=$1`, empty).Scan(&n)
+	if n != 0 {
+		t.Error("empty-stamp session survived")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id=$1`, kept).Scan(&n)
+	if n != 1 {
+		t.Error("stamped session was swept")
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM user_credentials WHERE stamp=''`).Scan(&n)
+	if n != 0 {
+		t.Error("empty-stamp credential survived")
+	}
+}
+
+func TestSweepStrayCredentials(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	saved14d, saved8d, now := `now() - INTERVAL '14 days'`, `now() - INTERVAL '8 days'`, `now()`
+	cases := []struct {
+		target, stamp, saved string
+		survives             bool
+	}{
+		{"plane", "config:live", saved14d, true},        // this process serves it: seen now
+		{"plane", "config:seen-1d", saved14d, true},     // another pod served it yesterday
+		{"plane", "config:never-seen", saved14d, false}, // old and nobody has served it
+		{"plane", "config:seen-8d", saved14d, false},    // last served more than a week ago
+		{"plane", "config:recent", now, true},           // saved just now, never seen: protected by updated_at
+		{"plane", "admin:x", saved14d, true},            // not a config stamp: not this sweep's to delete
+		{"other", "config:live", saved8d, false},        // only ("plane", "config:live") was served, not this name
+	}
+	for _, c := range cases {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u',$1,$2,'\x01',`+c.saved+`)`,
+			c.target, c.stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for stamp, ago := range map[string]string{"config:seen-1d": "1 day", "config:seen-8d": "8 days"} {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO stamp_seen (target,stamp,seen_at) VALUES ('plane',$1, now() - $2::interval)`, stamp, ago); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RecordServedStamps(ctx, []StampedName{{"plane", "config:live"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SweepStrayCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := s.EnrolledTargets(ctx, "u")
+	for _, c := range cases {
+		if _, present := got[StampedName{c.target, c.stamp}]; present != c.survives {
+			t.Errorf("%s/%s: present=%v, want %v", c.target, c.stamp, present, c.survives)
+		}
+	}
+}
+
+func TestRecordServedStampsRefreshesAndToleratesEmpty(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.RecordServedStamps(ctx, nil); err != nil {
+		t.Fatalf("empty list: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO stamp_seen (target,stamp,seen_at) VALUES ('plane','config:a', now() - INTERVAL '3 days')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordServedStamps(ctx, []StampedName{{"plane", "config:a"}, {"plane", "config:b"}}); err != nil {
+		t.Fatal(err)
+	}
+	var fresh int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM stamp_seen WHERE seen_at > now() - INTERVAL '1 minute'`).Scan(&fresh); err != nil || fresh != 2 {
+		t.Fatalf("fresh rows = %d, err %v; want both pairs recorded and the old one refreshed", fresh, err)
+	}
+}
+
+func TestSweepRemovesOldStampSeenRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for stamp, ago := range map[string]string{"config:old": "31 days", "config:kept": "29 days"} {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO stamp_seen (target,stamp,seen_at) VALUES ('plane',$1, now() - $2::interval)`, stamp, ago); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var old, kept int
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stamp_seen WHERE stamp='config:old'`).Scan(&old)
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stamp_seen WHERE stamp='config:kept'`).Scan(&kept)
+	if old != 0 || kept != 1 {
+		t.Errorf("old=%d kept=%d; want the 31 day row removed and the 29 day row kept", old, kept)
+	}
+}
+
+// When recording the served stamps fails, the stray sweep must not run: the
+// credential below is old and stamp_seen has no row for it, so a sweep would
+// delete a definition this process is serving.
+func TestSweepOnceSkipsStraySweepWhenRecordingFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	srv := &Server{store: s, cfg: &Config{Targets: []Target{{Name: "plane", UpstreamMCP: "https://plane.example/mcp"}}}}
+	stamp := srv.cfg.Targets[0].Stamp()
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO user_credentials (subject,target,stamp,sealed_headers,updated_at) VALUES ('u','plane',$1,'\x01', now() - INTERVAL '14 days')`, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	// A trigger that rejects inserts makes RecordServedStamps fail while the
+	// stray sweep, which only reads stamp_seen, would still succeed.
+	if _, err := s.pool.Exec(ctx, `
+CREATE FUNCTION reject_stamp_seen() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'rejected'; END $$ LANGUAGE plpgsql;
+CREATE TRIGGER reject_stamp_seen BEFORE INSERT ON stamp_seen FOR EACH ROW EXECUTE FUNCTION reject_stamp_seen();`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DROP TRIGGER reject_stamp_seen ON stamp_seen; DROP FUNCTION reject_stamp_seen();`)
+	})
+
+	srv.sweepOnce(ctx)
+
+	got, _ := s.EnrolledTargets(ctx, "u")
+	if _, present := got[StampedName{"plane", stamp}]; !present {
+		t.Error("credential for a served definition was deleted after recording failed")
+	}
+}
+
+// legacyCredentialsTable puts user_credentials back in the shape the previous
+// release created, in the default schema.
+func legacyCredentialsTable(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), `
+DROP TABLE user_credentials;
+CREATE TABLE user_credentials (
+    subject TEXT NOT NULL, target TEXT NOT NULL, sealed_headers BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (subject, target));
+INSERT INTO user_credentials (subject, target, sealed_headers) VALUES ('u', 'plane', '\x01');`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// storeWithSearchPath opens a second store on the same database whose
+// connections resolve unqualified names through an empty schema first.
+func storeWithSearchPath(t *testing.T, s *Store, emptySchema string) *Store {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+emptySchema+` CASCADE; CREATE SCHEMA `+emptySchema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+emptySchema+` CASCADE`) })
+
+	cfg := s.pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["search_path"] = emptySchema + ",public"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return &Store{pool: pool, refreshTTL: s.refreshTTL, sessionTTL: s.sessionTTL}
+}
+
+func TestCredentialKeyMigrationFindsTheTableThroughSearchPath(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	legacyCredentialsTable(t, s)
+	other := storeWithSearchPath(t, s, "mop_empty")
+
+	// The block that rewrites the key, on its own: the rest of migrate would
+	// create fresh tables in the empty schema and hide a wrong lookup. The stamp
+	// column is the step migrate takes just before it.
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE user_credentials ADD COLUMN IF NOT EXISTS stamp TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.pool.Exec(ctx, credentialKeyMigration); err != nil {
+		t.Fatal(err)
+	}
+	for _, stamp := range []string{"config:a", "config:b"} {
+		if err := s.PutUserCredential(ctx, "u", "plane", stamp, []byte("x")); err != nil {
+			t.Fatalf("stamp %s: %v", stamp, err)
+		}
+	}
+}
+
+func TestMigrateWithAnEmptySchemaFirstOnTheSearchPath(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	legacyCredentialsTable(t, s)
+	other := storeWithSearchPath(t, s, "mop_empty2")
+
+	for range 2 {
+		if err := other.migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	}
+	if err := other.PutUserCredential(ctx, "u", "plane", "config:a", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.PutUserCredential(ctx, "u", "plane", "config:b", []byte("b")); err != nil {
+		t.Fatalf("a second stamp for the same user and target must coexist: %v", err)
+	}
 }
