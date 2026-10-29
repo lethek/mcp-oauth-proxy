@@ -97,8 +97,9 @@ type Store struct {
 	refreshTTL time.Duration
 	sessionTTL time.Duration
 
-	// admin is set when admin targets are enabled. Until then the targets table
-	// is neither read nor written, and the freshness join is not issued.
+	// admin is set when admin targets are enabled. Until then no request path
+	// reads or writes the targets table and the freshness join is not issued.
+	// Only the sweep's purge of admin-stamped rows with no targets row reads it.
 	admin *adminPolicy
 
 	// afterVersionRead, when set, runs inside LoadAdminTargets between reading
@@ -978,7 +979,11 @@ DELETE FROM clients c
 // refresh or /revoke it fails, the edit stays committed, and the next sweep
 // repeats it.
 func (s *Store) purgeStaleAdminRows(ctx context.Context, name string) error {
-	if s.admin == nil || s.skipCleanup {
+	// Not gated on s.admin: an operator may switch the feature off after a
+	// target was removed, and rows stranded by that would never be purged. It
+	// reads targets only to find stamps that nothing carries, so rows for a live
+	// target survive until the feature is switched back on.
+	if s.skipCleanup {
 		return nil
 	}
 	// Every table is tried even if one fails, so a deadlock on sessions does not
